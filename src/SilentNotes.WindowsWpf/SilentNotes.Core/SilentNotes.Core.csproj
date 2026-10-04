@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SilentNotes.Core</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <TargetFramework>net472</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>15.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemGroup />
+  <ItemGroup>
+    <Reference Include="System.Threading.Tasks.Extensions" />
+    <Reference Include="CommunityToolkit.Mvvm" />
+    <Reference Include="System.Xml.Linq" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Memory" />
+    <Reference Include="System.Core" />
+    <Reference Include="VanillaCloudStorageClient">
+      <HintPath>..\..\..\src\SilentNotes.WindowsWinForms\build-output\Release\VanillaCloudStorageClient.dll</HintPath>
+    </Reference>
+    <Reference Include="BouncyCastle.Cryptography" />
+    <Reference Include="System.Web" />
+  </ItemGroup>
+</Project>

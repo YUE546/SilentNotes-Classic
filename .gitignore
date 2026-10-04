@@ -1,0 +1,13 @@
+*
+!.gitignore
+!.editorconfig
+!src/
+!src/SilentNotes.WindowsWpf/
+!src/SilentNotes.WindowsWpf/**
+src/SilentNotes.WindowsWpf/build-output/
+src/SilentNotes.WindowsWpf/obj/
+!src/SilentNotes.Blazor/
+!src/SilentNotes.Blazor/Resources/
+!src/SilentNotes.Blazor/Resources/Raw/
+!src/SilentNotes.Blazor/Resources/Raw/Localization/
+!src/SilentNotes.Blazor/Resources/Raw/Localization/**
