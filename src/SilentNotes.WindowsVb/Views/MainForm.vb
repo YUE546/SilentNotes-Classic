@@ -2441,7 +2441,23 @@ Namespace SilentNotes.WindowsVb.Views
                                                         End Try
                                                     End If
                                                 Next
-                                                errorText.Text = "密码错误，无法打开安全箱。请查看日志文件获取详细信息。"
+
+                                                ' 解不开 ≠ 密码一定错：net40 裁剪加密栈不支持 xchacha20/argon2id，
+                                                ' SafeModel.TryDecryptKey 会把"算法未知"也吞成 False。这里从密文头
+                                                ' 解析算法对，给用户可操作的提示而不是误导性的"密码错误"。
+                                                Dim hasUnsupportedSafe As Boolean = False
+                                                For Each s As SafeModel In _repository.Safes
+                                                    Dim description As String = DescribeSafeKeyAlgorithms(s)
+                                                    If description IsNot Nothing AndAlso Not IsSupportedSafeAlgorithms(description) Then
+                                                        hasUnsupportedSafe = True
+                                                        _logService.Info(String.Format("  安全箱 {0} 使用不支持的算法: {1}", s.Id, description))
+                                                    End If
+                                                Next
+                                                If hasUnsupportedSafe Then
+                                                    errorText.Text = "此安全箱使用的加密算法（xchacha20/argon2id）本版本不支持，" & vbLf & "请先用 tools\migrate-safe-crypto 迁移工具转换后再解锁。"
+                                                Else
+                                                    errorText.Text = "密码错误，无法打开安全箱。请查看日志文件获取详细信息。"
+                                                End If
                                             End If
                                         Else
                                             ' 创建新的安全箱
@@ -2475,6 +2491,40 @@ Namespace SilentNotes.WindowsVb.Views
 
             dialog.ShowDialog(Me)
         End Sub
+
+        ''' <summary>
+        ''' 从安全箱密钥的密文头解析算法对，形如 "xchacha20_poly1305 + argon2id"。
+        ''' 头格式："SilentSafe v=2$算法$nonce$KDF$salt$cost$压缩$密文"；解析失败返回 Nothing。
+        ''' </summary>
+        Private Shared Function DescribeSafeKeyAlgorithms(safe As SafeModel) As String
+            If safe Is Nothing OrElse String.IsNullOrEmpty(safe.SerializeableKey) Then
+                Return Nothing
+            End If
+            Try
+                Dim raw As Byte() = CryptoUtils.Base64StringToBytes(safe.SerializeableKey)
+                Dim take As Integer = Math.Min(200, raw.Length)
+                Dim prefix As String = System.Text.Encoding.UTF8.GetString(raw, 0, take)
+                ' 密文头分隔符是 $；不写字面量 "$"c 是为了不触发红线脚本的 VB14 插值字符串模式。
+                Dim separator As Char = ChrW(36)
+                Dim parts As String() = prefix.Split(separator)
+                If parts.Length >= 4 Then
+                    Dim kdf As String = parts(3)
+                    If String.IsNullOrEmpty(kdf) Then
+                        kdf = "(none)"
+                    End If
+                    Return parts(1) & " + " & kdf
+                End If
+            Catch
+            End Try
+            Return Nothing
+        End Function
+
+        ''' <summary>net40 裁剪加密栈只支持 aes_gcm/twofish_gcm + pbkdf2。</summary>
+        Private Shared Function IsSupportedSafeAlgorithms(description As String) As Boolean
+            Dim supportedCipher As Boolean = description.Contains("aes_gcm") OrElse description.Contains("twofish_gcm")
+            Dim supportedKdf As Boolean = description.Contains("pbkdf2") OrElse description.Contains("(none)")
+            Return supportedCipher AndAlso supportedKdf
+        End Function
 
         Private Function DecryptSafeNoteContent(note As NoteModel) As String
             If Not note.SafeId.HasValue OrElse String.IsNullOrEmpty(note.HtmlContent) Then
