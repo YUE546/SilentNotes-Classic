@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="14.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{A3F2B4C1-6D8E-4B7A-9C05-1E2F3A4B5C6D}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <!-- RootNamespace 置空：VB 会把 RootNamespace 前缀拼接到文件内声明的命名空间，
+         置空后由各 .vb 文件自声明完整命名空间（与 C# 习惯一致） -->
+    <RootNamespace></RootNamespace>
+    <!-- 进程名/exe 名 = SilentNotes（AssemblyName 决定 Task Manager 里的进程名） -->
+    <AssemblyName>SilentNotes</AssemblyName>
+    <!-- 不设 PlatformTarget 时 Vbc 任务会落到非确定默认；显式 AnyCPU + Prefer32Bit=true
+         与 C# WinForms 版行为完全一致（64 位系统上按 32 位跑，Task Manager 显示"32 位"）。
+         要切纯 64 位：Prefer32Bit 改 false 即可 -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>true</Prefer32Bit>
+    <TargetFrameworkVersion>v4.0.3</TargetFrameworkVersion>
+    <!-- VB10 语法上限：与 VS2010/VB2010 对齐。门禁构建用 Roslyn vbc 强制；正式构建换 in-box vbc 时该项被忽略（BC2007 警告） -->
+    <LangVersion>10</LangVersion>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionStrict>On</OptionStrict>
+    <OptionInfer>On</OptionInfer>
+    <OptionCompare>Binary</OptionCompare>
+    <MyType>Empty</MyType>
+    <FileAlignment>512</FileAlignment>
+    <!-- 默认 Roslyn vbc（语法门禁）；正式构建传 /p:VbcToolPath 指向框架自带 vbc -->
+    <VbcToolPath Condition=" '$(VbcToolPath)' == '' ">D:\vibe coding\silentnotes\tools\roslyn\pkg\tasks\net472</VbcToolPath>
+    <FrameworkPathOverride Condition=" '$(FrameworkPathOverride)' == '' ">D:\vibe coding\silentnotes\packages\Microsoft.NETFramework.ReferenceAssemblies.net40.1.0.3\build\.NETFramework\v4.0</FrameworkPathOverride>
+    <OutputPath>build-output\$(Configuration)\</OutputPath>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Resources\app.ico</ApplicationIcon>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <DefineDebug>true</DefineDebug>
+    <DefineTrace>true</DefineTrace>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <DefineTrace>true</DefineTrace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Security" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Xml" />
+    <Reference Include="Microsoft.VisualBasic" />
+    <Reference Include="SunnyUI">
+      <HintPath>..\..\packages\sunnyui.3.8.2\lib\net40\SunnyUI.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="SunnyUI.Common">
+      <HintPath>..\..\packages\sunnyui.common\lib\net40\SunnyUI.Common.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="SilentNotes.Core">
+      <HintPath>..\SilentNotes.WindowsWinForms\build-output\$(Configuration)\SilentNotes.Core.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="VanillaCloudStorageClient">
+      <HintPath>..\SilentNotes.WindowsWinForms\build-output\$(Configuration)\VanillaCloudStorageClient.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Program.vb" />
+    <Compile Include="MicroContainer.vb" />
+    <Compile Include="TaskUtils.vb" />
+    <Compile Include="Views\MainForm.vb" />
+    <Compile Include="Services\WindowsApplicationPaths.vb" />
+    <Compile Include="Services\WindowsDataDirectoryService.vb" />
+    <Compile Include="Services\WindowsEnvironmentService.vb" />
+    <Compile Include="Services\WindowsCryptoRandomService.vb" />
+    <Compile Include="Services\WindowsDataProtectionService.vb" />
+    <Compile Include="Services\WindowsLogService.vb" />
+    <Compile Include="Services\WindowsLanguageCodeProvider.vb" />
+    <Compile Include="Services\WindowsLanguageServiceResourceReader.vb" />
+    <Compile Include="Services\WindowsNativeBrowserService.vb" />
+    <Compile Include="Services\WindowsRepositoryStorageService.vb" />
+    <Compile Include="Services\WindowsSettingsService.vb" />
+    <Compile Include="Services\WindowsInternetStateService.vb" />
+    <Compile Include="Services\WindowsFilePickerService.vb" />
+    <Compile Include="Services\WindowsFolderPickerService.vb" />
+    <Compile Include="Services\WinFormsThemeService.vb" />
+    <Compile Include="Services\WinFormsFeedbackService.vb" />
+    <Compile Include="Services\WebDavDiagnostics.vb" />
+    <Compile Include="Services\WindowsSynchronizationService.vb" />
+    <Compile Include="Controls\SegmentedToggle.vb" />
+    <Compile Include="Controls\ThemedDialogForm.vb" />
+    <Compile Include="Controls\ThemedConfirmDialog.vb" />
+    <Compile Include="Controls\WebDavSettingsDialog.vb" />
+    <Compile Include="Controls\HtmlEditorControl.vb" />
+    <Compile Include="Controls\MsHtmlLateBound.vb" />
+    <Compile Include="Workers\HtmlCompatibilityInspector.vb" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\SilentNotes.Blazor\Resources\Raw\Localization\Lng.SilentNotes.*">
+      <Link>Resources\Localization\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.VisualBasic.targets" />
+</Project>
