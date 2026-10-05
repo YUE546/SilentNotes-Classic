@@ -15,6 +15,10 @@ Namespace SilentNotes.WindowsVb.Controls
     Friend Class ThemedConfirmDialog
         Inherits ThemedDialogForm
 
+        ' SunnyUI 控件不继承容器字体（ThemedDialogForm 设的 Font 对 UILabel/UIButton
+        ' 无效），不显式赋值会回退系统默认宋体。
+        Private Shared ReadOnly UIFont As New Font("Microsoft YaHei UI", 9.0F)
+
         Private Sub New()
         End Sub
 
@@ -32,7 +36,8 @@ Namespace SilentNotes.WindowsVb.Controls
                     .Top = 18,
                     .Width = 350,
                     .Height = 70,
-                    .TextAlign = ContentAlignment.TopLeft
+                    .TextAlign = ContentAlignment.TopLeft,
+                    .Font = UIFont
                 }
 
                 Dim confirmButton As New UIButton With {
@@ -41,14 +46,16 @@ Namespace SilentNotes.WindowsVb.Controls
                     .Height = 30,
                     .Tag = If(danger, "danger", "accent"),
                     .DialogResult = DialogResult.OK,
-                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right,
+                    .Font = UIFont
                 }
                 Dim cancelButton As New UIButton With {
                     .Text = "取消",
                     .Width = 72,
                     .Height = 30,
                     .DialogResult = DialogResult.Cancel,
-                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right,
+                    .Font = UIFont
                 }
                 cancelButton.Left = dialog.ClientSize.Width - 18 - confirmButton.Width - 8 - cancelButton.Width
                 confirmButton.Left = dialog.ClientSize.Width - 18 - confirmButton.Width
@@ -82,7 +89,8 @@ Namespace SilentNotes.WindowsVb.Controls
                     .Top = 18,
                     .Width = 370,
                     .Height = 70,
-                    .TextAlign = ContentAlignment.TopLeft
+                    .TextAlign = ContentAlignment.TopLeft,
+                    .Font = UIFont
                 }
 
                 Dim saveButton As New UIButton With {
@@ -91,21 +99,24 @@ Namespace SilentNotes.WindowsVb.Controls
                     .Height = 30,
                     .Tag = "accent",
                     .DialogResult = DialogResult.Yes,
-                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right,
+                    .Font = UIFont
                 }
                 Dim discardButton As New UIButton With {
                     .Text = "不保存",
                     .Width = 80,
                     .Height = 30,
                     .DialogResult = DialogResult.No,
-                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right,
+                    .Font = UIFont
                 }
                 Dim cancelButton As New UIButton With {
                     .Text = "取消",
                     .Width = 72,
                     .Height = 30,
                     .DialogResult = DialogResult.Cancel,
-                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+                    .Anchor = AnchorStyles.Bottom Or AnchorStyles.Right,
+                    .Font = UIFont
                 }
                 cancelButton.Left = dialog.ClientSize.Width - 18 - cancelButton.Width
                 discardButton.Left = cancelButton.Left - 8 - discardButton.Width

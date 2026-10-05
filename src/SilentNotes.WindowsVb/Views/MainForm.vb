@@ -37,6 +37,8 @@ Namespace SilentNotes.WindowsVb.Views
         Private ReadOnly _logService As ILogService
         Private ReadOnly _htmlCompatibilityInspector As New HtmlCompatibilityInspector()
         Private _autoSyncTimer As System.Threading.Timer
+        Private _syncInProgress As Boolean
+        Private _editorShortcutFilter As EditorShortcutFilter
 
         Private _repository As NoteRepositoryModel
         Private _selectedNote As NoteModel
@@ -141,6 +143,11 @@ Namespace SilentNotes.WindowsVb.Views
 
             BuildUi()
             WireEvents()
+
+            ' 焦点在 MSHTML 原生窗口里时窗体的 ProcessCmdKey 收不到组合键，
+            ' 靠线程级消息过滤器补活编辑器内的 Ctrl+S/Ctrl+N/Ctrl+F。
+            _editorShortcutFilter = New EditorShortcutFilter(Me)
+            Application.AddMessageFilter(_editorShortcutFilter)
 
             ' 通过在 Win32 层面把绘制设为合成（双缓冲），消除原生 ListBox 在悬停/选中时
             ' 先擦除再重绘导致的闪烁。只作用于内层列表框：外层面板也合成会让滚动变卡。
@@ -269,6 +276,10 @@ Namespace SilentNotes.WindowsVb.Views
             ' 右键菜单不在窗体控件树里，主题遍历永远到不了它；主题切换后颜色和
             ' 预渲染的图标位图都会过时，除非在这里刷新。
             Dim theme As WinFormsThemeService = ThemeService
+            ' Style=Custom 会跳过 SetStyleColor，渲染器的图像边距条永远停在默认
+            ' Blue 配色的白色上（浅色下看不出，深色下图标就是白底）；按主题手动
+            ' 切换 SunnyUI 配色表后再覆盖自定义颜色。
+            _moreMenu.SetStyleColor(If(theme.IsDarkMode, UIStyles.GetStyleColor(UIStyle.Dark), UIStyles.GetStyleColor(UIStyle.Blue)))
             _moreMenu.BackColor = theme.SurfacePaper
             _moreMenu.ForeColor = theme.TextPrimary
             For Each item As ToolStripItem In _moreMenu.Items
@@ -850,6 +861,53 @@ Namespace SilentNotes.WindowsVb.Views
 
 #End Region
 
+#Region "Editor shortcut filter"
+
+        ''' <summary>
+        ''' MSHTML 的原生窗口不把加速键转发给 WinForms：焦点在编辑器内时窗体的
+        ''' ProcessCmdKey 收不到 Ctrl 组合键，Ctrl+S/Ctrl+N/Ctrl+F 会失效。此过滤器
+        ''' 在线程消息层拦截编辑器窗口树内的这三个组合键并转回主窗体处理；
+        ''' B/I/U/Z/Y 等格式键由 MSHTML 自带加速键处理，不在此拦截。
+        ''' </summary>
+        Private NotInheritable Class EditorShortcutFilter
+            Implements IMessageFilter
+
+            Private Const WM_KEYDOWN As Integer = &H100
+            Private ReadOnly _owner As MainForm
+
+            Public Sub New(owner As MainForm)
+                _owner = owner
+            End Sub
+
+            Public Function PreFilterMessage(ByRef m As Message) As Boolean Implements IMessageFilter.PreFilterMessage
+                If m.Msg <> WM_KEYDOWN OrElse _owner.IsDisposed OrElse Not _owner._editor.IsReady Then
+                    Return False
+                End If
+                If Not _owner._editor.ContainsNativeWindow(m.HWnd) Then
+                    Return False
+                End If
+                If (Control.ModifierKeys And Keys.Control) <> Keys.Control Then
+                    Return False
+                End If
+
+                Dim key As Keys = DirectCast(m.WParam.ToInt32() And CInt(Keys.KeyCode), Keys)
+                Select Case key
+                    Case Keys.S
+                        _owner.HandleSaveShortcut()
+                        Return True
+                    Case Keys.N
+                        _owner.HandleNewNoteShortcut()
+                        Return True
+                    Case Keys.F
+                        _owner.HandleSearchShortcut()
+                        Return True
+                End Select
+                Return False
+            End Function
+        End Class
+
+#End Region
+
 #Region "Lifecycle"
 
         Protected Overrides Sub OnLoad(e As EventArgs)
@@ -907,6 +965,11 @@ Namespace SilentNotes.WindowsVb.Views
                 End If
             End If
 
+            ' 过滤器要在取消关闭的提前返回之后才注销：用户取消时它必须继续工作。
+            If _editorShortcutFilter IsNot Nothing Then
+                Application.RemoveMessageFilter(_editorShortcutFilter)
+                _editorShortcutFilter = Nothing
+            End If
             If _autoSyncTimer IsNot Nothing Then
                 _autoSyncTimer.Dispose()
                 _autoSyncTimer = Nothing
@@ -937,14 +1000,13 @@ Namespace SilentNotes.WindowsVb.Views
             If (keyData And Keys.Control) = Keys.Control Then
                 Select Case key
                     Case Keys.N
-                        NewNoteButton_Click(Me, EventArgs.Empty)
+                        HandleNewNoteShortcut()
                         Return True
                     Case Keys.S
-                        SaveSelectedNote()
+                        HandleSaveShortcut()
                         Return True
                     Case Keys.F
-                        _searchBox.TextBox.Focus()
-                        _searchBox.TextBox.SelectAll()
+                        HandleSearchShortcut()
                         Return True
                     Case Keys.B
                         _editor.FocusEditor()
@@ -969,6 +1031,9 @@ Namespace SilentNotes.WindowsVb.Views
                 End Select
             ElseIf key = Keys.Delete Then
                 ' 不要吞掉文本控件或编辑器里的 Delete
+                If _syncInProgress Then
+                    Return True
+                End If
                 If TypeOf ActiveControl Is TextBox OrElse TypeOf ActiveControl Is UITextBox OrElse TypeOf ActiveControl Is HtmlEditorControl Then
                     Return MyBase.ProcessCmdKey(msg, keyData)
                 End If
@@ -977,6 +1042,28 @@ Namespace SilentNotes.WindowsVb.Views
             End If
             Return MyBase.ProcessCmdKey(msg, keyData)
         End Function
+
+        ''' <summary>Ctrl+S 的统一入口：同步进行中时拒绝，避免与后台写盘并发。</summary>
+        Private Sub HandleSaveShortcut()
+            If _syncInProgress Then
+                SetStatus("正在同步，请等同步结束后再保存。", True)
+                Return
+            End If
+            SaveSelectedNote()
+        End Sub
+
+        Private Sub HandleNewNoteShortcut()
+            If _syncInProgress Then
+                SetStatus("正在同步，请等同步结束后再新建笔记。", True)
+                Return
+            End If
+            NewNoteButton_Click(Me, EventArgs.Empty)
+        End Sub
+
+        Private Sub HandleSearchShortcut()
+            _searchBox.TextBox.Focus()
+            _searchBox.TextBox.SelectAll()
+        End Sub
 
 #End Region
 
@@ -1130,6 +1217,25 @@ Namespace SilentNotes.WindowsVb.Views
                 Return
             End If
 
+            ' 同步会用磁盘上的仓库重载编辑器；与关闭窗口一样，先让用户决定
+            ' 未保存的编辑去留（保存 / 不保存 / 取消）。
+            If _contentDirty AndAlso _selectedNote IsNot Nothing AndAlso Not _showRecycleBin Then
+                Dim choice As DialogResult = ThemedConfirmDialog.ShowSavePrompt(
+                    Me, ThemeService, "未保存的更改",
+                    String.Format("笔记 ""{0}"" 有未保存的更改，是否保存？", _editorTitleBase))
+                If choice = DialogResult.Cancel Then
+                    Return
+                End If
+                If choice = DialogResult.Yes Then
+                    Dim saved As Boolean = SaveSelectedNote(False)
+                    If Not saved Then
+                        SetStatus("保存失败，已取消同步。", True)
+                        Return
+                    End If
+                End If
+            End If
+
+            _syncInProgress = True
             _syncButton.Enabled = False
             _saveButton.Enabled = False
             ' 同步期间的编辑只存在于内存中，会被下面的仓库重载丢弃；
@@ -1146,6 +1252,7 @@ Namespace SilentNotes.WindowsVb.Views
                                       Dim success As Boolean = _syncService.Sync(progress)
 
                                       SafeInvoke(Sub()
+                                                     _syncInProgress = False
                                                      _syncButton.Enabled = True
                                                      UpdateModeControls()
                                                  End Sub)
@@ -1158,7 +1265,7 @@ Namespace SilentNotes.WindowsVb.Views
                                                      End Sub)
                                       Else
                                           ' 重新加载已保存的内容并恢复正确的只读状态。
-                                          SafeInvoke(Sub() SelectNote(_selectedNote))
+                                          SafeInvoke(Sub() SelectNote(_selectedNote, True))
                                       End If
                                   End Sub)
         End Sub
@@ -1776,7 +1883,7 @@ Namespace SilentNotes.WindowsVb.Views
             End If
 
             RefreshTagList()
-            RefreshNoteList(FindFirstNote(Function(note) note.InRecyclingBin = _showRecycleBin))
+            RefreshNoteList(FindFirstNote(Function(note) note.InRecyclingBin = _showRecycleBin), True)
             UpdateRepositorySummary()
             UpdateModeControls()
 
@@ -1785,7 +1892,7 @@ Namespace SilentNotes.WindowsVb.Views
                 "已加载本地仓库。"))
         End Sub
 
-        Private Sub RefreshNoteList(noteToSelect As NoteModel)
+        Private Sub RefreshNoteList(noteToSelect As NoteModel, Optional forceReload As Boolean = False)
             _listItems = _repository.Notes _
                 .Where(Function(note) note.InRecyclingBin = _showRecycleBin) _
                 .Where(Function(note) MatchesTag(note)) _
@@ -1825,7 +1932,7 @@ Namespace SilentNotes.WindowsVb.Views
             _emptyListLabel.Visible = isEmpty
             _notesList.Visible = Not isEmpty
 
-            SelectNote(noteToSelect)
+            SelectNote(noteToSelect, forceReload)
         End Sub
 
         Private Sub NotesList_SelectedIndexChanged(sender As Object, e As EventArgs)
@@ -1942,9 +2049,17 @@ Namespace SilentNotes.WindowsVb.Views
 
 #Region "Note selection and saving"
 
-        Private Sub SelectNote(note As NoteModel)
+        Private Sub SelectNote(note As NoteModel, Optional forceReload As Boolean = False)
             If Not _editor.IsReady Then
                 _pendingSelectNote = note
+                Return
+            End If
+
+            ' 同一条笔记且未强制重载时保留编辑器现状：搜索、标签筛选、元数据保存
+            ' 等操作会带着当前选中笔记再次走到这里，重载会把未保存的编辑连同
+            ' * 标记一起冲掉。磁盘内容变化（同步/重载/备份恢复）的路径须传
+            ' forceReload:=True。
+            If Not forceReload AndAlso note IsNot Nothing AndAlso Object.ReferenceEquals(note, _selectedNote) Then
                 Return
             End If
 
@@ -2267,7 +2382,7 @@ Namespace SilentNotes.WindowsVb.Views
                 RefreshNoteList(If(_selectedNote IsNot Nothing AndAlso _selectedNote.SafeId.HasValue, _selectedNote, Nothing))
                 If _selectedNote IsNot Nothing AndAlso _selectedNote.SafeId.HasValue Then
                     _logService.Info("刷新当前安全箱笔记的显示状态...")
-                    SelectNote(_selectedNote)
+                    SelectNote(_selectedNote, True)
                 End If
                 _logService.Info("关闭安全箱流程完成。")
             Catch ex As Exception
@@ -2425,7 +2540,7 @@ Namespace SilentNotes.WindowsVb.Views
                                                 Next
                                                 RefreshNoteList(_selectedNote)
                                                 If _selectedNote IsNot Nothing AndAlso _selectedNote.SafeId.HasValue AndAlso _safeKeyService.IsSafeOpen(_selectedNote.SafeId.Value) Then
-                                                    SelectNote(_selectedNote)
+                                                    SelectNote(_selectedNote, True)
                                                 End If
                                             Else
                                                 _logService.Info(String.Format("安全箱打开失败: 仓库中有 {0} 个安全箱", _repository.Safes.Count))

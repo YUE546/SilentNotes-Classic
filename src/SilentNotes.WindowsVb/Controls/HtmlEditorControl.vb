@@ -83,34 +83,65 @@ Namespace SilentNotes.WindowsVb.Controls
         End Sub
 
         Private Sub OnDocumentClick(sender As Object, e As HtmlElementEventArgs)
-            If Not _isChecklist Then
-                Return
-            End If
-
             ' MSHTML 里文档级点击的 e.ToElement 是 null，所以元素必须从点击坐标解析。
-            ' 这也覆盖了 ::before 复选框的点击——它不是 DOM 节点。
             Dim element As HtmlElement = _browser.Document.GetElementFromPoint(e.ClientMousePosition)
-            While element IsNot Nothing AndAlso Not String.Equals(element.TagName, "P", StringComparison.OrdinalIgnoreCase)
-                If String.Equals(element.TagName, "BODY", StringComparison.OrdinalIgnoreCase) Then
-                    Return
-                End If
-                element = element.Parent
-            End While
 
-            If element Is Nothing Then
-                Return
+            If _isChecklist Then
+                ' ::before 复选框的点击也走这里——它不是 DOM 节点，按段落定位。
+                Dim paragraph As HtmlElement = FindAncestorParagraph(element)
+                If paragraph IsNot Nothing Then
+                    ToggleChecklistItem(paragraph)
+                End If
             End If
 
-            Dim className As String = element.GetAttribute("className")
+            ' MSHTML 里 <hr> 靠点击建立不了选区，Delete/退格因此删不掉它；
+            ' 点击命中时用 control range 手工选中。
+            SelectHorizontalRuleAt(element)
+        End Sub
+
+        Private Function FindAncestorParagraph(element As HtmlElement) As HtmlElement
+            Dim current As HtmlElement = element
+            While current IsNot Nothing
+                If String.Equals(current.TagName, "P", StringComparison.OrdinalIgnoreCase) Then
+                    Return current
+                End If
+                If String.Equals(current.TagName, "BODY", StringComparison.OrdinalIgnoreCase) Then
+                    Return Nothing
+                End If
+                current = current.Parent
+            End While
+            Return Nothing
+        End Function
+
+        Private Sub ToggleChecklistItem(paragraph As HtmlElement)
+            Dim className As String = paragraph.GetAttribute("className")
             If className Is Nothing Then
                 className = String.Empty
             End If
             If className.Contains("done") Then
-                element.SetAttribute("className", className.Replace("done", "").Trim())
+                paragraph.SetAttribute("className", className.Replace("done", "").Trim())
             Else
-                element.SetAttribute("className", (className & " done").Trim())
+                paragraph.SetAttribute("className", (className & " done").Trim())
             End If
             OnDomEvent(Me, EventArgs.Empty)
+        End Sub
+
+        Private Sub SelectHorizontalRuleAt(element As HtmlElement)
+            If _readOnly Then
+                Return
+            End If
+
+            Dim current As HtmlElement = element
+            While current IsNot Nothing
+                If String.Equals(current.TagName, "HR", StringComparison.OrdinalIgnoreCase) Then
+                    MsHtmlLateBound.SelectElementAsControlRange(_browser.Document.DomDocument, current.DomElement)
+                    Return
+                End If
+                If String.Equals(current.TagName, "BODY", StringComparison.OrdinalIgnoreCase) Then
+                    Return
+                End If
+                current = current.Parent
+            End While
         End Sub
 
         ''' <summary>用给定的笔记 HTML 替换编辑器内容。</summary>
@@ -379,6 +410,32 @@ Namespace SilentNotes.WindowsVb.Controls
 #End Region
 
 #Region "Shell document and browser mode"
+
+        ''' <summary>
+        ''' 判断一个原生窗口句柄是否在编辑器 WebBrowser 的窗口树内。MSHTML 的
+        ''' 内部原生窗口（Internet Explorer_Server 等）是 WebBrowser 控件的
+        ''' 子孙窗口，键盘消息不会经过 WinForms 的焦点体系，快捷键过滤器靠
+        ''' 本方法判定按键来源。
+        ''' </summary>
+        Public Function ContainsNativeWindow(hwnd As IntPtr) As Boolean
+            If hwnd = IntPtr.Zero OrElse Not _browser.IsHandleCreated Then
+                Return False
+            End If
+
+            Dim browserHandle As IntPtr = _browser.Handle
+            Dim current As IntPtr = hwnd
+            While current <> IntPtr.Zero
+                If current = browserHandle Then
+                    Return True
+                End If
+                current = GetParent(current)
+            End While
+            Return False
+        End Function
+
+        <System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint:="GetParent")>
+        Private Shared Function GetParent(hWnd As IntPtr) As IntPtr
+        End Function
 
         Private Shared Function BuildShellHtml() As String
             Return "<!DOCTYPE html><html><head><meta http-equiv=""X-UA-Compatible"" content=""IE=11"">" &

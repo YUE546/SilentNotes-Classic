@@ -80,5 +80,18 @@ Namespace SilentNotes.WindowsVb.Controls
         Friend Function GetParentElement(element As Object) As Object
             Return element.parentElement
         End Function
+
+        ''' <summary>
+        ''' 把 hr 等控件元素放进 control range 并选中：MSHTML 不给这类元素常规
+        ''' 文本选区，control range 选中后 Delete/退格才能删掉它。
+        ''' </summary>
+        Friend Sub SelectElementAsControlRange(domDocument As Object, element As Object)
+            If element Is Nothing OrElse TypeOf element Is DBNull Then
+                Return
+            End If
+            Dim controlRange As Object = domDocument.body.createControlRange()
+            controlRange.add(element)
+            controlRange.select()
+        End Sub
     End Module
 End Namespace
