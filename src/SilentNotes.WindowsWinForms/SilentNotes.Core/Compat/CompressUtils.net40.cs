@@ -3,8 +3,8 @@
 // - GZip uses the CompressionMode overload (CompressionLevel is .NET 4.5+), the produced
 //   gzip streams are equivalent.
 // - ZipArchive (.NET 4.5+) is replaced by a hand written zip reader/writer. The writer
-//   creates store-mode entries (valid standard zip), the reader understands both store and
-//   deflate entries, so backups created by older .NET 4.7.2 builds remain readable.
+//   creates store-mode entries (valid standard zip), the reader understands both store
+//   and deflate entries.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -194,7 +194,7 @@ namespace SilentNotes.Workers
                 }
                 else if (method == 8)
                 {
-                    // Deflate entry (raw deflate stream, as also used by ZipArchive and old builds).
+                    // Deflate entry (raw deflate stream).
                     using (MemoryStream compressedStream = new MemoryStream(compressedData))
                     using (DeflateStream deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
                     using (MemoryStream uncompressedStream = new MemoryStream())

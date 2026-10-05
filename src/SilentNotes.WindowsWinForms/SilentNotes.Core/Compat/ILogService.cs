@@ -1,6 +1,5 @@
-// Compat shim: ILogService exists in the previously prebuilt SilentNotes.Core.dll but has
-// no source file in src/SilentNotes.AllPlatforms. Recreated here (signature-identical,
-// verified by reflecting the old DLL) so the rebuilt assembly keeps the same API surface.
+// Compat shim: ILogService has no source file in src/SilentNotes.AllPlatforms. Recreated
+// here with the same signatures so the rebuilt assembly keeps the same API surface.
 using System;
 
 namespace SilentNotes.Services

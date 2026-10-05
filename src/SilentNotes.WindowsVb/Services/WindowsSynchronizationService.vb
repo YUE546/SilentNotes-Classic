@@ -18,10 +18,9 @@ Imports VanillaCloudStorageClient.CloudStorageProviders
 
 Namespace SilentNotes.WindowsVb.Services
     ''' <summary>
-    ''' WebDAV 同步服务（VB10 重写版）：C# 原版是 async/await 链，VB10 无 async——
-    ''' 全链路改为同步方法，由调用方（MainForm）在后台线程上执行；底层 WebDAV 客户端
-    ''' 保留 Task 签名（与 C# 版共用同一 DLL），通过 TaskUtils.WaitAndUnwrap 等待并还原异常。
-    ''' 进度与选择框通过既有机制 marshal 回 UI 线程。
+    ''' WebDAV 同步服务：VB10 无 async，全链路为同步方法，由调用方（MainForm）
+    ''' 在后台线程执行；底层 WebDAV 客户端为 Task 签名，经 TaskUtils.WaitAndUnwrap
+    ''' 等待并还原异常。进度与选择框通过既有机制 marshal 回 UI 线程。
     ''' </summary>
     Friend Class WindowsSynchronizationService
         Public Shared ReadOnly CloudFilename As String = "silentnotes_repository.silentnotes"
@@ -171,138 +170,76 @@ Namespace SilentNotes.WindowsVb.Services
             End Try
         End Sub
 
-        ''' <summary>用指纹比较两个仓库是否一致，与原版 SilentNotes 行为匹配。</summary>
+        ''' <summary>用指纹比较两个仓库是否一致。</summary>
         Private Shared Function RepositoriesAreEqual(repo1 As NoteRepositoryModel, repo2 As NoteRepositoryModel) As Boolean
             Return repo1.GetModificationFingerprint() = repo2.GetModificationFingerprint()
         End Function
 
-        ''' <summary>progress?.Invoke 的 VB10 等价写法。</summary>
-        Private Shared Sub Report(progress As Action(Of String), message As String)
+        ''' <summary>progress?.Invoke 的 VB10 等价写法；isError 供 UI 决定红色显示。</summary>
+        Private Shared Sub Report(progress As Action(Of String, Boolean), message As String, isError As Boolean)
             If progress IsNot Nothing Then
-                progress(message)
+                progress(message, isError)
             End If
         End Sub
 
-        Public Function UploadToCloud(Optional progress As Action(Of String) = Nothing) As Boolean
+        Public Function UploadToCloud(Optional progress As Action(Of String, Boolean) = Nothing) As Boolean
             Try
                 Dim credentials As CloudStorageCredentials = GetCredentials()
                 If credentials Is Nothing Then
-                    Report(progress, "未配置 WebDAV 凭据。")
+                    Report(progress, "未配置 WebDAV 凭据。", True)
                     Return False
                 End If
 
-                Report(progress, "正在加载本地仓库...")
+                Report(progress, "正在加载本地仓库...", False)
                 Dim localRepository As NoteRepositoryModel = Nothing
                 _repositoryStorageService.LoadRepositoryOrDefault(localRepository)
                 If Object.ReferenceEquals(localRepository, NoteRepositoryModel.InvalidRepository) Then
-                    Report(progress, "本地仓库无效。")
+                    Report(progress, "本地仓库无效。", True)
                     Return False
                 End If
 
-                Report(progress, "正在加密仓库...")
+                Report(progress, "正在加密仓库...", False)
                 Dim encrypted As Byte() = EncryptRepository(localRepository)
 
-                Report(progress, "正在上传到 WebDAV...")
+                Report(progress, "正在上传到 WebDAV...", False)
                 Dim diagnostics As New WebDavDiagnostics(_log)
                 diagnostics.Upload(CloudFilename, encrypted, credentials)
 
                 _log.Info("加密仓库上传成功")
-                Report(progress, "上传成功！")
+                Report(progress, "上传成功！", False)
                 Return True
             Catch ex As AccessDeniedException
                 _log.Warning("上传失败：认证被拒")
-                Report(progress, "上传失败：用户名或密码错误。")
+                Report(progress, "上传失败：用户名或密码错误。", True)
                 Return False
             Catch ex As Exception
                 _log.[Error]("上传到 WebDAV 失败", ex)
-                Report(progress, "上传失败：" & ex.Message)
-                Return False
-            End Try
-        End Function
-
-        ' C# 版里无任何调用者（死代码），为保持行为一致仍保留。
-        Public Function DownloadFromCloud(Optional progress As Action(Of String) = Nothing) As Boolean
-            Try
-                Dim credentials As CloudStorageCredentials = GetCredentials()
-                If credentials Is Nothing Then
-                    Report(progress, "未配置 WebDAV 凭据。")
-                    Return False
-                End If
-
-                Report(progress, "正在从 WebDAV 下载...")
-                Dim client As New WebdavCloudStorageClient(False)
-                Dim encrypted As Byte()
-                Try
-                    encrypted = TaskUtils.WaitAndUnwrap(Of Byte())(client.DownloadFileAsync(CloudFilename, credentials))
-                Catch
-                    _log.Info("云端无备份")
-                    Report(progress, "云端没有找到备份文件。")
-                    Return False
-                End Try
-
-                Report(progress, "正在解密仓库...")
-                Dim decrypted As Byte()
-                Try
-                    decrypted = DecryptRepository(encrypted)
-                Catch ex As CryptoDecryptionException
-                    Report(progress, "解密失败：传输码不正确。")
-                    _log.Warning("下载仓库解密失败（传输码错误）")
-                    Return False
-                End Try
-
-                Report(progress, "正在解析仓库...")
-                Dim dummyLoadedRepo As NoteRepositoryModel = Nothing
-                If Not _repositoryStorageService.TryLoadRepositoryFromFile(decrypted, dummyLoadedRepo) Then
-                    Report(progress, "文件格式无效。")
-                    Return False
-                End If
-
-                Report(progress, "正在替换本地仓库...")
-                Try
-                    Dim location As String = _repositoryStorageService.GetLocation()
-                    Dim xmlPath As String = Path.Combine(location, NoteRepositoryModel.RepositoryFileName)
-                    File.WriteAllBytes(xmlPath, decrypted)
-                    _repositoryStorageService.ClearCache()
-                Catch ex As Exception
-                    _log.[Error]("保存本地仓库失败", ex)
-                    Report(progress, "保存失败：" & ex.Message)
-                    Return False
-                End Try
-
-                Report(progress, "下载成功！请重新加载仓库。")
-                Return True
-            Catch ex As AccessDeniedException
-                _log.Warning("下载失败：认证被拒")
-                Report(progress, "下载失败：用户名或密码错误。")
-                Return False
-            Catch ex As Exception
-                _log.[Error]("下载失败", ex)
-                Report(progress, "下载失败：" & ex.Message)
+                Report(progress, "上传失败：" & ex.Message, True)
                 Return False
             End Try
         End Function
 
         ''' <summary>
-        ''' 基于指纹比较同步本地与云端仓库，与原版 SilentNotes 行为匹配：
+        ''' 基于指纹比较同步本地与云端仓库：
         ''' 1. 比较指纹检测变化；2. 用 NoteRepositoryMerger 正确合并；3. 仅在仓库不同时上传/下载。
         ''' 必须在后台线程调用（网络 + PBKDF2 是阻塞操作）。
         ''' </summary>
-        Public Function Sync(Optional progress As Action(Of String) = Nothing) As Boolean
+        Public Function Sync(Optional progress As Action(Of String, Boolean) = Nothing) As Boolean
             Try
                 Dim credentials As CloudStorageCredentials = GetCredentials()
                 If credentials Is Nothing Then
-                    Report(progress, "未配置 WebDAV 凭据。")
+                    Report(progress, "未配置 WebDAV 凭据。", True)
                     Return False
                 End If
 
                 Dim localRepo As NoteRepositoryModel = Nothing
                 _repositoryStorageService.LoadRepositoryOrDefault(localRepo)
                 If Object.ReferenceEquals(localRepo, NoteRepositoryModel.InvalidRepository) Then
-                    Report(progress, "本地仓库无效。")
+                    Report(progress, "本地仓库无效。", True)
                     Return False
                 End If
 
-                Report(progress, "正在检查云端...")
+                Report(progress, "正在检查云端...", False)
                 Dim client As New WebdavCloudStorageClient(False)
 
                 Dim existsInCloud As Boolean
@@ -310,29 +247,32 @@ Namespace SilentNotes.WindowsVb.Services
                     existsInCloud = TaskUtils.WaitAndUnwrap(Of Boolean)(client.ExistsFileAsync(CloudFilename, credentials))
                 Catch ex As AccessDeniedException
                     Throw
-                Catch
-                    _log.Info("检查云端失败，假设不存在")
-                    existsInCloud = False
+                Catch ex As Exception
+                    ' 检查失败不能当作"云端不存在"：那会走无合并的直接上传，
+                    ' 瞬时网络/服务器错误会导致云端仓库被本地版本静默覆盖。
+                    _log.[Error]("检查云端仓库状态失败", ex)
+                    Report(progress, "无法确认云端仓库状态，已取消本次同步，请稍后重试。", True)
+                    Return False
                 End Try
 
                 If Not existsInCloud AndAlso Not HasTransferCode Then
                     Dim autoCode As String = CryptoUtils.GenerateRandomBase62String(16, _cryptoRandomService)
                     SetTransferCode(autoCode)
                     _log.Info("已自动生成传输码（首次同步）")
-                    Report(progress, "已自动生成传输码，请记住此码用于其他设备同步。")
+                    Report(progress, "已自动生成传输码，请记住此码用于其他设备同步。", False)
                 ElseIf Not HasTransferCode Then
-                    Report(progress, "请先在设置中设置传输码。")
+                    Report(progress, "请先在设置中设置传输码。", True)
                     Return False
                 End If
 
                 If Not existsInCloud Then
-                    Report(progress, "云端无备份，正在上传...")
+                    Report(progress, "云端无备份，正在上传...", False)
                     CreateLocalBackup()
                     Return UploadToCloud(progress)
                 End If
 
                 ' 云端文件存在，下载它
-                Report(progress, "正在下载云端仓库...")
+                Report(progress, "正在下载云端仓库...", False)
                 Dim encrypted As Byte()
                 Try
                     encrypted = TaskUtils.WaitAndUnwrap(Of Byte())(client.DownloadFileAsync(CloudFilename, credentials))
@@ -340,7 +280,7 @@ Namespace SilentNotes.WindowsVb.Services
                     Throw
                 Catch ex As Exception
                     _log.[Error]("下载云端仓库失败", ex)
-                    Report(progress, "下载失败：" & ex.Message)
+                    Report(progress, "下载失败：" & ex.Message, True)
                     Return False
                 End Try
 
@@ -348,17 +288,17 @@ Namespace SilentNotes.WindowsVb.Services
                 Try
                     decrypted = DecryptRepository(encrypted)
                 Catch ex As CryptoDecryptionException
-                    Report(progress, "解析失败：传输码错误，请检查设置。")
+                    Report(progress, "解析失败：传输码错误，请检查设置。", True)
                     Return False
                 End Try
 
                 Dim cloudRepo As NoteRepositoryModel = Nothing
                 If Not _repositoryStorageService.TryLoadRepositoryFromFile(decrypted, cloudRepo) Then
-                    Report(progress, "云端文件格式无效。")
+                    Report(progress, "云端文件格式无效。", True)
                     Return False
                 End If
 
-                ' 检查仓库 ID 是否一致（匹配原版 SilentNotes 行为）
+                ' 检查仓库 ID 是否一致
                 If localRepo.Id = cloudRepo.Id Then
                     ' 同一仓库——自动合并，无对话框
                     _log.Info(String.Format("同设备同步：本地 {0} 条，云端 {1} 条", localRepo.Notes.Count, cloudRepo.Notes.Count))
@@ -370,11 +310,11 @@ Namespace SilentNotes.WindowsVb.Services
                 End If
             Catch ex As AccessDeniedException
                 _log.Warning("同步失败：认证被拒")
-                Report(progress, "同步失败：用户名或密码错误。")
+                Report(progress, "同步失败：用户名或密码错误。", True)
                 Return False
             Catch ex As Exception
                 _log.[Error]("同步失败", ex)
-                Report(progress, "同步失败：" & ex.Message)
+                Report(progress, "同步失败：" & ex.Message, True)
                 Return False
             End Try
         End Function
@@ -382,7 +322,7 @@ Namespace SilentNotes.WindowsVb.Services
         ''' <summary>
         ''' 合并本地与云端仓库并保存/上传结果。用于同一 ID（同设备）的仓库。
         ''' </summary>
-        Private Function MergeAndSave(localRepo As NoteRepositoryModel, cloudRepo As NoteRepositoryModel, progress As Action(Of String)) As Boolean
+        Private Function MergeAndSave(localRepo As NoteRepositoryModel, cloudRepo As NoteRepositoryModel, progress As Action(Of String, Boolean)) As Boolean
             Dim merger As New NoteRepositoryMerger()
             Dim mergedRepo As NoteRepositoryModel = merger.Merge(localRepo, cloudRepo)
 
@@ -390,7 +330,7 @@ Namespace SilentNotes.WindowsVb.Services
             Dim cloudChanged As Boolean = Not RepositoriesAreEqual(mergedRepo, cloudRepo)
 
             If Not localChanged AndAlso Not cloudChanged Then
-                Report(progress, "同步完成：无需更新。")
+                Report(progress, "同步完成：无需更新。", False)
                 Return True
             End If
 
@@ -402,7 +342,7 @@ Namespace SilentNotes.WindowsVb.Services
             End If
 
             If cloudChanged Then
-                Report(progress, "正在上传合并后的仓库到云端...")
+                Report(progress, "正在上传合并后的仓库到云端...", False)
                 Dim credentials As CloudStorageCredentials = GetCredentials()
                 Dim encryptedMerged As Byte() = EncryptRepository(mergedRepo)
                 Dim diagnostics As New WebDavDiagnostics(_log)
@@ -410,7 +350,7 @@ Namespace SilentNotes.WindowsVb.Services
                 _log.Info("已上传合并后的仓库到云端")
             End If
 
-            Report(progress, "同步完成！")
+            Report(progress, "同步完成！", False)
             Return True
         End Function
 
@@ -446,14 +386,13 @@ Namespace SilentNotes.WindowsVb.Services
         End Function
 
         ''' <summary>
-        ''' 处理本地与云端仓库 ID 不同时的同步：弹框询问合并/使用云端/取消，
-        ''' 匹配原版 SilentNotes 的 ShowMergeChoiceStep 行为。
+        ''' 处理本地与云端仓库 ID 不同时的同步：弹框询问合并/使用云端/取消。
         ''' </summary>
         Private Function HandleDifferentRepository(
             localRepo As NoteRepositoryModel,
             cloudRepo As NoteRepositoryModel,
             decryptedCloudBytes As Byte(),
-            progress As Action(Of String)) As Boolean
+            progress As Action(Of String, Boolean)) As Boolean
 
             ' VB 把 Notes.Count(predicate) 解析为对 Count 属性做索引，扩展方法须走 Where().Count()
             Dim localCount As Integer = localRepo.Notes.Where(Function(n) Not n.InRecyclingBin).Count()
@@ -462,19 +401,19 @@ Namespace SilentNotes.WindowsVb.Services
             Dim result As DialogResult = ShowSyncChoiceDialog(localCount, cloudCount)
 
             If result = DialogResult.Cancel Then
-                Report(progress, "同步已取消。")
+                Report(progress, "同步已取消。", False)
                 Return False
             End If
 
             If result = DialogResult.Yes Then
                 ' 合并两个仓库
-                Report(progress, "正在合并仓库...")
+                Report(progress, "正在合并仓库...", False)
                 Return MergeAndSave(localRepo, cloudRepo, progress)
             End If
 
             If result = DialogResult.No Then
                 ' 使用云端版本
-                Report(progress, "正在使用云端版本...")
+                Report(progress, "正在使用云端版本...", False)
                 CreateLocalBackup()
                 Try
                     Dim location As String = _repositoryStorageService.GetLocation()
@@ -482,11 +421,11 @@ Namespace SilentNotes.WindowsVb.Services
                     File.WriteAllBytes(xmlPath, decryptedCloudBytes)
                     _repositoryStorageService.ClearCache()
                     _log.Info("已使用云端版本覆盖本地")
-                    Report(progress, "同步完成！")
+                    Report(progress, "同步完成！", False)
                     Return True
                 Catch ex As Exception
                     _log.[Error]("保存仓库失败", ex)
-                    Report(progress, "保存失败：" & ex.Message)
+                    Report(progress, "保存失败：" & ex.Message, True)
                     Return False
                 End Try
             End If

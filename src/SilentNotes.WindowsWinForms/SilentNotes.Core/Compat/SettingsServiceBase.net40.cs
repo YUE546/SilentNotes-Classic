@@ -1,7 +1,6 @@
 // Compat copy of SilentNotes.AllPlatforms\Services\SettingsServiceBase.cs for .NET 4.0.
 // Only difference to the frozen original: TrySaveSettingsToLocalDevice is declared virtual,
-// because both Windows clients override it (the previously prebuilt DLL had it virtual too;
-// the current shared source lost the modifier).
+// because both Windows clients override it.
 
 using System;
 using System.IO;
@@ -47,7 +46,8 @@ namespace SilentNotes.Services
             try
             {
                 string xmlFilePath = Path.Combine(GetDirectoryPath(), SettingsModel.UserSettingsFileName);
-                if (_xmlFileService.TryLoad(xmlFilePath, out XDocument xml))
+                XDocument xml;
+                if (_xmlFileService.TryLoad(xmlFilePath, out xml))
                 {
                     modelWasUpdated = UpdateSettings(xml);
                     result = XmlUtils.DeserializeFromXmlDocument<SettingsModel>(xml);

@@ -12,19 +12,19 @@ Namespace SilentNotes.WindowsVb
     Public Class ServiceCollection
         Private ReadOnly _descriptors As New List(Of ServiceDescriptor)()
 
-        ''' <summary>把 TService 注册为单例，实现类就是 TService 本身（对应 MEDI 的 AddSingleton&lt;T&gt;()）。</summary>
+        ''' <summary>把 TService 注册为单例，实现类就是 TService 本身。</summary>
         Public Function AddSingleton(Of TService As Class)() As ServiceCollection
             _descriptors.Add(ServiceDescriptor.ForType(GetType(TService), GetType(TService)))
             Return Me
         End Function
 
-        ''' <summary>把 TService 注册为单例，实现类为 TImplementation（对应 MEDI 的 AddSingleton&lt;T, TImpl&gt;()）。</summary>
+        ''' <summary>把 TService 注册为单例，实现类为 TImplementation。</summary>
         Public Function AddSingleton(Of TService As Class, TImplementation As Class)() As ServiceCollection
             _descriptors.Add(ServiceDescriptor.ForType(GetType(TService), GetType(TImplementation)))
             Return Me
         End Function
 
-        ''' <summary>用工厂创建单例（对应 MEDI 的 AddSingleton&lt;T&gt;(provider =&gt; ...)）。</summary>
+        ''' <summary>用工厂创建单例。</summary>
         Public Function AddSingleton(Of TService As Class)(factory As Func(Of IServiceProvider, TService)) As ServiceCollection
             _descriptors.Add(ServiceDescriptor.ForFactory(GetType(TService), factory))
             Return Me
@@ -74,7 +74,7 @@ Namespace SilentNotes.WindowsVb
             End SyncLock
         End Function
 
-        ''' <summary>对应 MEDI 的 GetRequiredService：未注册直接抛异常。</summary>
+        ''' <summary>未注册时抛 InvalidOperationException。</summary>
         Public Function GetRequiredService(Of T As {Class})() As T
             Return CType(GetService(GetType(T)), T)
         End Function
@@ -100,7 +100,7 @@ Namespace SilentNotes.WindowsVb
             Return instance
         End Function
 
-        ''' <summary>按"参数最多的公共构造函数"做反射构造注入（对应 MEDI 的默认行为）。</summary>
+        ''' <summary>按"参数最多的公共构造函数"做反射构造注入。</summary>
         Private Function CreateInstance(implementationType As Type) As Object
             Dim constructors As ConstructorInfo() = implementationType.GetConstructors()
             If constructors.Length = 0 Then

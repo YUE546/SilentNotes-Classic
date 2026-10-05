@@ -17,7 +17,7 @@ Namespace SilentNotes.WindowsVb.Services
 
         Public Function IsInternetCostFree() As Boolean Implements IInternetStateService.IsInternetCostFree
             ' 桌面 Windows 上，除非是按流量计费的连接，否则视为免费连接。
-            ' 为简单起见只检查连通性。
+            ' 只检查连通性。
             Return IsInternetConnected()
         End Function
     End Class

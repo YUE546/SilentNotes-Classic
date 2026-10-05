@@ -9,9 +9,8 @@ Imports Sunny.UI
 
 Namespace SilentNotes.WindowsVb.Services
     ''' <summary>
-    ''' WinForms 客户端的 Core 反馈接口实现。Toast 走 SunnyUI 的瞬态 UIMessageTip
-    ''' 而非阻塞的 MessageBox；模态消息用 ThemedDialogForm，让 Core 发起的提示
-    ''' 跟随应用配色而不是无主题的系统 MessageBox。
+    ''' WinForms 客户端的 Core 反馈接口实现。Toast 走 SunnyUI 的瞬态 UIMessageTip；
+    ''' 模态消息用 ThemedDialogForm。
     ''' </summary>
     Friend Class WinFormsFeedbackService
         Implements IFeedbackService
@@ -86,7 +85,9 @@ Namespace SilentNotes.WindowsVb.Services
                 End Select
 
                 dialog.ApplyTheme(_theme)
-                defaultButton.Focus()
+                ' Focus 在句柄创建前调用是 no-op，初始焦点会落到 Tab 序第一个按钮；
+                ' Shown 之后再聚焦才能让保守默认（取消）真正生效。
+                AddHandler dialog.Shown, Sub() defaultButton.Focus()
                 ShowDialogOnOwner(dialog)
                 result = ToResult(dialog.DialogResult, buttons)
             End Using

@@ -62,7 +62,7 @@ Namespace SilentNotes.WindowsVb.Controls
 
             Dim document As HtmlDocument = _browser.Document
             document.AttachEventHandler("oninput", AddressOf OnDomEvent)
-            document.AttachEventHandler("onkeyup", AddressOf OnDomEvent)
+            document.AttachEventHandler("onkeyup", AddressOf OnKeyUpDomEvent)
             document.AttachEventHandler("onpaste", AddressOf OnDomEvent)
             document.AttachEventHandler("oncut", AddressOf OnDomEvent)
             document.AttachEventHandler("onselectionchange", AddressOf OnSelectionEvent)
@@ -74,6 +74,26 @@ Namespace SilentNotes.WindowsVb.Controls
         End Sub
 
         Private Sub OnDomEvent(sender As Object, e As EventArgs)
+            RaiseEvent ContentChanged(Me, EventArgs.Empty)
+        End Sub
+
+        ' onkeyup 对所有按键触发，包括不修改内容的修饰键/导航键；只让可能改动
+        ' 内容的按键标记脏，否则在编辑器里松开 Ctrl 也会点亮 * 标记。
+        Private Sub OnKeyUpDomEvent(sender As Object, e As EventArgs)
+            Dim keyCode As Integer = MsHtmlLateBound.GetCurrentEventKeyCode(_browser.Document.DomDocument)
+            If keyCode <> 0 Then
+                Select Case CType(keyCode, Keys)
+                    Case Keys.ControlKey, Keys.ShiftKey, Keys.Menu, Keys.Escape, Keys.Insert,
+                         Keys.Up, Keys.Down, Keys.Left, Keys.Right, Keys.Home, Keys.End,
+                         Keys.PageUp, Keys.PageDown, Keys.PrintScreen, Keys.Pause,
+                         Keys.CapsLock, Keys.NumLock, Keys.Scroll, Keys.LWin, Keys.RWin,
+                         Keys.Apps, Keys.Help
+                        Return
+                End Select
+                If keyCode >= CInt(Keys.F1) AndAlso keyCode <= CInt(Keys.F24) Then
+                    Return
+                End If
+            End If
             RaiseEvent ContentChanged(Me, EventArgs.Empty)
         End Sub
 
@@ -157,8 +177,8 @@ Namespace SilentNotes.WindowsVb.Controls
         End Sub
 
         ''' <summary>
-        ''' 返回编辑内容的 HTML。标签与属性名转为小写，让输出与其它 SilentNotes 客户端
-        ''' 存储的方言一致。
+        ''' 返回编辑内容的 HTML。标签与属性名转为小写
+        ''' （存储方言为小写标签/属性名）。
         ''' </summary>
         Public Function GetHtml() As String
             If Not _ready Then
@@ -208,23 +228,46 @@ Namespace SilentNotes.WindowsVb.Controls
                 Return
             End If
 
-            ' 这些十六进制值镜像 WinFormsThemeService 的 token（SurfacePaper、
-            ' SurfaceWindow、BorderSubtle、Accent...）。MSHTML 需要字面 CSS，
-            ' 所以在这里重复——两边都要与文档表保持同步。
-            Dim paper As String = If(dark, "#223030", "#FFFFFF")
-            Dim text As String = If(dark, "#D9E6E2", "#12433E")
-            Dim quoteBg As String = If(dark, "#1D2927", "#F0F7F5")
-            Dim quoteBorder As String = If(dark, "#33443F", "#CFE0DA")
-            Dim codeBg As String = If(dark, "#1D2927", "#F0F7F5")
-            Dim linkColor As String = If(dark, "#2DD4BF", "#0D9488")
-            Dim headingColor As String = If(dark, "#2DD4BF", "#0D9488")
-            Dim headingLine As String = If(dark, "#33443F", "#CFE0DA")
+            Dim index As Integer = If(dark, 1, 0) + If(isChecklist, 2, 0)
+            Dim css As String = EditorCssCache(index)
+            If css Is Nothing Then
+                css = BuildEditorCss(dark, isChecklist)
+                EditorCssCache(index) = css
+            End If
 
-            ' MSHTML 认识旧版 IE 的 scrollbar-* 属性；这是重设编辑器滚动条样式的
+            Try
+                Dim document As Object = _browser.Document.DomDocument
+                ' 每次更新都重建 style 元素：MSHTML 只认通过 styleSheet.cssText 写入的
+                ' 样式表，新元素是替换样式表唯一可靠的方式。
+                MsHtmlLateBound.ApplyEditorStyle(document, css)
+
+                Dim bodyElement As Object = MsHtmlLateBound.GetBody(document)
+                MsHtmlLateBound.SetBodyClassName(bodyElement, If(isChecklist, "sn-checklist", ""))
+            Catch
+                ' 样式刷新失败不能破坏主题切换；编辑器保留上一个样式表直到下一次 SetEditorTheme。
+            End Try
+        End Sub
+
+        ''' <summary>有效组合只有 (dark, isChecklist) 四种，缓存避免每次切笔记重拼 CSS 和 Base64。</summary>
+        Private Shared ReadOnly EditorCssCache(3) As String
+
+        Private Shared Function BuildEditorCss(dark As Boolean, isChecklist As Boolean) As String
+            ' MSHTML 需要字面 CSS，主题色在此以字面值硬编码；
+            ' WinFormsThemeService 的 token 调整时必须同步本表。
+            Dim paper As String = If(dark, "#29292D", "#FFFFFF")
+            Dim text As String = If(dark, "#E4E4E7", "#1F2328")
+            Dim quoteBg As String = If(dark, "#212124", "#F7F7F8")
+            Dim quoteBorder As String = If(dark, "#3A3A40", "#D8D8DC")
+            Dim codeBg As String = If(dark, "#212124", "#F7F7F8")
+            Dim linkColor As String = If(dark, "#2DD4BF", "#0D9488")
+            Dim headingColor As String = "#50A0FF"
+            Dim headingLine As String = If(dark, "#3A3A40", "#D8D8DC")
+
+            ' MSHTML（IE11 引擎）认识 scrollbar-* 属性；这是重设编辑器滚动条样式的
             ' 唯一方法（只改颜色——经典形状保留）。
-            Dim sbFace As String = If(dark, "#33443F", "#CFE0DA")
-            Dim sbTrack As String = If(dark, "#223030", "#FFFFFF")
-            Dim sbArrow As String = If(dark, "#8FA8A0", "#5B776E")
+            Dim sbFace As String = If(dark, "#3A3A40", "#D8D8DC")
+            Dim sbTrack As String = If(dark, "#29292D", "#FFFFFF")
+            Dim sbArrow As String = If(dark, "#9A9AA3", "#57575E")
 
             Dim css As New System.Text.StringBuilder()
             css.Append("html{background:" & paper & ";")
@@ -252,9 +295,8 @@ Namespace SilentNotes.WindowsVb.Controls
             css.Append("a{color:" & linkColor & ";}")
             If isChecklist Then
                 Dim accent As String = If(dark, "#2DD4BF", "#0D9488")
-                ' 中性灰与偏 teal 的深色纸面冲突；条目改用同一色调稍浅的底色。
-                Dim itemBg As String = If(dark, "#212B28", "#F2F2F2")
-                Dim doneText As String = If(dark, "#6E8880", "#8AA39C")
+                Dim itemBg As String = If(dark, "#242428", "#F2F2F2")
+                Dim doneText As String = If(dark, "#8B8B92", "#8E8E95")
                 ' 对勾是内联 SVG 背景而不是文本字形：MSHTML 的字体回退会把 U+2713
                 ' 渲染成错位的缺字形方框。Base64 让 data URI 在 cssText 往返中保持安全。
                 Dim checkSvg As String = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>" &
@@ -266,7 +308,7 @@ Namespace SilentNotes.WindowsVb.Controls
                 ' （负 text-indent 把方框拉回外面）让换行与文本对齐而不是与复选框对齐。
                 css.Append("body.sn-checklist p{margin:9px 0;padding:2px 6px 2px 30px;text-indent:-24px;")
                 css.Append("background:" & itemBg & ";border-radius:6px;cursor:default;}")
-                ' 复选框画成真正的圆角方框而不是字体字形，这样它在两套配色下都清晰并带 accent 色。
+                ' 复选框画成圆角方框（border + border-radius），不用字体字形。
                 css.Append("body.sn-checklist p:before{content:'';display:inline-block;width:15px;height:15px;")
                 css.Append("border:1px solid " & accent & ";border-radius:4px;margin-right:9px;vertical-align:-3px;}")
                 css.Append("body.sn-checklist p.done:before{background-color:" & accent & ";border-color:" & accent & ";")
@@ -275,18 +317,8 @@ Namespace SilentNotes.WindowsVb.Controls
                 css.Append("body.sn-checklist p.done{text-decoration:line-through;color:" & doneText & ";}")
             End If
 
-            Try
-                Dim document As Object = _browser.Document.DomDocument
-                ' 每次更新都重建 style 元素：MSHTML 只认通过 styleSheet.cssText 写入的
-                ' 样式表，新元素是替换样式表唯一可靠的方式。
-                MsHtmlLateBound.ApplyEditorStyle(document, css.ToString())
-
-                Dim bodyElement As Object = MsHtmlLateBound.GetBody(document)
-                MsHtmlLateBound.SetBodyClassName(bodyElement, If(isChecklist, "sn-checklist", ""))
-            Catch
-                ' 样式刷新失败不能破坏主题切换；编辑器保留上一个样式表直到下一次 SetEditorTheme。
-            End Try
-        End Sub
+            Return css.ToString()
+        End Function
 
 #End Region
 

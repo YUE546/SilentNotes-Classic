@@ -1,7 +1,7 @@
 // Compat copy of SilentNotes.AllPlatforms\Crypto\KeyDerivation\KeyDerivationFactory.cs for .NET 4.0.
 // The argon2id case is removed: no Argon2 implementation exists for .NET 4.0, the Windows
-// clients are switched to pbkdf2 (same kdf name as the original upstream format). Existing
-// argon2id ciphertexts require a one-time data migration before using the net40 build.
+// clients use pbkdf2. Existing argon2id ciphertexts require a one-time data migration
+// before using the net40 build.
 using System;
 
 namespace SilentNotes.Crypto.KeyDerivation

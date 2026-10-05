@@ -91,7 +91,6 @@
     <Compile Include="Services\WinFormsFeedbackService.vb" />
     <Compile Include="Services\WebDavDiagnostics.vb" />
     <Compile Include="Services\WindowsSynchronizationService.vb" />
-    <Compile Include="Controls\SegmentedToggle.vb" />
     <Compile Include="Controls\ThemedDialogForm.vb" />
     <Compile Include="Controls\ThemedConfirmDialog.vb" />
     <Compile Include="Controls\WebDavSettingsDialog.vb" />

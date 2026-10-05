@@ -32,7 +32,8 @@ namespace SilentNotes.Services
             needsReEncryption = false;
             if (!_safeKeys.ContainsKey(safe.Id))
             {
-                if (SafeModel.TryDecryptKey(safe.SerializeableKey, password, out byte[] decryptedKey, out needsReEncryption))
+                byte[] decryptedKey;
+                if (SafeModel.TryDecryptKey(safe.SerializeableKey, password, out decryptedKey, out needsReEncryption))
                     _safeKeys.Add(safe.Id, decryptedKey);
             }
             return IsSafeOpen(safe.Id);
@@ -53,7 +54,8 @@ namespace SilentNotes.Services
         /// <inheritdoc/>
         public void CloseSafe(Guid safeId)
         {
-            if (_safeKeys.TryGetValue(safeId, out byte[] key))
+            byte[] key;
+            if (_safeKeys.TryGetValue(safeId, out key))
             {
                 _safeKeys.Remove(safeId);
                 CryptoUtils.CleanArray(key);

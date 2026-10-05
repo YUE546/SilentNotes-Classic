@@ -63,18 +63,19 @@ namespace VanillaCloudStorageClient
         /// <returns>A cloud storage exception.</returns>
         protected static CloudStorageException ConvertToCloudStorageException(Exception catchedException)
         {
-            if (catchedException is CloudStorageException catchedCloudStorageException)
+            if (catchedException is CloudStorageException)
             {
                 // The catched exception is already of correct type.
-                return catchedCloudStorageException;
+                return (CloudStorageException)catchedException;
             }
-            else if (catchedException.InnerException is CloudStorageException innerCloudStorageException)
+            else if (catchedException.InnerException is CloudStorageException)
             {
                 // The catched exception is already of correct type but is wrapped inside another exception.
-                return innerCloudStorageException;
+                return (CloudStorageException)catchedException.InnerException;
             }
-            else if (catchedException is WebException webException)
+            else if (catchedException is WebException)
             {
+                WebException webException = (WebException)catchedException;
                 switch (webException.Status)
                 {
                     case WebExceptionStatus.Timeout:

@@ -22,7 +22,7 @@ Imports VanillaCloudStorageClient
 
 Namespace SilentNotes.WindowsVb.Views
     ''' <summary>
-    ''' WinForms 版 WPF MainWindow 的移植：两栏工作区（左侧找笔记、右侧写笔记），
+    ''' 两栏工作区（左侧找笔记、右侧写笔记），
     ''' 底部状态栏非阻塞反馈，危险操作只出现在回收站模式。内容基于 SunnyUI 控件
     ''' （每个都标记 Style=Custom 并经 WinFormsThemeService 着色），窗口用系统原生
     ''' 标题栏，因此标题栏按钮与窗口动画保持完整。
@@ -48,9 +48,16 @@ Namespace SilentNotes.WindowsVb.Views
         Private _contentDirty As Boolean
         Private _showRecycleBin As Boolean
         Private _searchText As String = String.Empty
+        Private _searchDebounceTimer As Timer
         Private _selectedTag As String
         Private _editorTitleBase As String = "编辑器"
         Private _tagSuggestions As New List(Of String)()
+        ' 列表自绘用的画笔缓存：DrawItem 每行每次滚动/悬停都会触发，现场 new Brush
+        ' 会造成 GC 压力；主题切换时在 ApplyThemeToUi 里统一 Dispose 重建。
+        Private _listPaperBrush As SolidBrush
+        Private _listAccentSoftBrush As SolidBrush
+        Private _listHoverBrush As SolidBrush
+        Private _listAccentBrush As SolidBrush
         Private ReadOnly _safeNoteTitles As New Dictionary(Of Guid, String)()
         Private _listItems As New List(Of NoteListItem)()
 
@@ -75,7 +82,8 @@ Namespace SilentNotes.WindowsVb.Views
         Private _modeTogglePanel As Panel
         Private _activeModeButtons As Panel
         Private _recycleBinModeButtons As Panel
-        Private _modeToggle As SegmentedToggle
+        Private _modeBreadcrumb As UIBreadcrumb
+        Private _modeHoverIndex As Integer = -1
         Private _newNoteButton As UIButton
         Private _newChecklistButton As UIButton
         Private _deleteNoteButton As UIButton
@@ -83,7 +91,7 @@ Namespace SilentNotes.WindowsVb.Views
         Private _permanentDeleteButton As UIButton
         Private _emptyBinButton As UIButton
         Private _searchBox As UITextBox
-        Private _tagPanel As FlowLayoutPanel
+        Private _tagFlow As UIFlowLayoutPanel
         Private _emptyListLabel As UILabel
         Private _notesList As UIListBox
 
@@ -102,8 +110,11 @@ Namespace SilentNotes.WindowsVb.Views
         ' （"Bold"、"InsertUnorderedList"...）或 FormatBlock 按钮的块标签
         ' （"H1"、"BLOCKQUOTE"、"PRE"）。
         Private ReadOnly _toolbarStateButtons As New Dictionary(Of String, UIButton)()
-        Private _toolbarStatePending As Boolean
-        Private _wordCountPending As Boolean
+        ' 各状态按钮上次应用的按下态：状态不变时跳过 SetToolbarButtonActive 的重着色。
+        Private ReadOnly _toolbarActiveState As New Dictionary(Of String, Boolean)()
+        ' 250ms 节流：合并工具栏状态刷新与字数统计，避免打字期间每条 DOM 事件
+        ' 都做 ~11 次 MSHTML COM 往返（GetCurrentBlockTag + 每钮 QueryState）。
+        Private _editorUiTimer As Timer
 
         ' 状态栏
         Private _statusPanel As UIPanel
@@ -178,6 +189,9 @@ Namespace SilentNotes.WindowsVb.Views
             BuildTopBar()
             BuildSplit()
             BuildMoreMenu()
+
+            _editorUiTimer = New Timer With {.Interval = 250}
+            AddHandler _editorUiTimer.Tick, AddressOf EditorUiTimer_Tick
         End Sub
 
         Private Sub BuildStatusBar()
@@ -377,23 +391,17 @@ Namespace SilentNotes.WindowsVb.Views
                 .Tag = "secondary"
             }
 
-            ' 标签筛选药丸放在一个裁剪容器里：AutoScroll 的系统横向滚动条落在
-            ' 容器外面并被隐藏（Shift+滚轮可横向滚动）。
-            Dim tagPanelHost As New Panel With {.Dock = DockStyle.Top, .Height = 34, .BackColor = Color.Transparent, .Tag = "bare"}
-            _tagPanel = New FlowLayoutPanel With {
-                .Top = 0,
-                .Left = 0,
-                .Width = 300,
-                .Height = 60,
+            ' 容器高度 = 药丸行 + SunnyUI 横向滚动条（HBar 按需自动出现）。
+            Dim tagPanelHost As New Panel With {.Dock = DockStyle.Top, .Height = 52, .BackColor = Color.Transparent, .Tag = "window"}
+            _tagFlow = New UIFlowLayoutPanel With {
+                .Dock = DockStyle.Fill,
                 .WrapContents = False,
-                .AutoScroll = True,
-                .Padding = New Padding(0, 2, 0, 2),
-                .BackColor = Color.Transparent,
-                .Font = UIAppFont,
-                .Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+                .Tag = "window",
+                .Font = UIAppFont
             }
-            tagPanelHost.Controls.Add(_tagPanel)
-            AddHandler tagPanelHost.Resize, Sub() _tagPanel.Width = tagPanelHost.ClientSize.Width
+            _tagFlow.Panel.Padding = New Padding(0, 2, 0, 2)
+            _tagFlow.Panel.Tag = "window"
+            tagPanelHost.Controls.Add(_tagFlow)
 
             _searchBox = New UITextBox With {
                 .Dock = DockStyle.Top,
@@ -404,18 +412,32 @@ Namespace SilentNotes.WindowsVb.Views
                 .Font = UIAppFont
             }
 
-            ' 模式切换器在两种模式下都保持可见，保证永远有回来的路。
+            ' 搜索防抖：每次按键不立刻跑全文过滤，停顿 300ms 后才刷新列表。
+            _searchDebounceTimer = New Timer With {.Interval = 300}
+            AddHandler _searchDebounceTimer.Tick, AddressOf SearchDebounceTimer_Tick
+
+            ' 模式切换器在两种模式下都保持可见。
+            ' 两个节点总宽 = 2*ItemWidth - 3 - Height/2 + Interval，Resize 时按
+            ' 控件宽反推 ItemWidth，使节点恰好铺满侧栏。
             _modeTogglePanel = New Panel With {
                 .Dock = DockStyle.Top,
                 .Height = 38,
                 .BackColor = Color.Transparent,
                 .Padding = New Padding(4, 5, 4, 5)
             }
-            _modeToggle = New SegmentedToggle(New String() {"活动笔记", "回收站"}) With {
+            _modeBreadcrumb = New UIBreadcrumb With {
                 .Dock = DockStyle.Fill,
-                .Font = UIAppFont
+                .Font = UIAppFont,
+                .Style = UIStyle.Custom,
+                .Cursor = Cursors.Hand
             }
-            _modeTogglePanel.Controls.Add(_modeToggle)
+            _modeBreadcrumb.Items.Add("活动笔记")
+            _modeBreadcrumb.Items.Add("回收站")
+            AddHandler _modeBreadcrumb.Resize, Sub()
+                                                   Dim innerWidth As Integer = _modeBreadcrumb.ClientSize.Width
+                                                   _modeBreadcrumb.ItemWidth = Math.Max(60, (innerWidth + 3 + _modeBreadcrumb.Height \ 2 - _modeBreadcrumb.Interval) \ 2)
+                                               End Sub
+            _modeTogglePanel.Controls.Add(_modeBreadcrumb)
 
             _activeModeButtons = New Panel With {.Dock = DockStyle.Top, .Height = 40, .BackColor = Color.Transparent}
             _recycleBinModeButtons = New Panel With {.Dock = DockStyle.Top, .Height = 40, .BackColor = Color.Transparent, .Visible = False}
@@ -643,6 +665,12 @@ Namespace SilentNotes.WindowsVb.Views
                     Case Else
                         active = _editor.QueryState(pair.Key)
                 End Select
+
+                Dim previous As Boolean
+                If _toolbarActiveState.TryGetValue(pair.Key, previous) AndAlso previous = active Then
+                    Continue For
+                End If
+                _toolbarActiveState(pair.Key) = active
                 SetToolbarButtonActive(pair.Value, active)
             Next
         End Sub
@@ -685,7 +713,9 @@ Namespace SilentNotes.WindowsVb.Views
             AddHandler _safeButton.Click, AddressOf SafeButton_Click
             AddHandler _saveButton.Click, Sub() SaveSelectedNote()
 
-            AddHandler _modeToggle.SelectedIndexChanged, AddressOf ModeToggle_SelectedIndexChanged
+            AddHandler _modeBreadcrumb.ItemIndexChanged, AddressOf ModeBreadcrumb_ItemIndexChanged
+            AddHandler _modeBreadcrumb.MouseMove, AddressOf ModeBreadcrumb_MouseMove
+            AddHandler _modeBreadcrumb.MouseLeave, AddressOf ModeBreadcrumb_MouseLeave
             AddHandler _searchBox.TextChanged, AddressOf SearchTextBox_TextChanged
             AddHandler _notesList.SelectedIndexChanged, AddressOf NotesList_SelectedIndexChanged
             AddHandler _notesList.DrawItem, AddressOf NotesList_DrawItem
@@ -706,7 +736,42 @@ Namespace SilentNotes.WindowsVb.Views
         End Sub
 
         Private Sub RefreshModeButtonColors()
-            _modeToggle.SelectedIndex = If(_showRecycleBin, 1, 0)
+            ' ItemIndex 赋值（含同值）都会触发 ItemIndexChanged，由 handler 的同态
+            ' 守卫吸收；绘制按 index <= ItemIndex 累积取已选色，填充色须用
+            ' SetItemColor 逐节点覆盖。
+            ApplyModeNodeColors()
+            _modeBreadcrumb.ItemIndex = If(_showRecycleBin, 1, 0)
+        End Sub
+
+        ' 节点填充色：选中与鼠标悬停（预选态）为 AccentSoft，其余 SurfaceWindow。
+        Private Sub ApplyModeNodeColors()
+            Dim theme As WinFormsThemeService = ThemeService
+            Dim selected As Integer = If(_showRecycleBin, 1, 0)
+            For index As Integer = 0 To _modeBreadcrumb.Count - 1
+                Dim fill As Color = If(index = selected OrElse index = _modeHoverIndex, theme.AccentSoft, theme.SurfaceWindow)
+                _modeBreadcrumb.SetItemColor(index, fill)
+            Next
+        End Sub
+
+        ' 节点几何：节点 i 占 [i*step, i*step + ItemWidth]，
+        ' step = ItemWidth - 3 - Height/2 + Interval（与 UIBreadcrumb 绘制一致）。
+        Private Sub ModeBreadcrumb_MouseMove(sender As Object, e As MouseEventArgs)
+            Dim stepWidth As Integer = _modeBreadcrumb.ItemWidth - 3 - _modeBreadcrumb.Height \ 2 + _modeBreadcrumb.Interval
+            If stepWidth <= 0 Then
+                Return
+            End If
+            Dim index As Integer = Math.Min(_modeBreadcrumb.Count - 1, Math.Max(0, e.X \ stepWidth))
+            If index <> _modeHoverIndex Then
+                _modeHoverIndex = index
+                ApplyModeNodeColors()
+            End If
+        End Sub
+
+        Private Sub ModeBreadcrumb_MouseLeave(sender As Object, e As EventArgs)
+            If _modeHoverIndex <> -1 Then
+                _modeHoverIndex = -1
+                ApplyModeNodeColors()
+            End If
         End Sub
 
         Private Sub RefreshPinnedButton()
@@ -730,8 +795,17 @@ Namespace SilentNotes.WindowsVb.Views
             End If
         End Sub
 
+        ''' <summary>清空面板前先 Dispose 被移除的子控件：Controls.Clear 不释放它们。</summary>
+        Private Shared Sub DisposeChildren(host As Control)
+            Dim children As New List(Of Control)(host.Controls.Cast(Of Control)())
+            host.Controls.Clear()
+            For Each child As Control In children
+                child.Dispose()
+            Next
+        End Sub
+
         Private Sub PopulateNoteTagPanel()
-            _noteTagPanel.Controls.Clear()
+            DisposeChildren(_noteTagPanel)
             If _selectedNote Is Nothing OrElse _showRecycleBin Then
                 Return
             End If
@@ -745,6 +819,7 @@ Namespace SilentNotes.WindowsVb.Views
         End Sub
 
         Private Function CreateNoteTagChip(tag As String) As Control
+            ' 芯片配色 = SunnyUI 默认蓝（RGB 80,160,255），创建时直接赋值。
             Dim chip As New FlowLayoutPanel With {
                 .AutoSize = True,
                 .WrapContents = False,
@@ -760,6 +835,12 @@ Namespace SilentNotes.WindowsVb.Views
                 .Height = 24,
                 .Radius = 12,
                 .Style = UIStyle.Custom,
+                .FillColor = Color.FromArgb(80, 160, 255),
+                .RectColor = Color.FromArgb(80, 160, 255),
+                .ForeColor = Color.White,
+                .FillHoverColor = Color.FromArgb(127, 176, 255),
+                .RectHoverColor = Color.FromArgb(127, 176, 255),
+                .ForeHoverColor = Color.White,
                 .Font = UIAppFont,
                 .Margin = Padding.Empty
             }
@@ -778,6 +859,13 @@ Namespace SilentNotes.WindowsVb.Views
                 .Height = 24,
                 .Radius = 12,
                 .Style = UIStyle.Custom,
+                .SymbolColor = Color.White,
+                .SymbolHoverColor = Color.White,
+                .SymbolPressColor = Color.White,
+                .FillColor = Color.FromArgb(80, 160, 255),
+                .RectColor = Color.FromArgb(80, 160, 255),
+                .FillHoverColor = Color.FromArgb(127, 176, 255),
+                .RectHoverColor = Color.FromArgb(127, 176, 255),
                 .Margin = New Padding(0, 0, 0, 0),
                 .Font = UIAppFont
             }
@@ -788,40 +876,6 @@ Namespace SilentNotes.WindowsVb.Views
             chip.Controls.Add(removeButton)
             Return chip
         End Function
-
-        Private Sub RefreshNoteTagChipColors()
-            Dim theme As WinFormsThemeService = ThemeService
-            For Each child As Control In _noteTagPanel.Controls
-                Dim chip As FlowLayoutPanel = TryCast(child, FlowLayoutPanel)
-                If chip Is Nothing Then
-                    Continue For
-                End If
-
-                For Each part As Control In chip.Controls
-                    Dim removeButton As UISymbolButton = TryCast(part, UISymbolButton)
-                    If removeButton IsNot Nothing Then
-                        removeButton.SymbolColor = theme.TextSecondary
-                        removeButton.SymbolHoverColor = theme.Danger
-                        removeButton.SymbolPressColor = theme.Danger
-                        removeButton.FillColor = theme.SurfacePaper
-                        removeButton.RectColor = theme.SurfacePaper
-                        removeButton.FillHoverColor = theme.DangerSoft
-                        removeButton.RectHoverColor = theme.DangerSoft
-                        Continue For
-                    End If
-
-                    Dim nameButton As UIButton = TryCast(part, UIButton)
-                    If nameButton IsNot Nothing Then
-                        nameButton.FillColor = theme.SurfacePaper
-                        nameButton.ForeColor = theme.TextPrimary
-                        nameButton.RectColor = theme.BorderSubtle
-                        nameButton.FillHoverColor = theme.AccentSoft
-                        nameButton.RectHoverColor = theme.Accent
-                        nameButton.ForeHoverColor = theme.Accent
-                    End If
-                Next
-            Next
-        End Sub
 
 #End Region
 
@@ -873,6 +927,7 @@ Namespace SilentNotes.WindowsVb.Views
             Implements IMessageFilter
 
             Private Const WM_KEYDOWN As Integer = &H100
+            Private Const WM_KEYUP As Integer = &H101
             Private ReadOnly _owner As MainForm
 
             Public Sub New(owner As MainForm)
@@ -880,7 +935,10 @@ Namespace SilentNotes.WindowsVb.Views
             End Sub
 
             Public Function PreFilterMessage(ByRef m As Message) As Boolean Implements IMessageFilter.PreFilterMessage
-                If m.Msg <> WM_KEYDOWN OrElse _owner.IsDisposed OrElse Not _owner._editor.IsReady Then
+                If m.Msg <> WM_KEYDOWN AndAlso m.Msg <> WM_KEYUP Then
+                    Return False
+                End If
+                If _owner.IsDisposed OrElse Not _owner._editor.IsReady Then
                     Return False
                 End If
                 If Not _owner._editor.ContainsNativeWindow(m.HWnd) Then
@@ -893,13 +951,19 @@ Namespace SilentNotes.WindowsVb.Views
                 Dim key As Keys = DirectCast(m.WParam.ToInt32() And CInt(Keys.KeyCode), Keys)
                 Select Case key
                     Case Keys.S
-                        _owner.HandleSaveShortcut()
+                        If m.Msg = WM_KEYDOWN Then
+                            _owner.HandleSaveShortcut()
+                        End If
                         Return True
                     Case Keys.N
-                        _owner.HandleNewNoteShortcut()
+                        If m.Msg = WM_KEYDOWN Then
+                            _owner.HandleNewNoteShortcut()
+                        End If
                         Return True
                     Case Keys.F
-                        _owner.HandleSearchShortcut()
+                        If m.Msg = WM_KEYDOWN Then
+                            _owner.HandleSearchShortcut()
+                        End If
                         Return True
                 End Select
                 Return False
@@ -947,22 +1011,9 @@ Namespace SilentNotes.WindowsVb.Views
         End Sub
 
         Protected Overrides Sub OnFormClosing(e As FormClosingEventArgs)
-            If _contentDirty AndAlso _selectedNote IsNot Nothing AndAlso Not _showRecycleBin Then
-                Dim choice As DialogResult = ThemedConfirmDialog.ShowSavePrompt(
-                    Me, ThemeService, "未保存的更改",
-                    String.Format("笔记 ""{0}"" 有未保存的更改，是否保存？", _editorTitleBase))
-                If choice = DialogResult.Cancel Then
-                    e.Cancel = True
-                    Return
-                End If
-                If choice = DialogResult.Yes Then
-                    Dim saved As Boolean = SaveSelectedNote(False)
-                    If Not saved Then
-                        SetStatus("保存失败，已取消关闭窗口。", True)
-                        e.Cancel = True
-                        Return
-                    End If
-                End If
+            If Not PromptSaveDirtyBeforeReload("保存失败，已取消关闭窗口。") Then
+                e.Cancel = True
+                Return
             End If
 
             ' 过滤器要在取消关闭的提前返回之后才注销：用户取消时它必须继续工作。
@@ -973,6 +1024,14 @@ Namespace SilentNotes.WindowsVb.Views
             If _autoSyncTimer IsNot Nothing Then
                 _autoSyncTimer.Dispose()
                 _autoSyncTimer = Nothing
+            End If
+            If _searchDebounceTimer IsNot Nothing Then
+                _searchDebounceTimer.Dispose()
+                _searchDebounceTimer = Nothing
+            End If
+            If _editorUiTimer IsNot Nothing Then
+                _editorUiTimer.Dispose()
+                _editorUiTimer = Nothing
             End If
             MyBase.OnFormClosing(e)
         End Sub
@@ -986,13 +1045,18 @@ Namespace SilentNotes.WindowsVb.Views
             BackColor = theme.SurfaceWindow
             RefreshModeButtonColors()
             PopulateTagPanel(CurrentVisibleTags(), _selectedTag)
-            RefreshNoteTagChipColors()
+            ' 主题遍历会把编辑区标签芯片按无 Tag 通用样式重新刷色（透明底 +
+            ' AccentSoft 悬停），重建芯片以恢复创建时的 SunnyUI 蓝。
+            PopulateNoteTagPanel()
             RefreshPinnedButton()
             RefreshMoreMenuTheme()
             _notesList.Invalidate()
             Dim isChecklist As Boolean = _selectedNote IsNot Nothing AndAlso _selectedNote.NoteType = NoteType.Checklist
             _editor.SetEditorTheme(theme.IsDarkMode, isChecklist)
+            ' 主题换了，"tool" 静息外观必须重新下发，状态缓存作废。
+            _toolbarActiveState.Clear()
             UpdateToolbarState()
+            RefreshListBrushes()
         End Sub
 
         Protected Overrides Function ProcessCmdKey(ByRef msg As Message, keyData As Keys) As Boolean
@@ -1219,20 +1283,8 @@ Namespace SilentNotes.WindowsVb.Views
 
             ' 同步会用磁盘上的仓库重载编辑器；与关闭窗口一样，先让用户决定
             ' 未保存的编辑去留（保存 / 不保存 / 取消）。
-            If _contentDirty AndAlso _selectedNote IsNot Nothing AndAlso Not _showRecycleBin Then
-                Dim choice As DialogResult = ThemedConfirmDialog.ShowSavePrompt(
-                    Me, ThemeService, "未保存的更改",
-                    String.Format("笔记 ""{0}"" 有未保存的更改，是否保存？", _editorTitleBase))
-                If choice = DialogResult.Cancel Then
-                    Return
-                End If
-                If choice = DialogResult.Yes Then
-                    Dim saved As Boolean = SaveSelectedNote(False)
-                    If Not saved Then
-                        SetStatus("保存失败，已取消同步。", True)
-                        Return
-                    End If
-                End If
+            If Not PromptSaveDirtyBeforeReload("保存失败，已取消同步。") Then
+                Return
             End If
 
             _syncInProgress = True
@@ -1243,12 +1295,11 @@ Namespace SilentNotes.WindowsVb.Views
             _editor.SetReadOnly(True)
             SetStatus("正在同步...")
 
-            ' C# 版为 async void：VB10 无 async，同步放到后台线程上执行，
-            ' UI 恢复操作经 SafeInvoke 回到 UI 线程（保留原按钮禁用/启用时序）。
+            ' VB10 无 async：同步在后台线程执行，UI 恢复操作经 SafeInvoke 回 UI 线程。
             Task.Factory.StartNew(Sub()
-                                      Dim progress As Action(Of String) = Sub(message)
-                                                                              SafeInvoke(Sub() SetStatus(message, IsSyncErrorMessage(message)))
-                                                                          End Sub
+                                      Dim progress As Action(Of String, Boolean) = Sub(message, isError)
+                                                                                      SafeInvoke(Sub() SetStatus(message, isError))
+                                                                                  End Sub
                                       Dim success As Boolean = _syncService.Sync(progress)
 
                                       SafeInvoke(Sub()
@@ -1293,9 +1344,8 @@ Namespace SilentNotes.WindowsVb.Views
         End Function
 
         ''' <summary>
-        ''' C# 版为 async Task（由线程池 Timer 回调或 OnLoad 的 fire-and-forget 调用）。
-        ''' VB10 无 async：改为同步方法，调用方保证在后台线程上执行；方法内的所有
-        ''' UI 触碰均经 SafeInvoke 包装（与 C# 版一致）。
+        ''' 同步方法，必须在后台线程调用（Timer 回调或后台任务）；
+        ''' 方法内所有 UI 触碰均经 SafeInvoke 包装。
         ''' </summary>
         Private Sub TryAutoSync(showStatus As Boolean)
             Try
@@ -1312,11 +1362,11 @@ Namespace SilentNotes.WindowsVb.Views
                     SafeInvoke(Sub() SetStatus("自动同步中..."))
                 End If
 
-                Dim progress As Action(Of String) = Sub(msg)
-                                                        If showStatus Then
-                                                            SafeInvoke(Sub() SetStatus(msg, IsSyncErrorMessage(msg)))
-                                                        End If
-                                                    End Sub
+                Dim progress As Action(Of String, Boolean) = Sub(msg, isError)
+                                                                If showStatus Then
+                                                                    SafeInvoke(Sub() SetStatus(msg, isError))
+                                                                End If
+                                                            End Sub
                 Dim success As Boolean = _syncService.Sync(progress)
 
                 If success Then
@@ -1424,16 +1474,12 @@ Namespace SilentNotes.WindowsVb.Views
             End Try
         End Sub
 
-        Private Sub SaveButton_Click(sender As Object, e As EventArgs)
-            SaveSelectedNote()
-        End Sub
-
 #End Region
 
 #Region "Note CRUD"
 
-        Private Sub ModeToggle_SelectedIndexChanged(sender As Object, e As EventArgs)
-            Dim toRecycleBin As Boolean = _modeToggle.SelectedIndex = 1
+        Private Sub ModeBreadcrumb_ItemIndexChanged(sender As Object, index As Integer)
+            Dim toRecycleBin As Boolean = index = 1
             If _showRecycleBin = toRecycleBin Then
                 Return
             End If
@@ -1452,33 +1498,14 @@ Namespace SilentNotes.WindowsVb.Views
         End Function
 
         Private Sub NewNoteButton_Click(sender As Object, e As EventArgs)
-            If Not HasEditableRepository() Then
-                Return
-            End If
-
-            _showRecycleBin = False
-            _searchBox.Text = String.Empty
-            _searchText = String.Empty
-
-            Dim note As New NoteModel With {
-                .HtmlContent = "<p>新笔记</p>"
-            }
-            If Not String.IsNullOrEmpty(_selectedTag) Then
-                note.Tags.Add(_selectedTag)
-            End If
-
-            note.RefreshModifiedAt()
-            _repository.Notes.Insert(0, note)
-            _repository.RefreshOrderModifiedAt()
-            RepositoryStorageService.TrySaveRepository(_repository)
-            UpdateRepositorySummary()
-            RefreshTagList()
-            RefreshNoteList(note)
-            UpdateModeControls()
-            SetStatus("已新建笔记。")
+            CreateNewNote(NoteType.Text, "<p>新笔记</p>", "已新建笔记。")
         End Sub
 
         Private Sub NewChecklistButton_Click(sender As Object, e As EventArgs)
+            CreateNewNote(NoteType.Checklist, "<p>新项目</p>", "已新建清单。")
+        End Sub
+
+        Private Sub CreateNewNote(noteType As NoteType, html As String, statusMessage As String)
             If Not HasEditableRepository() Then
                 Return
             End If
@@ -1488,8 +1515,8 @@ Namespace SilentNotes.WindowsVb.Views
             _searchText = String.Empty
 
             Dim note As New NoteModel With {
-                .NoteType = NoteType.Checklist,
-                .HtmlContent = "<p>新项目</p>"
+                .NoteType = noteType,
+                .HtmlContent = html
             }
             If Not String.IsNullOrEmpty(_selectedTag) Then
                 note.Tags.Add(_selectedTag)
@@ -1499,11 +1526,62 @@ Namespace SilentNotes.WindowsVb.Views
             _repository.Notes.Insert(0, note)
             _repository.RefreshOrderModifiedAt()
             RepositoryStorageService.TrySaveRepository(_repository)
+            RefreshNoteList(note)
             UpdateRepositorySummary()
             RefreshTagList()
-            RefreshNoteList(note)
             UpdateModeControls()
-            SetStatus("已新建清单。")
+            SetStatus(statusMessage)
+        End Sub
+
+        ''' <summary>仓库内容变更后的公共刷新级联：标签条、笔记列表、顶栏统计。</summary>
+        Private Sub RefreshAfterRepositoryChange(noteToSelect As NoteModel)
+            RefreshTagList()
+            RefreshNoteList(noteToSelect)
+            UpdateRepositorySummary()
+        End Sub
+
+        ''' <summary>笔记元数据（标签/置顶）变更后的刷新：在公共级联上补编辑区标题与标签建议。</summary>
+        Private Sub RefreshAfterMetadataChange(noteToSelect As NoteModel)
+            RefreshVisibleSelectedItemTitle()
+            RefreshAfterRepositoryChange(noteToSelect)
+            UpdateTagSuggestions()
+        End Sub
+
+        ''' <summary>有未保存编辑时弹三选项询问（保存/不保存/取消）。
+        ''' 返回 False 表示本次重载应中止；cancelMessage 用于保存失败时的状态栏提示。</summary>
+        Private Function PromptSaveDirtyBeforeReload(cancelMessage As String) As Boolean
+            If Not _contentDirty OrElse _selectedNote Is Nothing OrElse _showRecycleBin Then
+                Return True
+            End If
+
+            Dim choice As DialogResult = ThemedConfirmDialog.ShowSavePrompt(
+                Me, ThemeService, "未保存的更改",
+                String.Format("笔记 ""{0}"" 有未保存的更改，是否保存？", _editorTitleBase))
+            If choice = DialogResult.Cancel Then
+                Return False
+            End If
+            If choice = DialogResult.Yes Then
+                If Not SaveSelectedNote(False) Then
+                    SetStatus(cancelMessage, True)
+                    Return False
+                End If
+            End If
+            Return True
+        End Function
+
+        Private Sub RefreshListBrushes()
+            If _listPaperBrush IsNot Nothing Then
+                _listPaperBrush.Dispose()
+                _listAccentSoftBrush.Dispose()
+                _listHoverBrush.Dispose()
+                _listAccentBrush.Dispose()
+            End If
+
+            Dim theme As WinFormsThemeService = ThemeService
+            _listPaperBrush = New SolidBrush(theme.SurfacePaper)
+            _listAccentSoftBrush = New SolidBrush(theme.AccentSoft)
+            _listHoverBrush = New SolidBrush(theme.ListHover)
+            _listAccentBrush = New SolidBrush(theme.Accent)
         End Sub
 
         Private Function HasEditableRepository() As Boolean
@@ -1525,9 +1603,7 @@ Namespace SilentNotes.WindowsVb.Views
             _repository.RefreshOrderModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
             Dim nextNote As NoteModel = FindFirstNote(Function(note) Not note.InRecyclingBin)
-            UpdateRepositorySummary()
-            RefreshTagList()
-            RefreshNoteList(nextNote)
+            RefreshAfterRepositoryChange(nextNote)
             SetStatus(If(saved, "已移到回收站。", "移动到回收站失败。"), Not saved)
         End Sub
 
@@ -1541,9 +1617,7 @@ Namespace SilentNotes.WindowsVb.Views
             _repository.RefreshOrderModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
             Dim nextNote As NoteModel = FindFirstNote(Function(note) note.InRecyclingBin)
-            RefreshNoteList(nextNote)
-            UpdateRepositorySummary()
-            RefreshTagList()
+            RefreshAfterRepositoryChange(nextNote)
             SetStatus(If(saved, "已恢复笔记。", "恢复笔记失败。"), Not saved)
         End Sub
 
@@ -1563,9 +1637,7 @@ Namespace SilentNotes.WindowsVb.Views
             _repository.RefreshOrderModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
             Dim nextNote As NoteModel = FindFirstNote(Function(note) note.InRecyclingBin)
-            RefreshNoteList(nextNote)
-            UpdateRepositorySummary()
-            RefreshTagList()
+            RefreshAfterRepositoryChange(nextNote)
             SetStatus(If(saved, "已永久删除笔记。", "永久删除失败。"), Not saved)
         End Sub
 
@@ -1596,9 +1668,7 @@ Namespace SilentNotes.WindowsVb.Views
             Next
             _repository.RefreshOrderModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
-            RefreshNoteList(Nothing)
-            UpdateRepositorySummary()
-            RefreshTagList()
+            RefreshAfterRepositoryChange(Nothing)
             SetStatus(If(saved, "已清空回收站。", "清空回收站失败。"), Not saved)
         End Sub
 
@@ -1625,9 +1695,20 @@ Namespace SilentNotes.WindowsVb.Views
                 Return
             End If
 
-            _searchText = If(_searchBox.Text, String.Empty)
-            UpdateRepositorySummary()
+            _searchDebounceTimer.Stop()
+            _searchDebounceTimer.Start()
+        End Sub
+
+        Private Sub SearchDebounceTimer_Tick(sender As Object, e As EventArgs)
+            _searchDebounceTimer.Stop()
+            Dim text As String = If(_searchBox.Text, String.Empty)
+            If text = _searchText Then
+                Return
+            End If
+
+            _searchText = text
             RefreshNoteList(_selectedNote)
+            UpdateRepositorySummary()
         End Sub
 
         Private Sub TagsTextBox_KeyDown(sender As Object, e As KeyEventArgs)
@@ -1678,9 +1759,10 @@ Namespace SilentNotes.WindowsVb.Views
             ' 与笔记列表同样的约定：先重绘整行覆盖 UIListBox 的默认文本，再绘制。
             Dim theme As WinFormsThemeService = ThemeService
             Dim selected As Boolean = (e.State And DrawItemState.Selected) = DrawItemState.Selected
-            Using background As New SolidBrush(If(selected, theme.AccentSoft, theme.SurfacePaper))
-                e.Graphics.FillRectangle(background, e.Bounds)
-            End Using
+            If _listPaperBrush Is Nothing Then
+                RefreshListBrushes()
+            End If
+            e.Graphics.FillRectangle(If(selected, _listAccentSoftBrush, _listPaperBrush), e.Bounds)
 
             Dim text As String = TryCast(_tagSuggestionList.Items(e.Index), String)
             If String.IsNullOrEmpty(text) Then
@@ -1722,12 +1804,8 @@ Namespace SilentNotes.WindowsVb.Views
             _selectedNote.RefreshMetaModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
             _tagsTextBox.Text = String.Empty
-            RefreshVisibleSelectedItemTitle()
             PopulateNoteTagPanel()
-            RefreshTagList()
-            RefreshNoteList(_selectedNote)
-            UpdateRepositorySummary()
-            UpdateTagSuggestions()
+            RefreshAfterMetadataChange(_selectedNote)
             SetStatus(If(saved, "已添加标签。", "保存笔记属性失败。"), Not saved)
         End Sub
 
@@ -1749,11 +1827,7 @@ Namespace SilentNotes.WindowsVb.Views
             _selectedNote.Tags.RemoveAt(tagIndex)
             _selectedNote.RefreshMetaModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
-            RefreshVisibleSelectedItemTitle()
-            RefreshTagList()
-            RefreshNoteList(_selectedNote)
-            UpdateRepositorySummary()
-            UpdateTagSuggestions()
+            RefreshAfterMetadataChange(_selectedNote)
             SetStatus(If(saved, "已删除标签。", "保存笔记属性失败。"), Not saved)
         End Sub
 
@@ -1809,12 +1883,12 @@ Namespace SilentNotes.WindowsVb.Views
         End Function
 
         Private Sub PopulateTagPanel(tags As List(Of String), selectedTag As String)
-            _tagPanel.Controls.Clear()
+            DisposeChildren(_tagFlow.Panel)
             _selectedTag = selectedTag
 
-            _tagPanel.Controls.Add(CreateTagButton("全部", Nothing, selectedTag Is Nothing))
+            _tagFlow.Panel.Controls.Add(CreateTagButton("全部", Nothing, selectedTag Is Nothing))
             For Each tag As String In tags
-                _tagPanel.Controls.Add(CreateTagButton(tag, tag, String.Equals(tag, selectedTag, StringComparison.InvariantCultureIgnoreCase)))
+                _tagFlow.Panel.Controls.Add(CreateTagButton(tag, tag, String.Equals(tag, selectedTag, StringComparison.InvariantCultureIgnoreCase)))
             Next
             RefreshTagButtonColors()
         End Sub
@@ -1839,8 +1913,14 @@ Namespace SilentNotes.WindowsVb.Views
         End Function
 
         Private Sub RefreshTagButtonColors()
+            ' 筛选药丸：选中项 SunnyUI 默认蓝（RGB 80,160,255）+ 白字，
+            ' 未选项 paper 底 + secondary 字。
             Dim theme As WinFormsThemeService = ThemeService
-            For Each child As Control In _tagPanel.Controls
+            Dim blue As Color = Color.FromArgb(80, 160, 255)
+            Dim blueHover As Color = Color.FromArgb(127, 176, 255)
+            _tagFlow.ScrollBarColor = theme.BorderSubtle
+            _tagFlow.ScrollBarBackColor = theme.SurfaceWindow
+            For Each child As Control In _tagFlow.Panel.Controls
                 Dim button As UIButton = TryCast(child, UIButton)
                 If button Is Nothing Then
                     Continue For
@@ -1848,12 +1928,12 @@ Namespace SilentNotes.WindowsVb.Views
 
                 Dim isSel As Boolean = String.Equals(button.Name, _selectedTag, StringComparison.InvariantCultureIgnoreCase) _
                     OrElse (String.IsNullOrEmpty(button.Name) AndAlso _selectedTag Is Nothing)
-                button.FillColor = If(isSel, theme.AccentSoft, theme.SurfacePaper)
-                button.RectColor = If(isSel, theme.Accent, theme.BorderSubtle)
-                button.ForeColor = If(isSel, theme.Accent, theme.TextSecondary)
-                button.FillHoverColor = theme.AccentSoft
-                button.RectHoverColor = theme.Accent
-                button.ForeHoverColor = If(isSel, theme.Accent, theme.TextPrimary)
+                button.FillColor = If(isSel, blue, theme.SurfacePaper)
+                button.RectColor = If(isSel, blue, theme.BorderSubtle)
+                button.ForeColor = If(isSel, Color.White, theme.TextSecondary)
+                button.FillHoverColor = If(isSel, blueHover, theme.ListHover)
+                button.RectHoverColor = If(isSel, blueHover, theme.BorderSubtle)
+                button.ForeHoverColor = If(isSel, Color.White, theme.TextPrimary)
             Next
         End Sub
 
@@ -1948,6 +2028,9 @@ Namespace SilentNotes.WindowsVb.Views
             If e.Index < 0 OrElse e.Index >= _listItems.Count Then
                 Return
             End If
+            If _listPaperBrush Is Nothing Then
+                RefreshListBrushes()
+            End If
 
             ' UIListBox 已经在这里画过默认背景和条目文本；先覆盖整行（包括滚动条
             ' 留白），再在上面绘制两行笔记卡片。
@@ -1957,26 +2040,20 @@ Namespace SilentNotes.WindowsVb.Views
             Dim hovered As Boolean = (e.State And DrawItemState.HotLight) = DrawItemState.HotLight
 
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias
-            Using background As New SolidBrush(theme.SurfacePaper)
-                e.Graphics.FillRectangle(background, e.Bounds)
-            End Using
+            e.Graphics.FillRectangle(_listPaperBrush, e.Bounds)
 
-            ' 为纵向滚动条留出留白，卡片不会跑到它下面
-            Dim rowRect As New Rectangle(e.Bounds.X + 4, e.Bounds.Y + 2, e.Bounds.Width - 22, e.Bounds.Height - 4)
-            Dim back As Color = If(selected, theme.AccentSoft, If(hovered, theme.ListHover, theme.SurfacePaper))
-            Using background As New SolidBrush(back)
-                e.Graphics.FillRectangle(background, rowRect)
-            End Using
+            ' 为纵向滚动条留出少量边距，卡片不会跑到它下面
+            Dim rowRect As New Rectangle(e.Bounds.X + 4, e.Bounds.Y + 2, e.Bounds.Width - 8, e.Bounds.Height - 4)
+            Dim back As SolidBrush = If(selected, _listAccentSoftBrush, If(hovered, _listHoverBrush, _listPaperBrush))
+            e.Graphics.FillRectangle(back, rowRect)
 
             ' 选中态：卡片左缘的纵向强调条
             If selected Then
-                Using bar As New SolidBrush(theme.Accent)
-                    e.Graphics.FillRectangle(bar, e.Bounds.X + 4, e.Bounds.Y + 2, 4, e.Bounds.Height - 4)
-                End Using
+                e.Graphics.FillRectangle(_listAccentBrush, e.Bounds.X + 4, e.Bounds.Y + 2, 4, e.Bounds.Height - 4)
             End If
 
             Dim h As Integer = e.Bounds.Height
-            Dim textWidth As Integer = Math.Max(40, e.Bounds.Width - 40)
+            Dim textWidth As Integer = Math.Max(40, e.Bounds.Width - 28)
             Dim titleRect As New Rectangle(e.Bounds.X + 14, e.Bounds.Y + 6, textWidth, 20)
             Dim secondaryRect As New Rectangle(e.Bounds.X + 14, e.Bounds.Y + h - 26, textWidth, 18)
 
@@ -2006,7 +2083,8 @@ Namespace SilentNotes.WindowsVb.Views
             ' VB 陷阱：Notes.Count 有属性时会解析为对属性做索引，扩展方法须走 Where().Count()
             Dim activeCount As Integer = _repository.Notes.Where(Function(note) Not note.InRecyclingBin).Count()
             Dim recycleBinCount As Integer = _repository.Notes.Where(Function(note) note.InRecyclingBin).Count()
-            Dim visibleCount As Integer = _repository.Notes.Where(Function(note) note.InRecyclingBin = _showRecycleBin AndAlso MatchesTag(note) AndAlso MatchesSearch(note)).Count()
+            ' 可见条数直接取刚刷新完的列表结果，避免把 MatchesSearch 的全文正则重跑一遍。
+            Dim visibleCount As Integer = _listItems.Count
             _repositorySummaryLabel.Text = If(String.IsNullOrWhiteSpace(_searchText),
                 String.Format("{0} 条活动笔记，{1} 条回收站笔记。当前视图 {2} 条。", activeCount, recycleBinCount, visibleCount),
                 String.Format("当前视图找到 {0} 条；总计 {1} 条活动笔记，{2} 条回收站笔记。", visibleCount, activeCount, recycleBinCount))
@@ -2102,7 +2180,7 @@ Namespace SilentNotes.WindowsVb.Views
                         Dim unlockedTitle As String = BuildPlainText(unlockedContent)
                         Dim displayTitle As String = If(String.IsNullOrWhiteSpace(unlockedTitle),
                             "无标题笔记",
-                            If(unlockedTitle.Length > 80, unlockedTitle.Substring(0, 80) & "...", unlockedTitle))
+                            TruncateEllipsis(unlockedTitle, 80))
                         SetEditorTitle(displayTitle)
                         If Not String.IsNullOrEmpty(unlockedTitle) Then
                             _safeNoteTitles(note.Id) = unlockedTitle
@@ -2134,8 +2212,6 @@ Namespace SilentNotes.WindowsVb.Views
             If Not canEdit Then
                 _editor.SetContent("<p>" & EncodeTextToHtml(BuildPlainText(note.HtmlContent)) & "</p>", False)
             End If
-
-            _contentDirty = False
         End Sub
 
         Private Sub LoadEditorContent(html As String, isChecklist As Boolean)
@@ -2164,32 +2240,27 @@ Namespace SilentNotes.WindowsVb.Views
         Private Sub Editor_ContentChanged(sender As Object, e As EventArgs)
             _contentDirty = True
             UpdateEditorTitleMarker()
-            ScheduleWordCountUpdate()
+            ScheduleEditorUiRefresh()
         End Sub
 
         Private Sub Editor_SelectionChanged(sender As Object, e As EventArgs)
-            ' 把频繁的 selectionchange 事件合并为每次消息循环迭代一次工具栏刷新
-            If _toolbarStatePending OrElse Not IsHandleCreated Then
-                Return
-            End If
-            _toolbarStatePending = True
-            SafeInvoke(Sub()
-                           _toolbarStatePending = False
-                           UpdateToolbarState()
-                       End Sub)
+            ScheduleEditorUiRefresh()
         End Sub
 
-        ' GetHtml() 是一次 MSHTML COM 往返；每次按键都跑会让长笔记卡顿，
-        ' 所以字数统计合并为每次消息迭代一次。
-        Private Sub ScheduleWordCountUpdate()
-            If _wordCountPending OrElse Not IsHandleCreated Then
+        Private Sub ScheduleEditorUiRefresh()
+            If Not IsHandleCreated Then
                 Return
             End If
-            _wordCountPending = True
-            SafeInvoke(Sub()
-                           _wordCountPending = False
-                           UpdateWordCount()
-                       End Sub)
+            ' 已在跑的节流周期继续生效，只需保证计时器处于启动状态。
+            If Not _editorUiTimer.Enabled Then
+                _editorUiTimer.Start()
+            End If
+        End Sub
+
+        Private Sub EditorUiTimer_Tick(sender As Object, e As EventArgs)
+            _editorUiTimer.Stop()
+            UpdateToolbarState()
+            UpdateWordCount()
         End Sub
 
         ''' <summary>设置编辑区标题；未保存时显示 * 前缀。</summary>
@@ -2274,11 +2345,7 @@ Namespace SilentNotes.WindowsVb.Views
 
             _selectedNote.RefreshMetaModifiedAt()
             Dim saved As Boolean = RepositoryStorageService.TrySaveRepository(_repository)
-            RefreshVisibleSelectedItemTitle()
-            RefreshTagList()
-            RefreshNoteList(_selectedNote)
-            UpdateRepositorySummary()
-            UpdateTagSuggestions()
+            RefreshAfterMetadataChange(_selectedNote)
             SetStatus(If(saved, "已保存笔记属性。", "保存笔记属性失败。"), Not saved)
         End Sub
 
@@ -2345,7 +2412,9 @@ Namespace SilentNotes.WindowsVb.Views
 
             Dim input As String = urlBox.Text.Trim()
             Dim url As String = input
-            If Not url.StartsWith("http://") AndAlso Not url.StartsWith("https://") AndAlso Not url.StartsWith("mailto:") Then
+            If Not url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) _
+                AndAlso Not url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) _
+                AndAlso Not url.StartsWith("mailto:", StringComparison.OrdinalIgnoreCase) Then
                 url = "https://" & url
             End If
 
@@ -2489,123 +2558,110 @@ Namespace SilentNotes.WindowsVb.Views
                                         End If
 
                                         Dim securePassword As SecureString = CryptoUtils.StringToSecureString(password)
-
-                                        If existingSafe Then
-                                            ' 尝试打开所有已有安全箱（防御性地先关闭）
-                                            Dim anyOpened As Boolean = False
-                                            For Each safe As SafeModel In _repository.Safes
-                                                Try
-                                                    Dim testEncrypted As Byte() = CryptoUtils.Base64StringToBytes(safe.SerializeableKey)
-                                                    Dim testCryptor As ICryptor = New Cryptor(SafeModel.CryptorPackageName, Nothing)
-                                                    Dim testNeedsReEnc As Boolean = False
-                                                    Dim testDecrypted As Byte() = testCryptor.Decrypt(testEncrypted, securePassword, testNeedsReEnc)
-                                                    _logService.Info(String.Format("直接解密安全箱成功: needsReEnc={0}", testNeedsReEnc))
-                                                Catch testEx As Exception
-                                                    _logService.[Error](String.Format("直接解密安全箱失败, 实际异常: {0}", testEx))
-                                                End Try
-
-                                                _safeKeyService.CloseSafe(safe.Id)
-                                                Dim needsReEncryption As Boolean = False
-                                                If _safeKeyService.TryOpenSafe(safe, securePassword, needsReEncryption) Then
-                                                    anyOpened = True
-                                                    If needsReEncryption Then
-                                                        Dim settings As SettingsModel = Program.Services.GetRequiredService(Of ISettingsService)().LoadSettingsOrDefault()
-                                                        Dim key As Byte() = Nothing
-                                                        safe.SerializeableKey = SafeModel.EncryptKey(
-                                                            If(_safeKeyService.TryGetKey(safe.Id, key), key, New Byte(31) {}),
-                                                            securePassword,
-                                                            _cryptoRandomService,
-                                                            settings.SelectedEncryptionAlgorithm,
-                                                            settings.SelectedKdfAlgorithm)
-                                                        safe.RefreshModifiedAt()
-                                                        RepositoryStorageService.TrySaveRepository(_repository)
-                                                    End If
-                                                End If
-                                            Next
-
-                                            If anyOpened Then
-                                                dialog.DialogResult = DialogResult.OK
-                                                dialog.Close()
-                                                SetStatus("安全箱已解锁。")
-                                                For Each note As NoteModel In _repository.Notes
-                                                    If note.SafeId.HasValue AndAlso _safeKeyService.IsSafeOpen(note.SafeId.Value) AndAlso Not String.IsNullOrEmpty(note.HtmlContent) Then
-                                                        Dim decrypted As String = DecryptSafeNoteContent(note)
-                                                        If decrypted IsNot Nothing Then
-                                                            Dim title2 As String = BuildPlainText(decrypted)
-                                                            If Not String.IsNullOrEmpty(title2) Then
-                                                                _safeNoteTitles(note.Id) = title2
-                                                            End If
-                                                        End If
-                                                    End If
-                                                Next
-                                                RefreshNoteList(_selectedNote)
-                                                If _selectedNote IsNot Nothing AndAlso _selectedNote.SafeId.HasValue AndAlso _safeKeyService.IsSafeOpen(_selectedNote.SafeId.Value) Then
-                                                    SelectNote(_selectedNote, True)
-                                                End If
-                                            Else
-                                                _logService.Info(String.Format("安全箱打开失败: 仓库中有 {0} 个安全箱", _repository.Safes.Count))
-                                                For Each s As SafeModel In _repository.Safes
-                                                    _logService.Info(String.Format("  安全箱 {0}: 有密钥={1}, 密钥长度={2}", s.Id, Not String.IsNullOrEmpty(s.SerializeableKey), If(s.SerializeableKey IsNot Nothing, s.SerializeableKey.Length, 0)))
-                                                    If Not String.IsNullOrEmpty(s.SerializeableKey) Then
-                                                        Try
-                                                            Dim raw As Byte() = CryptoUtils.Base64StringToBytes(s.SerializeableKey)
-                                                            Dim header As String = CryptoUtils.BytesToString(raw).Substring(0, Math.Min(25, raw.Length))
-                                                            _logService.Info(String.Format("  密钥头内容: '{0}'", header))
-                                                        Catch ex As Exception
-                                                            _logService.[Error]("  密钥 Base64 解析失败", ex)
-                                                        End Try
-                                                    End If
-                                                Next
-
-                                                ' 解不开 ≠ 密码一定错：net40 裁剪加密栈不支持 xchacha20/argon2id，
-                                                ' SafeModel.TryDecryptKey 会把"算法未知"也吞成 False。这里从密文头
-                                                ' 解析算法对，给用户可操作的提示而不是误导性的"密码错误"。
-                                                Dim hasUnsupportedSafe As Boolean = False
-                                                For Each s As SafeModel In _repository.Safes
-                                                    Dim description As String = DescribeSafeKeyAlgorithms(s)
-                                                    If description IsNot Nothing AndAlso Not IsSupportedSafeAlgorithms(description) Then
-                                                        hasUnsupportedSafe = True
-                                                        _logService.Info(String.Format("  安全箱 {0} 使用不支持的算法: {1}", s.Id, description))
-                                                    End If
-                                                Next
-                                                If hasUnsupportedSafe Then
-                                                    errorText.Text = "此安全箱使用的加密算法（xchacha20/argon2id）本版本不支持，" & vbLf & "请先用 tools\migrate-safe-crypto 迁移工具转换后再解锁。"
-                                                Else
-                                                    errorText.Text = "密码错误，无法打开安全箱。请查看日志文件获取详细信息。"
-                                                End If
-                                            End If
-                                        Else
-                                            ' 创建新的安全箱
-                                            Try
-                                                Dim safe As SafeModel = New SafeModel()
-                                                Dim settings As SettingsModel = Program.Services.GetRequiredService(Of ISettingsService)().LoadSettingsOrDefault()
-                                                Dim algorithm As String = settings.SelectedEncryptionAlgorithm
-                                                Dim kdfAlgorithm As String = settings.SelectedKdfAlgorithm
-
-                                                Dim key As Byte() = _cryptoRandomService.GetRandomBytes(32)
-                                                safe.SerializeableKey = SafeModel.EncryptKey(key, securePassword, _cryptoRandomService, algorithm, kdfAlgorithm)
-
-                                                Dim dummyNeedsReEncryption As Boolean = False
-                                                If Not _safeKeyService.TryOpenSafe(safe, securePassword, dummyNeedsReEncryption) Then
-                                                    errorText.Text = "安全箱创建失败，无法验证密钥。"
-                                                    Return
-                                                End If
-
-                                                _repository.Safes.Add(safe)
-                                                RepositoryStorageService.TrySaveRepository(_repository)
-                                                dialog.DialogResult = DialogResult.OK
-                                                dialog.Close()
-                                                SetStatus("安全箱已创建并解锁。")
-                                            Catch ex As Exception
-                                                errorText.Text = "创建安全箱失败：" & ex.Message
-                                            End Try
-                                        End If
-
+                                        Dim succeeded As Boolean = If(existingSafe,
+                                            TryOpenSafes(securePassword, errorText),
+                                            TryCreateSafe(securePassword, errorText))
                                         securePassword.Clear()
+                                        If succeeded Then
+                                            dialog.DialogResult = DialogResult.OK
+                                            dialog.Close()
+                                        End If
                                     End Sub
 
             dialog.ShowDialog(Me)
         End Sub
+
+        ''' <summary>用密码解锁仓库中的所有安全箱。返回 False 时把原因写进 errorText。</summary>
+        Private Function TryOpenSafes(securePassword As SecureString, errorText As UILabel) As Boolean
+            ' 防御性地先关闭已有的安全箱
+            Dim anyOpened As Boolean = False
+            For Each safe As SafeModel In _repository.Safes
+                _safeKeyService.CloseSafe(safe.Id)
+                Dim needsReEncryption As Boolean = False
+                If _safeKeyService.TryOpenSafe(safe, securePassword, needsReEncryption) Then
+                    anyOpened = True
+                    If needsReEncryption Then
+                        Dim settings As SettingsModel = Program.Services.GetRequiredService(Of ISettingsService)().LoadSettingsOrDefault()
+                        Dim key As Byte() = Nothing
+                        safe.SerializeableKey = SafeModel.EncryptKey(
+                            If(_safeKeyService.TryGetKey(safe.Id, key), key, New Byte(31) {}),
+                            securePassword,
+                            _cryptoRandomService,
+                            settings.SelectedEncryptionAlgorithm,
+                            settings.SelectedKdfAlgorithm)
+                        safe.RefreshModifiedAt()
+                        RepositoryStorageService.TrySaveRepository(_repository)
+                    End If
+                End If
+            Next
+
+            If Not anyOpened Then
+                _logService.Info(String.Format("安全箱打开失败: 仓库中有 {0} 个安全箱", _repository.Safes.Count))
+
+                ' 解不开 ≠ 密码一定错：net40 裁剪加密栈不支持 xchacha20/argon2id，
+                ' SafeModel.TryDecryptKey 会把"算法未知"也吞成 False。这里从密文头
+                ' 解析算法对，给用户可操作的提示而不是误导性的"密码错误"。
+                Dim hasUnsupportedSafe As Boolean = False
+                For Each s As SafeModel In _repository.Safes
+                    Dim description As String = DescribeSafeKeyAlgorithms(s)
+                    If description IsNot Nothing AndAlso Not IsSupportedSafeAlgorithms(description) Then
+                        hasUnsupportedSafe = True
+                        _logService.Info(String.Format("  安全箱 {0} 使用不支持的算法: {1}", s.Id, description))
+                    End If
+                Next
+                If hasUnsupportedSafe Then
+                    errorText.Text = "此安全箱使用的加密算法（xchacha20/argon2id）本版本不支持，" & vbLf & "请先用 tools\migrate-safe-crypto 迁移工具转换后再解锁。"
+                Else
+                    errorText.Text = "密码错误，无法打开安全箱。"
+                End If
+                Return False
+            End If
+
+            SetStatus("安全箱已解锁。")
+            For Each note As NoteModel In _repository.Notes
+                If note.SafeId.HasValue AndAlso _safeKeyService.IsSafeOpen(note.SafeId.Value) AndAlso Not String.IsNullOrEmpty(note.HtmlContent) Then
+                    Dim decrypted As String = DecryptSafeNoteContent(note)
+                    If decrypted IsNot Nothing Then
+                        Dim title2 As String = BuildPlainText(decrypted)
+                        If Not String.IsNullOrEmpty(title2) Then
+                            _safeNoteTitles(note.Id) = title2
+                        End If
+                    End If
+                End If
+            Next
+            RefreshNoteList(_selectedNote)
+            If _selectedNote IsNot Nothing AndAlso _selectedNote.SafeId.HasValue AndAlso _safeKeyService.IsSafeOpen(_selectedNote.SafeId.Value) Then
+                SelectNote(_selectedNote, True)
+            End If
+            Return True
+        End Function
+
+        ''' <summary>创建新安全箱并解锁。返回 False 时把原因写进 errorText。</summary>
+        Private Function TryCreateSafe(securePassword As SecureString, errorText As UILabel) As Boolean
+            Try
+                Dim safe As New SafeModel()
+                Dim settings As SettingsModel = Program.Services.GetRequiredService(Of ISettingsService)().LoadSettingsOrDefault()
+                Dim algorithm As String = settings.SelectedEncryptionAlgorithm
+                Dim kdfAlgorithm As String = settings.SelectedKdfAlgorithm
+
+                Dim key As Byte() = _cryptoRandomService.GetRandomBytes(32)
+                safe.SerializeableKey = SafeModel.EncryptKey(key, securePassword, _cryptoRandomService, algorithm, kdfAlgorithm)
+
+                Dim dummyNeedsReEncryption As Boolean = False
+                If Not _safeKeyService.TryOpenSafe(safe, securePassword, dummyNeedsReEncryption) Then
+                    errorText.Text = "安全箱创建失败，无法验证密钥。"
+                    Return False
+                End If
+
+                _repository.Safes.Add(safe)
+                RepositoryStorageService.TrySaveRepository(_repository)
+                SetStatus("安全箱已创建并解锁。")
+                Return True
+            Catch ex As Exception
+                errorText.Text = "创建安全箱失败：" & ex.Message
+                Return False
+            End Try
+        End Function
 
         ''' <summary>
         ''' 从安全箱密钥的密文头解析算法对，形如 "xchacha20_poly1305 + argon2id"。
@@ -2707,17 +2763,25 @@ Namespace SilentNotes.WindowsVb.Views
             End Try
         End Sub
 
+        ''' <summary>超长文本截断并加省略号。</summary>
+        Private Shared Function TruncateEllipsis(text As String, maxLength As Integer) As String
+            If text Is Nothing OrElse text.Length <= maxLength Then
+                Return text
+            End If
+            Return text.Substring(0, maxLength) & "..."
+        End Function
+
         Private Shared Function BuildTitle(note As NoteModel) As String
             Dim heading As String = ExtractFirstHeading(note.HtmlContent)
             If Not String.IsNullOrWhiteSpace(heading) Then
-                Return If(heading.Length > 80, heading.Substring(0, 80) & "...", heading)
+                Return TruncateEllipsis(heading, 80)
             End If
 
             Dim text As String = BuildPlainText(note.HtmlContent)
             If String.IsNullOrWhiteSpace(text) Then
                 Return "无标题笔记"
             End If
-            Return If(text.Length > 80, text.Substring(0, 80) & "...", text)
+            Return TruncateEllipsis(text, 80)
         End Function
 
         Private Shared Function ExtractFirstHeading(html As String) As String
@@ -2737,35 +2801,10 @@ Namespace SilentNotes.WindowsVb.Views
         End Function
 
         Private Shared Function BuildPlainText(html As String) As String
-            Dim withoutTags As String = Regex.Replace(If(html, String.Empty), "<.*?>", " ")
+            ' Singleline 让 . 跨行匹配：跨行的标签同样要剥干净，否则影响搜索与字数。
+            Dim withoutTags As String = Regex.Replace(If(html, String.Empty), "<.*?>", " ", RegexOptions.Singleline)
             Dim decoded As String = System.Net.WebUtility.HtmlDecode(withoutTags)
             Return Regex.Replace(decoded, "\s+", " ").Trim()
-        End Function
-
-        Private Shared Function IsSyncErrorMessage(message As String) As Boolean
-            If String.IsNullOrEmpty(message) Then
-                Return False
-            End If
-            Return message.Contains("失败") _
-                OrElse message.Contains("错误") _
-                OrElse message.Contains("无效") _
-                OrElse message.Contains("请先") _
-                OrElse message.Contains("没有找到")
-        End Function
-
-        Private Shared Function BuildBodyLine(note As NoteModel) As String
-            If String.IsNullOrWhiteSpace(note.HtmlContent) Then
-                Return Nothing
-            End If
-
-            Dim withoutHeadings As String = Regex.Replace(note.HtmlContent, "<h[123][^>]*>.*?</h[123]>", " ", RegexOptions.IgnoreCase Or RegexOptions.Singleline)
-            Dim plainText As String = BuildPlainText(withoutHeadings)
-
-            If String.IsNullOrWhiteSpace(plainText) Then
-                Return Nothing
-            End If
-
-            Return If(plainText.Length > 60, plainText.Substring(0, 60) & "...", plainText)
         End Function
 
 #End Region
@@ -2775,7 +2814,6 @@ Namespace SilentNotes.WindowsVb.Views
 
             Private ReadOnly _note As NoteModel
             Private _title As String
-            Private _bodyLine As String
             Private _secondaryLine As String
 
             Public Sub New(note As NoteModel)
@@ -2795,12 +2833,6 @@ Namespace SilentNotes.WindowsVb.Views
                 End Get
             End Property
 
-            Public ReadOnly Property BodyLine As String
-                Get
-                    Return _bodyLine
-                End Get
-            End Property
-
             Public ReadOnly Property SecondaryLine As String
                 Get
                     Return _secondaryLine
@@ -2815,7 +2847,6 @@ Namespace SilentNotes.WindowsVb.Views
 
             Public Sub RefreshDisplay()
                 _title = BuildTitle(_note)
-                _bodyLine = BuildBodyLine(_note)
                 Dim parts As New List(Of String)()
                 If _note.NoteType = NoteType.Checklist Then
                     parts.Add("清单")
@@ -2831,8 +2862,7 @@ Namespace SilentNotes.WindowsVb.Views
             End Sub
 
             Public Sub SetCustomTitle(customTitle As String)
-                _title = If(String.IsNullOrWhiteSpace(customTitle), "无标题笔记",
-                    If(customTitle.Length > 80, customTitle.Substring(0, 80) & "...", customTitle))
+                _title = If(String.IsNullOrWhiteSpace(customTitle), "无标题笔记", TruncateEllipsis(customTitle, 80))
             End Sub
 
             Public Overrides Function ToString() As String

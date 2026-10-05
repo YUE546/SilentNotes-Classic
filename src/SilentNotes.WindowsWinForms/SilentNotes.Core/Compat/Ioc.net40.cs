@@ -1,6 +1,6 @@
 // Compat copy of SilentNotes.AllPlatforms\Ioc.cs for .NET 4.0.
 // Differences to the frozen original:
-// - The class is public (the previously prebuilt DLL exported it; the Windows clients use it).
+// - The class is public (the Windows clients use it).
 // - The unusable "using Microsoft.Extensions.DependencyInjection;" is removed instead of
 //   being satisfied by the empty namespace shim (kept only for the frozen original).
 using System;
@@ -37,7 +37,8 @@ namespace SilentNotes
         public object GetService(Type serviceType)
         {
             // Check if there is an injected service first
-            if (_injectedServices.TryGetValue(serviceType, out object instance))
+            object instance;
+            if (_injectedServices.TryGetValue(serviceType, out instance))
                 return instance;
 
             if (_serviceProvider == null)

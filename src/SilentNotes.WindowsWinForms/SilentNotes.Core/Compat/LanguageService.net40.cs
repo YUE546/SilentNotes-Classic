@@ -58,7 +58,8 @@ namespace SilentNotes.Services
         /// <inheritdoc/>
         public string LoadText(string id)
         {
-            if (LazyLoadTextResources() && _textResources.TryGetValue(id, out string text))
+            string text;
+            if (LazyLoadTextResources() && _textResources.TryGetValue(id, out text))
                 return text;
             else if (Debugger.IsAttached)
                 throw new Exception(string.Format("Could not find text resource {0}", id));
@@ -145,8 +146,10 @@ namespace SilentNotes.Services
             string line;
             while ((line = languageResourceStream.ReadLine()) != null)
             {
+                string resKey;
+                string resText;
                 if (!IsComment(line) &&
-                    TrySplitLine(line, out string resKey, out string resText))
+                    TrySplitLine(line, out resKey, out resText))
                 {
                     resText = ReplaceSpecialTags(resText);
                     result[resKey] = resText;
@@ -226,8 +229,10 @@ namespace SilentNotes.Services
                 string line;
                 while ((line = languageResourceStream.ReadLine()) != null)
                 {
+                    string resKey;
+                    string resText;
                     if (!IsComment(line) &&
-                        TrySplitLine(line, out string resKey, out string resText))
+                        TrySplitLine(line, out resKey, out resText))
                     {
                         if (_textResources.ContainsKey(resKey))
                         {

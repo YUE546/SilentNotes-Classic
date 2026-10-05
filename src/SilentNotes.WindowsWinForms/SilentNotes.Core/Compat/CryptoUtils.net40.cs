@@ -1,7 +1,7 @@
 // Compat copy of SilentNotes.AllPlatforms\Crypto\CryptoUtils.cs for .NET 4.0.
 // Only difference to the frozen original: the Obfuscate function uses aes_gcm (instead of the
-// .NET 4.0 unavailable xchacha20). Note that data obfuscated by an older build cannot be
-// deobfuscated by this one without a prior migration.
+// .NET 4.0 unavailable xchacha20). Data obfuscated with other algorithms requires a prior
+// migration before deobfuscation.
 using System;
 using System.Runtime.CompilerServices;
 using System.Security;

@@ -9,10 +9,9 @@
     <AssemblyName>VanillaCloudStorageClient</AssemblyName>
     <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
-    <LangVersion>latest</LangVersion>
+    <LangVersion>6</LangVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
-    <!-- Roslyn (C# 7+) compiler for the legacy MSBuild 14 toolchain -->
-    <CscToolPath>$(MSBuildThisFileDirectory)..\..\..\tools\roslyn\pkg\tasks\net472</CscToolPath>
+    <!-- C# 6 compiles with the Roslyn csc built into MSBuild 14; no external CscToolPath needed -->
     <!-- net40 targeting pack is not installed; use the reference assemblies package directly
          (its .targets file is SDK-style and cannot be imported by MSBuild 14) -->
     <FrameworkPathOverride>$(MSBuildThisFileDirectory)..\..\..\packages\Microsoft.NETFramework.ReferenceAssemblies.net40.1.0.3\build\.NETFramework\v4.0</FrameworkPathOverride>

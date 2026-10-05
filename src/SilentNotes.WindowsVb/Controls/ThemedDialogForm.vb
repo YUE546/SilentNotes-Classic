@@ -15,7 +15,7 @@ Namespace SilentNotes.WindowsVb.Controls
         Inherits Form
 
         ''' <summary>最近应用的一套调色板；让子类给动态元素着色。</summary>
-        Friend Theme As WinFormsThemeService
+        Friend Property Theme As WinFormsThemeService
 
         Public Sub New()
             FormBorderStyle = FormBorderStyle.FixedDialog

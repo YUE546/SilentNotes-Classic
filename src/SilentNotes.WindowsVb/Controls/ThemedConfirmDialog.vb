@@ -10,7 +10,7 @@ Namespace SilentNotes.WindowsVb.Controls
     ''' <summary>
     ''' 确认型 MessageBox 的主题化替代：标题、说明文字和一行右对齐按钮。
     ''' 当操作不可逆（永久删除、清空回收站、恢复备份）时，确认按钮变为 danger 色。
-    ''' 使用 SunnyUI 按钮/标签，让对话框与主窗口样式一致。
+    ''' 使用 SunnyUI 按钮/标签，经 WinFormsThemeService 着色。
     ''' </summary>
     Friend Class ThemedConfirmDialog
         Inherits ThemedDialogForm

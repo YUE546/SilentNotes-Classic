@@ -3,6 +3,7 @@
 // same behaviour with ContinueWith on the captured synchronization context, so the file/folder
 // picker dialogs are still invoked from the UI thread.
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using SilentNotes.Models;
 using SilentNotes.Services;
@@ -27,7 +28,7 @@ namespace SilentNotes.Workers
             {
                 if (t.Result)
                 {
-                    // Create a zip file, so that in future, attachements can be added as well.
+                    // Create a zip file containing the repository file.
                     CompressUtils.CompressEntry repositoryEntry = new CompressUtils.CompressEntry
                     {
                         Name = NoteRepositoryModel.RepositoryFileName,

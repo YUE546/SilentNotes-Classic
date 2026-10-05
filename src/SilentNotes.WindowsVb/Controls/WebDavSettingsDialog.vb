@@ -12,7 +12,7 @@ Imports VanillaCloudStorageClient.CloudStorageProviders
 
 Namespace SilentNotes.WindowsVb.Controls
     ''' <summary>
-    ''' WebDavSettingsDialog 的 WinForms 版：WebDAV 服务器/用户名/密码、传输码、
+    ''' WebDAV 同步设置对话框：服务器/用户名/密码、传输码、
     ''' 同步模式与数据目录，带实时连接测试。
     ''' </summary>
     Public Class WebDavSettingsDialog
@@ -98,7 +98,7 @@ Namespace SilentNotes.WindowsVb.Controls
             Width = 480
             Height = 410
 
-            ' 填充面板上的绝对布局：确定性布局，没有 TableLayoutPanel 的行增长怪癖。
+            ' 绝对布局（固定 Left/Top 坐标）。
             Dim content As New Panel With {.Dock = DockStyle.Fill, .Tag = "window"}
 
             _serverUrlBox = New UITextBox With {.Left = 112, .Top = 16, .Width = 348, .Font = UIAppFont, .Watermark = "https://…"}
@@ -189,6 +189,9 @@ Namespace SilentNotes.WindowsVb.Controls
             _statusText.Text = String.Empty
         End Sub
 
+        ''' <summary>下拉框索引 ↔ 设置存储字符串的唯一映射，两方向共用。</summary>
+        Private Shared ReadOnly SyncModeNames As String() = {"Never", "CostFreeInternetOnly", "Always"}
+
         ''' <summary>给表单字段设置预填值。</summary>
         Public Sub Prefill(url As String, username As String, password As String, transferCode As String, syncMode As String, dataDirectory As String)
             _serverUrlBox.Text = If(url, String.Empty)
@@ -200,18 +203,16 @@ Namespace SilentNotes.WindowsVb.Controls
 
             Dim modeIndex As Integer = 1
             If Not String.IsNullOrEmpty(syncMode) Then
-                If String.Equals(syncMode, "Never", StringComparison.Ordinal) Then
-                    modeIndex = 0
-                ElseIf String.Equals(syncMode, "Always", StringComparison.Ordinal) Then
-                    modeIndex = 2
+                Dim found As Integer = Array.IndexOf(SyncModeNames, syncMode)
+                If found >= 0 Then
+                    modeIndex = found
                 End If
             End If
             _syncModeBox.SelectedIndex = modeIndex
             UpdateTestButtonState()
         End Sub
 
-        ' C# 版是 async void + await Task.Run；VB10 没有 async，
-        ' 改为后台线程执行测试、SetStatus/BeginInvoke 回 UI 线程。
+        ' VB10 无 async：连接测试在后台线程执行，SetStatus/BeginInvoke 回 UI 线程。
         Private Sub TestConnectionButton_Click(sender As Object, e As EventArgs)
             _testConnectionButton.Enabled = False
             _saveButton.Enabled = False
@@ -230,10 +231,13 @@ Namespace SilentNotes.WindowsVb.Controls
                                       Catch ex As Exception
                                           SetStatus("发生未知错误：" & ex.Message, True)
                                       Finally
-                                          BeginInvoke(New Action(Sub()
-                                                                     _testConnectionButton.Enabled = True
-                                                                     _saveButton.Enabled = True
-                                                                 End Sub))
+                                          ' 测试期间窗体可能已被关闭（连接慢时），句柄销毁后 BeginInvoke 会抛异常。
+                                          If Not IsDisposed AndAlso IsHandleCreated Then
+                                              BeginInvoke(New Action(Sub()
+                                                                         _testConnectionButton.Enabled = True
+                                                                         _saveButton.Enabled = True
+                                                                     End Sub))
+                                          End If
                                       End Try
                                   End Sub)
         End Sub
@@ -248,8 +252,8 @@ Namespace SilentNotes.WindowsVb.Controls
                     .UnprotectedPassword = password
                 }
 
-                ' 客户端保留 Task 签名（与 C# 版共用 DLL）；本方法运行在后台线程，Wait+解包等待，
-                ' 异常还原成原始类型（AccessDeniedException 等），catch 分支语义与 C# 版一致。
+                ' 客户端方法为 Task 签名；本方法在后台线程用 Wait+解包等待，
+                ' 异常还原为原始类型（AccessDeniedException 等）。
                 TaskUtils.WaitAndUnwrap(client.ListFileNamesAsync(credentials))
                 Return True
             Catch ex As AccessDeniedException
@@ -268,6 +272,10 @@ Namespace SilentNotes.WindowsVb.Controls
         End Function
 
         Private Sub SetStatus(message As String, isError As Boolean)
+            ' 句柄销毁后 InvokeRequired 返回 False，会走跨线程改控件的危险路径。
+            If IsDisposed OrElse Not IsHandleCreated Then
+                Return
+            End If
             If InvokeRequired Then
                 BeginInvoke(New Action(Sub() SetStatus(message, isError)))
                 Return
@@ -300,13 +308,7 @@ Namespace SilentNotes.WindowsVb.Controls
             Username = _usernameBox.Text.Trim()
             Password = _passwordBox.Text
             TransferCode = _transferCodeBox.Text.Replace(" ", String.Empty)
-            If _syncModeBox.SelectedIndex = 0 Then
-                SyncMode = "Never"
-            ElseIf _syncModeBox.SelectedIndex = 2 Then
-                SyncMode = "Always"
-            Else
-                SyncMode = "CostFreeInternetOnly"
-            End If
+            SyncMode = SyncModeNames(If(_syncModeBox.SelectedIndex >= 0, _syncModeBox.SelectedIndex, 1))
             DataDirectory = _currentDataDirectory
             DialogResult = DialogResult.OK
         End Sub

@@ -5,9 +5,8 @@ Imports System
 Namespace SilentNotes.WindowsVb.Controls
     ''' <summary>
     ''' MSHTML DOM 后期绑定工具：全项目唯一 Option Strict Off 的文件。
-    ''' C# 版通过 dynamic binder 访问 DomDocument；VB 后期绑定语义略有差异——
-    ''' MSHTML 的 null 经 COM 封送回来是 DBNull 而不是 Nothing，所有取值都必须同时排查两者。
-    ''' 这里集中封装全部后期绑定调用，其余代码保持 Option Strict On。
+    ''' VB 后期绑定访问 DomDocument；MSHTML 的 null 经 COM 封送是 DBNull 而非 Nothing，
+    ''' 所有取值必须同时排查两者。这里集中封装全部后期绑定调用，其余代码保持 Option Strict On。
     ''' </summary>
     Friend Module MsHtmlLateBound
 
@@ -67,6 +66,19 @@ Namespace SilentNotes.WindowsVb.Controls
                 Return Nothing
             End If
             Return range.parentElement()
+        End Function
+
+        ''' <summary>取当前 DOM 事件（window.event）的 keyCode；事件不可用或非键盘事件时返回 0。</summary>
+        Friend Function GetCurrentEventKeyCode(domDocument As Object) As Integer
+            Dim ev As Object = domDocument.parentWindow.event
+            If ev Is Nothing OrElse TypeOf ev Is DBNull Then
+                Return 0
+            End If
+            Dim code As Object = ev.keyCode
+            If code Is Nothing OrElse TypeOf code Is DBNull Then
+                Return 0
+            End If
+            Return CInt(code)
         End Function
 
         Friend Function GetTagName(element As Object) As String

@@ -15,7 +15,7 @@ Namespace SilentNotes.WindowsVb.Services
 
         Public Sub New()
             Dim directory As String = WindowsDataDirectoryService.GetEffectiveDirectory()
-            _logFilePath = Path.Combine(directory, "silentnotes_wpf.log")
+            _logFilePath = Path.Combine(directory, "silentnotes_vbforms.log")
             TryRotateIfNeeded()
         End Sub
 

@@ -21,8 +21,7 @@ namespace SilentNotes.Crypto.KeyDerivation
         public const string CryptoKdfName = "pbkdf2";
 
         /// <summary>
-        /// Measured ~750ms on a mid-range mobile device of 2023. This value will be increased over
-        /// time, to adapt for future hardware.
+        /// ~750ms on a mid-range mobile device.
         /// </summary>
         private const int HighCostIterations = 25000;
 
@@ -39,7 +38,8 @@ namespace SilentNotes.Crypto.KeyDerivation
         {
             if ((password == null) || (password.Length == 0))
                 throw new CryptoException("The password cannot be empty.");
-            if (!int.TryParse(cost, NumberStyles.None, CultureInfo.InvariantCulture, out int iterations))
+            int iterations;
+            if (!int.TryParse(cost, NumberStyles.None, CultureInfo.InvariantCulture, out iterations))
                 throw new CryptoException("The cost parameter has an invalid format.");
             if (iterations < 1)
                 throw new CryptoException("The cost factor is too small.");
@@ -80,7 +80,8 @@ namespace SilentNotes.Crypto.KeyDerivation
         /// <inheritdoc/>
         public bool NeedsRehashForHighCost(string cost)
         {
-            if (!int.TryParse(cost, NumberStyles.None, CultureInfo.InvariantCulture, out int iterations))
+            int iterations;
+            if (!int.TryParse(cost, NumberStyles.None, CultureInfo.InvariantCulture, out iterations))
                 throw new CryptoException("The cost parameter has an invalid format.");
             return HighCostIterations > iterations;
         }

@@ -5,11 +5,10 @@ Imports System.Threading.Tasks
 
 Namespace SilentNotes.WindowsVb.Services
     ''' <summary>
-    ''' net40 没有 Task.FromResult，用 TaskCompletionSource 等价实现
-    ''' （Compat 先例见 SilentNotes.WindowsWinForms\SilentNotes.Core\Compat\DummyFeedbackService.net40.cs）。
-    ''' 另提供 WaitAndUnwrap：底层 WebDAV 客户端保留 Task 签名（与 C# 版共用同一 DLL），
-    ''' VB10 无 await，在后台线程上 Wait() 等待；StartNew 包装的异常会包成 AggregateException，
-    ''' 这里解包还原成原始异常类型，让调用方的 catch（AccessDeniedException 等）语义与 C# 版一致。
+    ''' net40 没有 Task.FromResult，用 TaskCompletionSource 等价实现。
+    ''' 另提供 WaitAndUnwrap：底层 WebDAV 客户端为 Task 签名，VB10 无 await，
+    ''' 在后台线程上 Wait() 等待；StartNew 包装的异常会包成 AggregateException，
+    ''' 这里解包还原成原始异常类型。
     ''' </summary>
     Friend Module TaskUtils
         Friend Function TaskFromResult(Of T)(value As T) As Task(Of T)

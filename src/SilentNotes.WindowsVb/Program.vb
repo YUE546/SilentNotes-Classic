@@ -12,7 +12,7 @@ Imports Sunny.UI
 
 Namespace SilentNotes.WindowsVb
     Friend Module Program
-        ' 复用 C# WinForms 版的单实例互斥名：VB 版与 C# 版、WPF 版两两互斥（共用同一数据目录）
+        ' 三版共用同一数据目录，两两互斥。
         Private Const MutexName As String = "Global\SilentNotes_WinForms_SingleInstance"
         Private Const WpfMutexName As String = "Global\SilentNotes_WPF_SingleInstance"
         Private _mutex As Mutex
@@ -81,7 +81,7 @@ Namespace SilentNotes.WindowsVb
             Catch ex As Threading.WaitHandleCannotBeOpenedException
                 ' WPF 版未运行 → 正常继续
             Catch
-                ' 其它异常（如句柄权限）也放行，与 C# 版 try/catch 语义一致
+                ' 其它异常（如句柄权限）也放行
             End Try
             Return True
         End Function
@@ -90,13 +90,20 @@ Namespace SilentNotes.WindowsVb
             Try
                 Dim current As Diagnostics.Process = Diagnostics.Process.GetCurrentProcess()
                 Dim processes As Diagnostics.Process() = Diagnostics.Process.GetProcessesByName(current.ProcessName)
-                For Each process As Diagnostics.Process In processes
-                    If process.Id <> current.Id AndAlso process.MainWindowHandle <> IntPtr.Zero Then
-                        NativeMethods.SetForegroundWindow(process.MainWindowHandle)
-                        NativeMethods.ShowWindow(process.MainWindowHandle, NativeMethods.SW_RESTORE)
-                        Exit For
-                    End If
-                Next
+                Try
+                    For Each candidate As Diagnostics.Process In processes
+                        If candidate.Id <> current.Id AndAlso candidate.MainWindowHandle <> IntPtr.Zero Then
+                            NativeMethods.SetForegroundWindow(candidate.MainWindowHandle)
+                            NativeMethods.ShowWindow(candidate.MainWindowHandle, NativeMethods.SW_RESTORE)
+                            Exit For
+                        End If
+                    Next
+                Finally
+                    current.Dispose()
+                    For Each candidate As Diagnostics.Process In processes
+                        candidate.Dispose()
+                    Next
+                End Try
             Catch
             End Try
         End Sub
