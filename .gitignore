@@ -1,0 +1,16 @@
+*
+!.gitignore
+!src/
+!src/SilentNotes.TwinBasic/
+!src/SilentNotes.TwinBasic/build/
+!src/SilentNotes.TwinBasic/build/SilentNotesTb.twinproj
+!src/SilentNotes.TwinBasic/build/shellsrc/
+!src/SilentNotes.TwinBasic/build/shellsrc/**
+!src/SilentNotes.TwinBasic/sync/
+!src/SilentNotes.TwinBasic/sync/mock/
+!src/SilentNotes.TwinBasic/sync/mock/start-webdav.ps1
+!src/SilentNotes.TwinBasic/temp/
+!src/SilentNotes.TwinBasic/temp/*.ps1
+!src/SilentNotes.TwinBasic/temp/build.cmd
+!src/SilentNotes.TwinBasic/chilkat-new-win32/
+!src/SilentNotes.TwinBasic/chilkat-new-win32/**

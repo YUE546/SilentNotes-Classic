@@ -1,0 +1,88 @@
+Option Explicit
+
+' TbBase64 - hand-written Base64, standard alphabet, no line breaks, '=' padding.
+' Matches .NET Convert.ToBase64String / FromBase64String for our payloads.
+
+Class TbBase64
+
+    Private Const ALPHA As String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    Public Function Encode(b() As Byte) As String
+        Dim out As String
+        Dim n As Long, i As Long, v As Long, pos As Long
+        n = UBound(b) + 1
+        ' preallocated buffer + Mid$ writes: O(n); concatenation on this size
+        ' payloads is quadratic and blocks the caller for minutes
+        out = Space$(((n + 2) \ 3) * 4)
+        pos = 1
+        i = 0
+        Do While i + 2 < n
+            v = (CLng(b(i)) * 65536) Or (CLng(b(i + 1)) * 256) Or CLng(b(i + 2))
+            Mid$(out, pos, 1) = Mid$(ALPHA, (v \ 262144) + 1, 1)
+            Mid$(out, pos + 1, 1) = Mid$(ALPHA, ((v \ 4096) And 63) + 1, 1)
+            Mid$(out, pos + 2, 1) = Mid$(ALPHA, ((v \ 64) And 63) + 1, 1)
+            Mid$(out, pos + 3, 1) = Mid$(ALPHA, (v And 63) + 1, 1)
+            pos = pos + 4
+            i = i + 3
+        Loop
+        If (n - i) = 1 Then
+            v = CLng(b(i))
+            Mid$(out, pos, 1) = Mid$(ALPHA, (v \ 4) + 1, 1)
+            Mid$(out, pos + 1, 1) = Mid$(ALPHA, ((v And 3) * 16) + 1, 1)
+            Mid$(out, pos + 2, 1) = "="
+            Mid$(out, pos + 3, 1) = "="
+        ElseIf (n - i) = 2 Then
+            v = (CLng(b(i)) * 256) Or CLng(b(i + 1))
+            Mid$(out, pos, 1) = Mid$(ALPHA, (v \ 1024) + 1, 1)
+            Mid$(out, pos + 1, 1) = Mid$(ALPHA, ((v \ 16) And 63) + 1, 1)
+            Mid$(out, pos + 2, 1) = Mid$(ALPHA, ((v And 15) * 4) + 1, 1)
+            Mid$(out, pos + 3, 1) = "="
+        End If
+        Encode = out
+    End Function
+
+    ' Returns a Variant holding Byte() on success, or Empty on invalid input.
+    Public Function Decode(s As String) As Variant
+        Dim tmp() As Byte
+        Dim n As Long, i As Long
+        Dim acc As Long, accBits As Long
+        Dim ch As Long, v As Long, done As Boolean
+
+        ReDim tmp(0 To (Len(s) \ 4 + 1) * 3)
+        For i = 1 To Len(s)
+            ch = AscW(Mid$(s, i, 1))
+            If ch = 61 Then ' '=' padding: only allowed as the last 1-2 chars
+                done = True
+            ElseIf ch = 13 Or ch = 10 Or ch = 9 Or ch = 32 Then
+                ' ignore whitespace (defensive; our payloads never contain any)
+            ElseIf done Then
+                Decode = Empty
+                Exit Function
+            Else
+                v = InStr(ALPHA, ChrW$(ch)) - 1
+                If v < 0 Then Decode = Empty: Exit Function
+                acc = (acc * 64) Or v
+                accBits = accBits + 6
+                If accBits >= 8 Then
+                    accBits = accBits - 8
+                    tmp(n) = CByte((acc \ (2 ^ accBits)) And 255)
+                    n = n + 1
+                    ' keep only the not-yet-emitted bits in the accumulator,
+                    ' otherwise it would overflow the Long on longer payloads
+                    If accBits > 0 Then
+                        acc = acc And ((2 ^ accBits) - 1)
+                    Else
+                        acc = 0
+                    End If
+                End If
+            End If
+        Next
+        If n = 0 Then
+            Decode = Empty
+            Exit Function
+        End If
+        ReDim Preserve tmp(0 To n - 1)
+        Decode = tmp
+    End Function
+
+End Class

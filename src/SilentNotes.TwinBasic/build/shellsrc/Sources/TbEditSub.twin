@@ -1,0 +1,70 @@
+Option Explicit
+
+' TbEditSub - WndProc subclass of the editor's native child window
+' (Internet Explorer_Server) so Ctrl+click on a link can be routed to the
+' shell (ShellExecute). Same [PredeclaredId] pattern as TbSubclass; the
+' same P1 hard rule applies: Remove() MUST run before the window dies
+' (Form_Unload). Only Ctrl+clicks are intercepted - every other message
+' passes through untouched so the editor keeps its native behavior.
+
+[PredeclaredId]
+Class TbEditSub
+
+    Private Const WM_LBUTTONUP = &H202
+    Private Const MK_CONTROL = &H8
+
+    Private Declare Function SetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long, ByVal dwNewLong As Long) As Long
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function CallWindowProcW Lib "user32" (ByVal lpPrevWndFunc As Long, ByVal hWnd As Long, ByVal uMsg As Long, ByVal wParam As Long, ByVal lParam As Long) As Long
+
+    Public g_Frm As MainForm
+    Public m_origProc As Long
+
+    Private m_hWnd As Long
+    Private m_installed As Boolean
+
+    Public Sub Install(ByVal hWnd As Long, ByVal frm As MainForm)
+        If m_installed Then Exit Sub
+        If hWnd = 0 Then Exit Sub
+        Set g_Frm = frm
+        m_hWnd = hWnd
+        m_origProc = GetWindowLongW(hWnd, GWL_WNDPROC)
+        SetWindowLongW hWnd, GWL_WNDPROC, AddressOf WndProc
+        m_installed = True
+    End Sub
+
+    Public Sub Remove()
+        If Not m_installed Then Exit Sub
+        SetWindowLongW m_hWnd, GWL_WNDPROC, m_origProc
+        m_installed = False
+        Set g_Frm = Nothing
+    End Sub
+
+    Public Function IsInstalled() As Boolean
+        IsInstalled = m_installed
+    End Function
+
+    Private Property Get GWL_WNDPROC() As Long
+        GWL_WNDPROC = -4
+    End Property
+
+    Public Function WndProc(ByVal hWnd As Long, ByVal uMsg As Long, ByVal wParam As Long, ByVal lParam As Long) As Long
+        On Error GoTo defproc
+        If uMsg = WM_LBUTTONUP Then
+            If (wParam And MK_CONTROL) <> 0 Then
+                Dim x As Long, y As Long
+                x = lParam And &HFFFF&
+                If x >= 32768 Then x = x - 65536
+                y = (lParam And &HFFFF0000) \ &H10000
+                If Not TbEditSub.g_Frm Is Nothing Then
+                    TbEditSub.g_Frm.OnEditClick x, y
+                End If
+                WndProc = 0
+                Exit Function
+            End If
+        End If
+defproc:
+        WndProc = CallWindowProcW(TbEditSub.m_origProc, hWnd, uMsg, wParam, lParam)
+    End Function
+
+End Class

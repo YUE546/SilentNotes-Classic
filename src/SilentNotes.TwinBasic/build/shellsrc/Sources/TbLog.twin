@@ -1,0 +1,36 @@
+Option Explicit
+
+' TbLog - crash.log append writer.
+' Format replicated from the .NET shells (Program.vb / Program.cs LogException):
+'   File.AppendAllText(path, String.Format("[{0}] {1}\r\n\r\n", DateTime.Now, ex))
+'   => "[yyyy/MM/dd HH:mm:ss] <body>\r\n\r\n"   (body may span lines, like ex.ToString())
+' Encoding = UTF-8 WITHOUT BOM (matches .NET File.AppendAllText default).
+' Written via binary Put + TbUtf8 so no ANSI codepage mangling (Print# would
+' write GBK on a zh-CN box - wrong for UTF-8 crash.log).
+
+Class TbLog
+
+    Public Function AppendEntry(path As String, body As String) As Boolean
+        On Error GoTo fail
+        Dim u8 As TbUtf8
+        Set u8 = New TbUtf8
+
+        Dim s As String
+        s = "[" & Format$(Now, "yyyy/mm/dd hh:nn:ss") & "] " & body & vbCrLf & vbCrLf
+
+        Dim ba() As Byte
+        ba = u8.Encode(s)
+
+        Dim f As Integer
+        f = FreeFile
+        Open path For Binary Access Read Write As #f
+        Seek #f, LOF(f) + 1        ' append at end (creates file when missing)
+        Put #f, , ba
+        Close #f
+        AppendEntry = True
+        Exit Function
+    fail:
+        AppendEntry = False
+    End Function
+
+End Class

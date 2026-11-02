@@ -1,0 +1,269 @@
+Option Explicit
+
+' TbRepoXml - in-memory model of the SilentNotes repository XML.
+' Fidelity contract (route B phase 2): no strongly-typed note model here on
+' purpose - the model is "attribute dict in file order + child node order",
+' every text/attribute value kept RAW as it appears in the file (entities
+' intact, whitespace verbatim, tabs included), plus per-element self-closing
+' flag and per-attribute quote character. The serializer replays exactly this,
+' so element order, attribute order, indentation, quote style, empty
+' attributes, self-closing vs explicit close, CRLF and BOM all survive.
+'
+' Node 0 is the document pseudo-element (holds XML declaration blob, root
+' element, any trailing whitespace). Tree links: NChild1/NNext sibling chain.
+' Fixed capacities with hard errors on overflow (no silent truncation).
+
+Module TbRepoXml
+
+Public Const NKELEMENT As Long = 0
+Public Const NKTEXT As Long = 1
+Public Const NKRAW As Long = 2     ' XML declaration / PI / comment / CDATA blob
+
+Public Const NODE_CAP As Long = 16384
+Public Const ATTR_CAP As Long = 32768
+
+Public Type TbXmlAttr
+    AName As String
+    AValue As String     ' raw, entities intact
+    AQuote As String     ' the quote character used in the file (" or ')
+End Type
+
+Public Type TbXmlNode
+    NKind As Long
+    NName As String      ' element name ("" for text/raw nodes)
+    NSelfClose As Boolean
+    NText As String      ' NKTEXT: raw content; NKRAW: full verbatim blob
+    NParent As Long
+    NChild1 As Long      ' first child node index (0 = none)
+    NNext As Long        ' next sibling index (0 = none)
+    NAttr1 As Long       ' attributes live in m_Attrs[NAttr1..NAttrN] (0 = none)
+    NAttrN As Long
+End Type
+
+Public m_Nodes() As TbXmlNode
+Public m_Attrs() As TbXmlAttr
+Public m_NodeCount As Long
+Public m_AttrCount As Long
+
+' ---- statistics (filled by Compute*) ----
+Public st_Elements As Long
+Public st_Texts As Long
+Public st_Raws As Long
+Public st_Attrs As Long
+Public st_DepthMax As Long
+Public st_EntityAmp As Long
+Public st_EntityLt As Long
+Public st_EntityGt As Long
+Public st_EntityQuot As Long
+Public st_EntityApos As Long
+Public st_EntityNum As Long
+Public st_RecanText As Long
+Public st_RecanAttr As Long
+Public st_RecanSampleT As String
+Public st_RecanSampleA As String
+
+Public Sub ResetModel()
+    ReDim m_Nodes(0 To NODE_CAP)
+    ReDim m_Attrs(1 To ATTR_CAP)
+    m_NodeCount = 0
+    m_AttrCount = 0
+    m_Nodes(0).NKind = NKELEMENT
+    m_Nodes(0).NName = "#document"
+    m_Nodes(0).NSelfClose = False
+    m_Nodes(0).NText = ""
+    m_Nodes(0).NParent = -1
+    m_Nodes(0).NChild1 = 0
+    m_Nodes(0).NNext = 0
+    m_Nodes(0).NAttr1 = 0
+    m_Nodes(0).NAttrN = -1
+    st_Elements = 0
+    st_Texts = 0
+    st_Raws = 0
+    st_Attrs = 0
+    st_DepthMax = 0
+    st_EntityAmp = 0
+    st_EntityLt = 0
+    st_EntityGt = 0
+    st_EntityQuot = 0
+    st_EntityApos = 0
+    st_EntityNum = 0
+    st_RecanText = 0
+    st_RecanAttr = 0
+    st_RecanSampleT = ""
+    st_RecanSampleA = ""
+End Sub
+
+Public Function AddNode(ByVal parent As Long, ByVal kind As Long) As Long
+    Dim idx As Long, c As Long
+    m_NodeCount = m_NodeCount + 1
+    If m_NodeCount > NODE_CAP Then Err.Raise 1101, "TbRepoXml", "node capacity exceeded"
+    idx = m_NodeCount
+    m_Nodes(idx).NKind = kind
+    m_Nodes(idx).NName = ""
+    m_Nodes(idx).NSelfClose = False
+    m_Nodes(idx).NText = ""
+    m_Nodes(idx).NParent = parent
+    m_Nodes(idx).NChild1 = 0
+    m_Nodes(idx).NNext = 0
+    m_Nodes(idx).NAttr1 = 0
+    m_Nodes(idx).NAttrN = -1
+    If parent >= 0 Then
+        If m_Nodes(parent).NChild1 = 0 Then
+            m_Nodes(parent).NChild1 = idx
+        Else
+            c = m_Nodes(parent).NChild1
+            Do While m_Nodes(c).NNext <> 0
+                c = m_Nodes(c).NNext
+            Loop
+            m_Nodes(c).NNext = idx
+        End If
+    End If
+    AddNode = idx
+End Function
+
+Public Sub AddAttr(ByVal el As Long, ByRef aName As String, ByRef aVal As String, ByRef aQuote As String)
+    m_AttrCount = m_AttrCount + 1
+    If m_AttrCount > ATTR_CAP Then Err.Raise 1102, "TbRepoXml", "attr capacity exceeded"
+    If m_Nodes(el).NAttr1 = 0 Then m_Nodes(el).NAttr1 = m_AttrCount
+    m_Nodes(el).NAttrN = m_AttrCount
+    m_Attrs(m_AttrCount).AName = aName
+    m_Attrs(m_AttrCount).AValue = aVal
+    m_Attrs(m_AttrCount).AQuote = aQuote
+End Sub
+
+' ---- element count by name (recursive walk) ----
+Public Function CountNamed(ByVal nm As String) As Long
+    CountNamed = CountNamedUnder(0, nm)
+End Function
+
+Private Function CountNamedUnder(ByVal idx As Long, ByRef nm As String) As Long
+    Dim n As Long, c As Long
+    c = m_Nodes(idx).NChild1
+    Do While c <> 0
+        If m_Nodes(c).NKind = NKELEMENT Then
+            If m_Nodes(c).NName = nm Then n = n + 1
+            n = n + CountNamedUnder(c, nm)
+        End If
+        c = m_Nodes(c).NNext
+    Loop
+    CountNamedUnder = n
+End Function
+
+Public Sub ComputeStats()
+    st_Elements = 0
+    st_Texts = 0
+    st_Raws = 0
+    st_DepthMax = 0
+    WalkStats 0, 0
+    st_Attrs = m_AttrCount
+End Sub
+
+Private Sub WalkStats(ByVal idx As Long, ByVal depth As Long)
+    Dim c As Long
+    c = m_Nodes(idx).NChild1
+    Do While c <> 0
+        Select Case m_Nodes(c).NKind
+        Case NKELEMENT
+            st_Elements = st_Elements + 1
+            If depth + 1 > st_DepthMax Then st_DepthMax = depth + 1
+            WalkStats c, depth + 1
+        Case NKTEXT
+            st_Texts = st_Texts + 1
+        Case NKRAW
+            st_Raws = st_Raws + 1
+        End Select
+        c = m_Nodes(c).NNext
+    Loop
+End Sub
+
+' ---- entity census over raw text nodes + attribute values ----
+Public Sub ComputeEntityCensus()
+    st_EntityAmp = 0
+    st_EntityLt = 0
+    st_EntityGt = 0
+    st_EntityQuot = 0
+    st_EntityApos = 0
+    st_EntityNum = 0
+    CensusWalk 0
+End Sub
+
+Private Sub CensusWalk(ByVal idx As Long)
+    Dim c As Long, i As Long
+    c = m_Nodes(idx).NChild1
+    Do While c <> 0
+        Select Case m_Nodes(c).NKind
+        Case NKTEXT
+            CensusStr m_Nodes(c).NText
+        Case NKELEMENT
+            For i = m_Nodes(c).NAttr1 To m_Nodes(c).NAttrN
+                CensusStr m_Attrs(i).AValue
+            Next
+            CensusWalk c
+        End Select
+        c = m_Nodes(c).NNext
+    Loop
+End Sub
+
+Private Sub CensusStr(ByRef s As String)
+    If InStr(s, "&") = 0 Then Exit Sub
+    st_EntityAmp = st_EntityAmp + CountSub(s, "&amp;")
+    st_EntityLt = st_EntityLt + CountSub(s, "&lt;")
+    st_EntityGt = st_EntityGt + CountSub(s, "&gt;")
+    st_EntityQuot = st_EntityQuot + CountSub(s, "&quot;")
+    st_EntityApos = st_EntityApos + CountSub(s, "&apos;")
+    st_EntityNum = st_EntityNum + CountSub(s, "&#")
+End Sub
+
+Private Function CountSub(ByRef s As String, ByRef pat As String) As Long
+    Dim n As Long, p As Long
+    p = InStr(1, s, pat, vbBinaryCompare)
+    Do While p > 0
+        n = n + 1
+        p = InStr(p + Len(pat), s, pat, vbBinaryCompare)
+    Loop
+    CountSub = n
+End Function
+
+' ---- recanonicalization check (informational): does
+'      Escape(Unescape(raw)) == raw hold for every node?
+'      0 everywhere proves the file uses exactly our canonical escaping.
+Public Sub ComputeRecanonical()
+    st_RecanText = 0
+    st_RecanAttr = 0
+    st_RecanSampleT = ""
+    st_RecanSampleA = ""
+    RecanWalk 0
+End Sub
+
+Private Sub RecanWalk(ByVal idx As Long)
+    Dim c As Long, i As Long
+    c = m_Nodes(idx).NChild1
+    Do While c <> 0
+        Select Case m_Nodes(c).NKind
+        Case NKTEXT
+            If TbXmlLite.EscapeText(TbXmlLite.Unescape(m_Nodes(c).NText)) <> m_Nodes(c).NText Then
+                st_RecanText = st_RecanText + 1
+                If Len(st_RecanSampleT) = 0 Then st_RecanSampleT = Snip(m_Nodes(c).NText)
+            End If
+        Case NKELEMENT
+            For i = m_Nodes(c).NAttr1 To m_Nodes(c).NAttrN
+                If TbXmlLite.EscapeAttr(TbXmlLite.Unescape(m_Attrs(i).AValue)) <> m_Attrs(i).AValue Then
+                    st_RecanAttr = st_RecanAttr + 1
+                    If Len(st_RecanSampleA) = 0 Then st_RecanSampleA = Snip(m_Attrs(i).AValue)
+                End If
+            Next
+            RecanWalk c
+        End Select
+        c = m_Nodes(c).NNext
+    Loop
+End Sub
+
+Private Function Snip(ByRef s As String) As String
+    If Len(s) > 60 Then
+        Snip = Left$(s, 60) & "..."
+    Else
+        Snip = s
+    End If
+End Function
+
+End Module

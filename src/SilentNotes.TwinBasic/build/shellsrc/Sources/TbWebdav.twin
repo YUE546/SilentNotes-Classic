@@ -1,0 +1,515 @@
+Option Explicit
+
+' TbWebdav - WebDAV transport for the tB shell (P4 core layer).
+' Chilkat.Http.1 via the TbChilkat reg-free activation context. Every request
+' goes through Http.SynchronousRequest so an HTTP status code is ALWAYS
+' distinguishable from a transport failure (QuickGetStr/QuickGetBd return
+' empty/0 for both and cannot be used).
+'
+' Verified against Chilkat 11.6.1 win32 (p4\http_api_probe.ps1, live mock):
+'   - SynchronousRequest returns an HttpResponse for 4xx too (LastMethodSuccess
+'     stays 1); Nothing + Http.LastMethodSuccess=0 only on transport failure.
+'   - HttpRequest.LoadBodyFromBytes(byte()) / AddHeader / HttpVerb / Path work
+'     via late binding; resp.Body returns Variant Byte(), resp.BodyStr works.
+'   - Basic auth is sent proactively (Login/Password/BasicAuth=1): correct
+'     credentials never see a 401 roundtrip, wrong credentials answer 401.
+'   - Chilkat.Http has no UnlockBundle (that is Chilkat.Global) - trial mode
+'     works without unlocking.
+'
+' Semantics (per task spec):
+'   PutFile    200/201/204 -> True
+'   GetFile    200 -> True + data;  404 -> False, LastStatus=404 (distinguishable)
+'   DeleteFile 200/204 -> True;     404 -> False, LastStatus=404
+'   Mkcol      201 -> True; 405 (already exists) -> True (idempotent)
+'   Propfind   207 -> True + props.Exists=True; 404 -> True + props.Exists=False
+'   Transport failure -> False, LastStatus=0; one automatic retry.
+'   ConnectTimeout/ReadTimeout = 15s, RequireSslCertVerify = 1 (https only;
+'   the local http mock never triggers cert verification).
+
+Class TbWebdav
+
+    Private m_Http As Object          ' Chilkat.Http.1 (late bound)
+    Private m_Ck As TbChilkat         ' reg-free loader (transient actctx per CreateObject)
+    Private m_BaseUrl As String       ' default prefix for relative paths
+    Private m_LastErr As String
+    Private m_LastStatus As Long      ' HTTP status of the last answered request (0 = transport fail)
+    Private m_LastAttempts As Long    ' attempts used by the last operation
+
+    Public Property Get LastError() As String
+        LastError = m_LastErr
+    End Property
+
+    Public Property Get LastStatus() As Long
+        LastStatus = m_LastStatus
+    End Property
+
+    Public Property Get LastAttempts() As Long
+        LastAttempts = m_LastAttempts
+    End Property
+
+    Public Property Get HttpVersion() As String
+        On Error Resume Next
+        If m_Ck.EnterCtx() Then          ' late-bound call needs the window (pit 23)
+            HttpVersion = m_Http.Version
+            m_Ck.ExitCtx
+        End If
+    End Property
+
+    ' ------------------------------------------------------------- init
+
+    ' baseUrl e.g. "http://127.0.0.1:8790/webdav" (prefix for relative urls).
+    Public Function Init(chilkat As TbChilkat, baseUrl As String, user As String, pass As String, ByRef errText As String) As Boolean
+        m_LastErr = "": m_LastStatus = 0: m_LastAttempts = 0
+        Set m_Ck = chilkat        ' kept: per-request HttpRequest needs transient reg-free activation
+        If Not chilkat.GetChilkat("Chilkat.Http.1", m_Http, errText) Then
+            m_LastErr = errText
+            Exit Function
+        End If
+        On Error GoTo fail
+        ' pit 23: the FIRST late-bound call on a fresh object resolves the
+        ' typelib reg-free - must run inside the activation window
+        If Not chilkat.EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(chilkat.LastActivateError)
+            GoTo fail
+        End If
+        m_Http.Login = user
+        m_Http.Password = pass
+        m_Http.BasicAuth = 1
+        m_Http.ConnectTimeout = 15
+        m_Http.ReadTimeout = 15
+        m_Http.RequireSslCertVerify = 1
+        m_Http.MaxResponseSize = 200000000   ' repositories stay far below 200 MB
+        chilkat.ExitCtx
+        m_BaseUrl = baseUrl
+        Init = True
+        Exit Function
+    fail:
+        chilkat.ExitCtx
+        errText = "TbWebdav.Init: " & Err.Number & " " & Err.Description
+        m_LastErr = errText
+    End Function
+
+    ' ------------------------------------------------------------- verbs
+
+    ' PUT bytes; success on 200/201/204.
+    Public Function PutFile(url As String, data() As Byte) As Boolean
+        Dim resp As Object, errT As String
+        If Not Send("PUT", url, data, resp, errT) Then
+            m_LastErr = errT
+            Exit Function
+        End If
+        Dim st As Long
+        st = resp.StatusCode
+        m_LastStatus = st
+        If (st = 200) Or (st = 201) Or (st = 204) Then
+            PutFile = True
+        Else
+            m_LastErr = "PUT failed with HTTP " & st
+        End If
+    End Function
+
+    ' GET bytes; success on 200 (data filled). 404 -> False + LastStatus=404.
+    Public Function GetFile(url As String, ByRef data() As Byte) As Boolean
+        Dim resp As Object, errT As String
+        Dim emptyBody() As Byte
+        If Not Send("GET", url, emptyBody, resp, errT) Then
+            m_LastErr = errT
+            Exit Function
+        End If
+        Dim st As Long
+        st = resp.StatusCode
+        m_LastStatus = st
+        If st <> 200 Then
+            m_LastErr = "GET failed with HTTP " & st
+            Exit Function
+        End If
+        data = resp.Body          ' Variant Byte() -> Byte()
+        GetFile = True
+    End Function
+
+    ' DELETE; success on 200/204. 404 -> False + LastStatus=404.
+    Public Function DeleteFile(url As String) As Boolean
+        Dim resp As Object, errT As String
+        Dim emptyBody() As Byte
+        If Not Send("DELETE", url, emptyBody, resp, errT) Then
+            m_LastErr = errT
+            Exit Function
+        End If
+        Dim st As Long
+        st = resp.StatusCode
+        m_LastStatus = st
+        If (st = 200) Or (st = 204) Then
+            DeleteFile = True
+        Else
+            m_LastErr = "DELETE failed with HTTP " & st
+        End If
+    End Function
+
+    ' MKCOL; 201 -> True, 405 (already exists) -> True (idempotent), 409 -> False.
+    Public Function Mkcol(url As String) As Boolean
+        Dim resp As Object, errT As String
+        Dim emptyBody() As Byte
+        If Not Send("MKCOL", url, emptyBody, resp, errT) Then
+            m_LastErr = errT
+            Exit Function
+        End If
+        Dim st As Long
+        st = resp.StatusCode
+        m_LastStatus = st
+        If (st = 201) Or (st = 200) Then
+            Mkcol = True
+        ElseIf st = 405 Then
+            Mkcol = True           ' already exists - treat as success
+            m_LastErr = "MKCOL already exists (405, idempotent success)"
+        Else
+            m_LastErr = "MKCOL failed with HTTP " & st
+        End If
+    End Function
+
+    ' PROPFIND. Call succeeds (True) whenever the server answered 207 or 404;
+    ' props.Exists tells whether the resource exists. props is always a fresh object.
+    Public Function Propfind(url As String, ByRef props As TbWebdavProps) As Boolean
+        Dim resp As Object, errT As String
+        Dim emptyBody() As Byte
+        Set props = New TbWebdavProps
+        If Not Send("PROPFIND", url, emptyBody, resp, errT, "1") Then
+            m_LastErr = errT
+            Exit Function
+        End If
+        Dim st As Long
+        st = resp.StatusCode
+        m_LastStatus = st
+        If st = 404 Then
+            props.Exists = False
+            Propfind = True
+            Exit Function
+        End If
+        If st <> 207 Then
+            m_LastErr = "PROPFIND failed with HTTP " & st
+            Exit Function
+        End If
+        ParseMultistatus resp.BodyStr, props
+        Propfind = True
+    End Function
+
+    ' Convenience: remote file exists? (Propfind + Exists)
+    Public Function RemoteExists(url As String, ByRef isDir As Boolean, ByRef size As Double) As Boolean
+        Dim props As TbWebdavProps
+        If Not Propfind(url, props) Then Exit Function
+        RemoteExists = props.Exists
+        isDir = props.IsDir
+        size = props.Size
+    End Function
+
+    ' ------------------------------------------------------------- engine
+
+    ' One request with one automatic retry on TRANSPORT failure (no response).
+    ' HTTP statuses are answers, not failures - they never retry.
+    ' depthHeader: only used for PROPFIND ("0"/"1"); empty = no Depth header.
+    Private Function Send(verb As String, url As String, body() As Byte, ByRef resp As Object, ByRef errText As String, Optional depthHeader As String = "") As Boolean
+        errText = ""
+        m_LastAttempts = 0
+        m_LastStatus = 0
+
+        Dim host As String, path As String
+        Dim port As Long, sslFlag As Boolean
+        If Not ParseUrl(url, host, port, sslFlag, path, errText) Then
+            m_LastErr = errText
+            Exit Function
+        End If
+
+        ' pit 23: the whole request section (HttpRequest creation + Http call)
+        ' runs under the activation context
+        If Not m_Ck.EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(m_Ck.LastActivateError)
+            m_LastErr = errText
+            Exit Function
+        End If
+
+        Dim attempt As Long
+        For attempt = 1 To 2
+            m_LastAttempts = attempt
+            Dim req As Object
+            Set req = Nothing
+            ' created INSIDE our Enter window (CreateUnderCtx nests refcounted)
+            If Not m_Ck.CreateUnderCtx("Chilkat.HttpRequest.1", req, errText) Then
+                errText = "CreateObject(Chilkat.HttpRequest.1) failed: " & errText
+                m_LastErr = errText
+                m_Ck.ExitCtx
+                Exit Function
+            End If
+
+            req.HttpVerb = verb
+            req.Path = path
+            If Len(depthHeader) > 0 Then
+                req.AddHeader "Depth", depthHeader
+            End If
+            If ArrLen(body) > 0 Then
+                req.contentType = "application/octet-stream"
+                req.LoadBodyFromBytes body
+            End If
+
+            Set resp = Nothing
+            On Error Resume Next
+            Err.Clear
+            Set resp = m_Http.SynchronousRequest(host, port, sslFlag, req)
+            Dim callErr As Long, callDesc As String
+            callErr = Err.Number: callDesc = Err.Description
+            On Error GoTo 0
+
+            If callErr <> 0 Then
+                errText = verb & " dispatch error 0x" & Hex$(callErr) & ": " & callDesc
+                m_LastErr = errText
+                m_Ck.ExitCtx
+                Exit Function            ' dispatch-level breakage: no retry
+            End If
+
+            If resp Is Nothing Then
+                m_LastStatus = 0
+                m_LastErr = verb & " transport failure: LastMethodSuccess=" & m_Http.LastMethodSuccess
+                If attempt = 1 Then
+                    SleepApi 300         ' brief pause, then retry once
+                End If
+            Else
+                m_LastStatus = resp.StatusCode
+                m_LastErr = ""
+                Send = True
+                m_Ck.ExitCtx
+                Exit Function
+            End If
+        Next
+        m_Ck.ExitCtx
+        errText = m_LastErr & " (after " & m_LastAttempts & " attempts)"
+        m_LastErr = errText
+    End Function
+
+    ' Parses "http(s)://host[:port]/path..." ; relative urls (no scheme) are
+    ' resolved against m_BaseUrl.
+    Public Function ParseUrl(ByVal url As String, ByRef host As String, ByRef port As Long, ByRef sslFlag As Boolean, ByRef path As String, ByRef errText As String) As Boolean
+        errText = ""
+        Dim low As String
+        low = LCase$(url)
+        If (Left$(low, 7) <> "http://") And (Left$(low, 8) <> "https://") Then
+            ' relative: join with base
+            If Len(m_BaseUrl) = 0 Then
+                errText = "relative url '" & url & "' without base url"
+                Exit Function
+            End If
+            Dim base As String
+            base = m_BaseUrl
+            If Right$(base, 1) = "/" Then base = Left$(base, Len(base) - 1)
+            If Left$(url, 1) <> "/" Then url = "/" & url
+            url = base & url
+            low = LCase$(url)
+        End If
+
+        Dim rest As String
+        If Left$(low, 8) = "https://" Then
+            sslFlag = True
+            port = 443
+            rest = Mid$(url, 9)
+        Else
+            sslFlag = False
+            port = 80
+            rest = Mid$(url, 8)
+        End If
+
+        ' strip userinfo (not used, but be defensive)
+        Dim atPos As Long
+        atPos = InStr(rest, "@")
+        Dim slashPos As Long
+        slashPos = InStr(rest, "/")
+        If (atPos > 0) And ((slashPos = 0) Or (atPos < slashPos)) Then
+            rest = Mid$(rest, atPos + 1)
+            slashPos = InStr(rest, "/")
+        End If
+
+        Dim hostPart As String
+        If slashPos > 0 Then
+            hostPart = Left$(rest, slashPos - 1)
+            path = Mid$(rest, slashPos)
+        Else
+            hostPart = rest
+            path = "/"
+        End If
+        If Len(path) = 0 Then path = "/"
+
+        Dim colonPos As Long
+        colonPos = InStr(hostPart, ":")
+        If colonPos > 0 Then
+            host = Left$(hostPart, colonPos - 1)
+            On Error GoTo badPort
+            port = CLng(Mid$(hostPart, colonPos + 1))
+            On Error GoTo 0
+        Else
+            host = hostPart
+        End If
+        If Len(host) = 0 Then
+            errText = "url has empty host: '" & url & "'"
+            Exit Function
+        End If
+        If (port < 1) Or (port > 65535) Then
+            errText = "url has invalid port: '" & url & "'"
+            Exit Function
+        End If
+        ParseUrl = True
+        Exit Function
+    badPort:
+        errText = "url has invalid port: '" & url & "'"
+    End Function
+
+    ' ------------------------------------------------------- multistatus
+
+    ' Hand-rolled RFC4918 multistatus parser (case-insensitive, prefix-agnostic
+    ' for the common shapes "<D:x>", "<d:x>", "<x>"). Names/hrefs are taken from
+    ' the original text (case preserved); only tag matching is case-insensitive.
+    Private Sub ParseMultistatus(body As String, props As TbWebdavProps)
+        Dim entries() As String, nEntries As Long
+        CollectResponses body, entries, nEntries
+        If nEntries < 1 Then Exit Sub
+
+        Dim i As Long
+        For i = 0 To nEntries - 1
+            Dim e As String
+            e = entries(i)
+            Dim isDir As Boolean
+            isDir = TagCollectionPresent(e)
+            If i = 0 Then
+                props.Exists = True
+                props.IsDir = isDir
+                props.Href = TagValue(e, "href")
+                props.LastModified = TagValue(e, "getlastmodified")
+                Dim sLen As String
+                sLen = TagValue(e, "getcontentlength")
+                If Len(sLen) > 0 Then
+                    On Error Resume Next
+                    props.Size = CDbl(sLen)
+                    On Error GoTo 0
+                End If
+            Else
+                Dim nm As String, hr As String
+                nm = TagValue(e, "displayname")
+                hr = TagValue(e, "href")
+                If Len(nm) = 0 Then
+                    nm = NameFromHref(hr)
+                    If isDir And Len(nm) > 0 Then
+                        If Right$(nm, 1) = "/" Then nm = Left$(nm, Len(nm) - 1)
+                    End If
+                End If
+                props.AddChild nm, hr
+            End If
+        Next
+    End Sub
+
+    ' Splits a 207 body into the inner text of each <...:response>...</...:response>.
+    ' Discriminates opening vs closing tags by scanning back to the '<' that
+    ' starts the tag and checking for '/' - the naive "char before the name is
+    ':'" check cannot work, because in "</D:response>" that char is the ':'
+    ' of the namespace prefix (P4 first-run bug, caught by the gates).
+    Private Sub CollectResponses(body As String, ByRef entries() As String, ByRef nEntries As Long)
+        nEntries = 0
+        Dim p As Long, openStart As Long
+        openStart = -1
+        p = InStr(1, body, "response>", vbTextCompare)
+        Do While p > 0
+            Dim tagStart As Long
+            tagStart = StartOfTag(body, p)
+            Dim isClosing As Boolean
+            isClosing = False
+            If tagStart > 0 Then
+                isClosing = (Mid$(body, tagStart + 1, 1) = "/")
+            End If
+            If isClosing Then
+                If openStart > 0 Then
+                    ReDim Preserve entries(0 To nEntries)
+                    entries(nEntries) = Mid$(body, openStart, tagStart - openStart)
+                    nEntries = nEntries + 1
+                    openStart = -1
+                End If
+            Else
+                If openStart < 0 Then
+                    openStart = p + Len("response>")
+                End If
+            End If
+            p = InStr(p + 1, body, "response>", vbTextCompare)
+        Loop
+    End Sub
+
+    ' Index of the '<' that starts the tag whose name run contains position p
+    ' (0 when none). Between '<' and the name only '/' and prefix chars occur.
+    Private Function StartOfTag(body As String, ByVal p As Long) As Long
+        Dim k As Long
+        k = p - 1
+        Do While k > 0
+            If Mid$(body, k, 1) = "<" Then
+                StartOfTag = k
+                Exit Function
+            End If
+            k = k - 1
+        Loop
+        StartOfTag = 0
+    End Function
+
+    Private Function TagCollectionPresent(entry As String) As Boolean
+        Dim low As String
+        low = LCase$(entry)
+        If InStr(low, ":collection/>") > 0 Then TagCollectionPresent = True: Exit Function
+        If InStr(low, ":collection>") > 0 Then TagCollectionPresent = True: Exit Function
+        If InStr(low, "<collection/>") > 0 Then TagCollectionPresent = True: Exit Function
+    End Function
+
+    ' Value between an OPENING "<...:tag>" (or "<tag>") and its "</" - "" when
+    ' absent. Opening/closing discrimination via StartOfTag (see CollectResponses).
+    Private Function TagValue(entry As String, tag As String) As String
+        Dim p As Long
+        p = 1
+        Do
+            p = InStr(p, entry, tag, vbTextCompare)
+            If p <= 0 Then Exit Function
+            ' must be inside an opening tag: '<' before the name, no '/'
+            Dim ts As Long
+            ts = StartOfTag(entry, p)
+            If ts > 0 Then
+                If Mid$(entry, ts + 1, 1) <> "/" Then
+                    Dim gt As Long
+                    gt = InStr(p, entry, ">")
+                    If gt > 0 Then
+                        Dim vStart As Long
+                        vStart = gt + 1
+                        Dim closePos As Long
+                        closePos = InStr(vStart, entry, "</", vbBinaryCompare)
+                        If closePos > 0 Then
+                            TagValue = Mid$(entry, vStart, closePos - vStart)
+                        End If
+                        Exit Function
+                    End If
+                End If
+            End If
+            p = p + Len(tag)
+        Loop
+    End Function
+
+    Private Function NameFromHref(href As String) As String
+        Dim t As String
+        t = href
+        Do While (Len(t) > 1) And (Right$(t, 1) = "/")
+            t = Left$(t, Len(t) - 1)
+        Loop
+        Dim p As Long
+        p = InStrRev(t, "/")
+        If p > 0 Then NameFromHref = Mid$(t, p + 1) Else NameFromHref = t
+    End Function
+
+    ' ------------------------------------------------------------- helpers
+
+    Private Declare Sub SleepApi Lib "kernel32" Alias "Sleep" (ByVal dwMilliseconds As Long)
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

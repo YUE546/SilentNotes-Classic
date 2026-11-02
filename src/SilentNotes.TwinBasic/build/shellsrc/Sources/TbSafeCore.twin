@@ -1,0 +1,571 @@
+Option Explicit
+
+' TbSafeCore - pure-tB safe (security box) core, route B phase 3B.
+' Semantics ported 1:1 from the frozen Core (read-only reference, diff-tested):
+'   src\SilentNotes.AllPlatforms\Models\SafeModel.cs       (key block, EncryptKey/TryDecryptKey)
+'   src\SilentNotes.AllPlatforms\Services\SafeKeyService.cs (open/close/key cache)
+'   src\SilentNotes.AllPlatforms\Crypto\Cryptor.cs          (two overloads - THE key finding):
+'
+'   1) Safe key at rest  = Cryptor("SilentSafe").Encrypt(key32, PASSWORD,
+'      KeyDerivationCostType.High, "aes_gcm", "pbkdf2")
+'      -> PASSWORD path: PBKDF2-SHA1(utf8(pw), salt16, cost=25000) -> 32B key
+'         -> AES-256-GCM(nonce16) -> rev2 header
+'         "SilentSafe v=2$aes_gcm$<nonce_b64>$pbkdf2$<salt_b64>$25000$$" + cipher||tag16
+'      -> base64 -> <safe><key>. Wrong password = GCM auth failure = recognizable.
+'   2) Note content      = Cryptor("SilentNote").Encrypt(utf8(html), SAFEKEY,
+'      "aes_gcm", Nothing)
+'      -> RAW-KEY overload (VB MainForm.EncryptSafeNoteContentForSafe L2243 /
+'         ComGateway.EncryptNoteHtmlForSafe): the 32B safe key is used DIRECTLY
+'         as the AES-256-GCM key (CryptoUtils.TruncateKey, NO KDF), header has
+'         EMPTY kdf/salt/cost: "SilentNote v=2$aes_gcm$<nonce_b64>$$$$" + cipher||tag16
+'         -> base64 -> <html_content>. NOT a password, NOT re-derived.
+'
+' needsReEncryption = Pbkdf2.NeedsRehashForHighCost(cost) = (25000 > cost).
+'
+' Unsupported blocks (xchacha20/argon2id safes of old repos) are refused with
+' distinct errors, mirroring the VB shell's DescribeSafeKeyAlgorithms gate.
+'
+' tB traps respected: no UDT in class, no Public constants in class (TB5250),
+' byte arrays travel as Variant, RtlMoveMemory not needed, >= &H8000 literals
+' carry &.
+
+Class TbSafeCore
+
+    Private Const PkgSafe As String = "SilentSafe"   ' SafeModel.CryptorPackageName
+    Private Const PkgNote As String = "SilentNote"   ' NoteModel.CryptorPackageName
+    Private Const AlgAes As String = "aes_gcm"
+    Private Const AlgTwofish As String = "twofish_gcm"
+    Private Const KdfPbkdf2 As String = "pbkdf2"
+    Private Const CostHigh As String = "25000"       ' Pbkdf2.HighCostIterations
+    Private Const SafeKeyLen As Long = 32
+    Private Const TagLen As Long = 16
+
+    Private m_Crypto As TbCrypto          ' proven Chilkat chain (Pbkdf2/random/EncryptAs)
+    Private m_HP As TbHeaderPacker
+    Private m_B64 As TbBase64
+    Private m_Ck As TbChilkat             ' loader ref for per-operation EnterCtx (pit 23)
+
+    ' open-safe store (SafeKeyService._safeKeys equivalent; parallel arrays,
+    ' no UDT in class)
+    Private m_N As Long
+    Private m_Ids() As String
+    Private m_KeyHex() As String
+
+    Public Function Init(crypto As TbCrypto, ByRef errText As String) As Boolean
+        Set m_Crypto = crypto
+        Set m_HP = New TbHeaderPacker
+        Set m_B64 = New TbBase64
+        If crypto Is Nothing Then
+            errText = "TbSafeCore.Init: crypto is Nothing"
+            Exit Function
+        End If
+        Set m_Ck = crypto.ChilkatRef
+        m_N = 0
+        Init = True
+    End Function
+
+    ' ---------------------------------------------------------------- state
+
+    Public Function IsOpen(safeId As String) As Boolean
+        Dim i As Long
+        For i = 0 To m_N - 1
+            If m_Ids(i) = safeId Then
+                IsOpen = True
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' number of open safes
+    Public Property Get OpenCount() As Long
+        OpenCount = m_N
+    End Property
+
+    ' hex of the stored key (SafeKeyService.TryGetKey equivalent). "" = not open.
+    Public Function KeyHexOf(safeId As String) As String
+        Dim i As Long
+        For i = 0 To m_N - 1
+            If m_Ids(i) = safeId Then
+                KeyHexOf = m_KeyHex(i)
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' SafeKeyService.CloseSafe: wipe + remove. Returns 1 if it was open.
+    Public Function CloseSafe(safeId As String) As Long
+        Dim i As Long, j As Long, removed As Long
+        For i = 0 To m_N - 1
+            If m_Ids(i) = safeId Then
+                Dim b() As Byte
+                b = HexToBytes(m_KeyHex(i))
+                For j = 0 To UBound(b)
+                    b(j) = 0
+                Next
+                For j = i To m_N - 2
+                    m_Ids(j) = m_Ids(j + 1)
+                    m_KeyHex(j) = m_KeyHex(j + 1)
+                Next
+                m_N = m_N - 1
+                removed = 1
+                Exit For
+            End If
+        Next
+        CloseSafe = removed
+    End Function
+
+    Public Sub CloseAllSafes()
+        Do While m_N > 0
+            CloseSafe m_Ids(0)
+        Loop
+    End Sub
+
+    ' ---------------------------------------------------------------- open
+
+    ' SafeModel.TryDecryptKey + SafeKeyService.TryOpenSafe semantics.
+    ' Returns False + errText on wrong password ("wrong_password_or_corrupt"),
+    ' unsupported algorithm ("unsupported_algorithm:<alg>"), unsupported kdf,
+    ' bad key size. Wrong password NEVER opens the safe and never crashes.
+    Public Function OpenSafe(safeId As String, serializeableKeyB64 As String, _
+        password As String, ByRef needsReEncryption As Boolean, ByRef errText As String) As Boolean
+
+        On Error GoTo fail
+        needsReEncryption = False
+        errText = ""
+        If IsOpen(safeId) Then CloseSafe safeId   ' VB TryOpenSafes re-open semantics
+
+        Dim packed() As Byte
+        Dim v As Variant
+        v = m_B64.Decode(serializeableKeyB64)
+        If Not IsArray(v) Then
+            errText = "key block is not valid base64"
+            Exit Function
+        End If
+        packed = v
+
+        ' header pre-check (Cryptor.Decrypt routes on header.AlgorithmName)
+        Dim header As TbCryptoHeader, cipherFull() As Byte
+        If Not m_HP.Unpack(packed, PkgSafe, header, cipherFull, errText) Then
+            errText = "key block header: " & errText
+            Exit Function
+        End If
+        If header.AlgorithmName <> AlgAes And header.AlgorithmName <> AlgTwofish Then
+            errText = "unsupported_algorithm:" & AsciiMask(header.AlgorithmName)
+            Exit Function
+        End If
+        If header.KdfName <> KdfPbkdf2 Then
+            errText = "unsupported_kdf:" & AsciiMask(header.KdfName)
+            Exit Function
+        End If
+        If Len(header.Cost) = 0 Then
+            errText = "key block has empty cost"
+            Exit Function
+        End If
+
+        ' proven password-path decrypt (TbCrypto.DecryptAs: Pbkdf2-SHA1 ->
+        ' AES-GCM -> tag check; wrong pw = LastMethodSuccess=0)
+        Dim plainB64 As String
+        plainB64 = m_Crypto.DecryptAs(PkgSafe, serializeableKeyB64, password, errText)
+        If Left$(plainB64, 4) = "ERR:" Then
+            errText = "wrong_password_or_corrupt (" & plainB64 & ")"
+            Exit Function
+        End If
+
+        Dim kv As Variant
+        kv = m_B64.Decode(plainB64)
+        If Not IsArray(kv) Then
+            errText = "decrypted key is not valid base64"
+            Exit Function
+        End If
+        Dim k() As Byte
+        k = kv
+        If ArrLen(k) <> SafeKeyLen Then
+            errText = "decrypted key size " & ArrLen(k) & " <> " & SafeKeyLen
+            Exit Function
+        End If
+
+        needsReEncryption = NeedsRehashForHighCost(header.Cost)
+        StoreKey safeId, m_Crypto.BytesToHex(k)
+        OpenSafe = True
+        Exit Function
+fail:
+        errText = "OpenSafe err=" & Err.Number & " " & AsciiMask(Err.Description)
+    End Function
+
+    ' ---------------------------------------------------------------- create
+
+    ' VB TryCreateSafe semantics: random 32B key -> SafeModel.EncryptKey
+    ' (SilentSafe / High cost 25000 / aes_gcm / pbkdf2) -> verify by opening.
+    ' Returns serializeableKeyB64 (<safe><key> content) + the raw key hex.
+    Public Function CreateSafe(password As String, ByRef serializeableKeyB64 As String, _
+        ByRef keyHex As String, ByRef errText As String) As Boolean
+
+        On Error GoTo fail
+        serializeableKeyB64 = ""
+        keyHex = ""
+        If Len(password) < 5 Then
+            errText = "password_too_short"    ' Cryptor.ValidatePassword MinPasswordLength=5
+            Exit Function
+        End If
+
+        Dim key() As Byte
+        key = m_Crypto.RandomBytesN(SafeKeyLen)
+        keyHex = m_Crypto.BytesToHex(key)
+
+        Dim keyB64 As String
+        keyB64 = m_B64.Encode(key)
+
+        Dim packed As String
+        packed = m_Crypto.EncryptAs(PkgSafe, keyB64, password, CostHigh, errText)
+        If Left$(packed, 4) = "ERR:" Then
+            errText = "EncryptKey: " & packed
+            Exit Function
+        End If
+        serializeableKeyB64 = packed
+
+        ' verify like VB TryCreateSafe (open with the same password)
+        Dim nr As Boolean
+        If Not OpenSafe("__create_verify__", serializeableKeyB64, password, nr, errText) Then
+            errText = "create verify failed: " & errText
+            CloseSafe "__create_verify__"
+            Exit Function
+        End If
+        CreateSafe = True
+        Exit Function
+fail:
+        errText = "CreateSafe err=" & Err.Number & " " & AsciiMask(Err.Description)
+    End Function
+
+    ' ---------------------------------------------------------- note content
+
+    ' Cryptor("SilentNote").Encrypt(plain, safeKey, "aes_gcm", Nothing) -
+    ' RAW-KEY overload. keyHex = open safe key (64 hex chars). plainB64 =
+    ' base64 of the UTF-8 note content bytes. Returns packedB64 or "ERR:...".
+    Public Function EncryptNote(keyHex As String, plainB64 As String, ByRef errText As String) As String
+        On Error GoTo fail
+        errText = ""
+        If Len(keyHex) <> SafeKeyLen * 2 Then
+            EncryptNote = "ERR:key hex must be " & (SafeKeyLen * 2) & " chars"
+            Exit Function
+        End If
+
+        Dim plain() As Byte
+        If Len(plainB64) > 0 Then
+            Dim pv As Variant
+            pv = m_B64.Decode(plainB64)
+            If Not IsArray(pv) Then
+                EncryptNote = "ERR:plainB64 is not valid base64"
+                Exit Function
+            End If
+            plain = pv
+        End If
+
+        Dim nonce() As Byte
+        nonce = m_Crypto.RandomBytesN(16)
+
+        ' pit 23: the whole Chilkat section runs under the activation context
+        If Not m_Ck.EnterCtx() Then
+            EncryptNote = "ERR:EnterCtx failed le=" & CStr(m_Ck.LastActivateError)
+            Exit Function
+        End If
+        Dim crypt As Object
+        Set crypt = m_Crypto.Crypt
+        crypt.CryptAlgorithm = "aes"
+        crypt.CipherMode = "gcm"
+        crypt.KeyLength = 256
+        crypt.SetEncodedIV m_Crypto.BytesToHex(nonce), "hex"
+        crypt.SetEncodedKey keyHex, "hex"
+
+        Dim enc As Variant
+        If ArrLen(plain) > 0 Then
+            enc = crypt.EncryptBytes(plain)
+            If Not IsArray(enc) Then GoTo encFail
+            If crypt.LastMethodSuccess = 0 Then GoTo encFail
+        Else
+            ' empty message: probe tB zero-length arrays + Chilkat (the Core
+            ' Cryptor accepts an empty message; shell layer never sends one
+            ' without content, but keep semantics faithful and reportable)
+            Dim z() As Byte, zEnc As Variant
+            Dim zErr As Long, zDesc As String
+            On Error Resume Next
+            Err.Clear
+            ReDim z(0 To -1)
+            zErr = Err.Number
+            zDesc = Err.Description
+            If zErr = 0 Then
+                Err.Clear
+                zEnc = crypt.EncryptBytes(z)
+                zErr = Err.Number
+                zDesc = Err.Description
+                If zErr = 0 And IsArray(zEnc) Then
+                    If crypt.LastMethodSuccess = 0 Then zErr = -2: zDesc = "LMS=0"
+                End If
+            End If
+            On Error GoTo fail
+            If zErr <> 0 Or Not IsArray(zEnc) Then
+                EncryptNote = "ERR:empty plaintext rejected (err " & zErr & " " & AsciiMask(zDesc) & ")"
+                Exit Function
+            End If
+            enc = zEnc
+        End If
+
+        Dim tagHex As String
+        tagHex = crypt.GetEncodedAuthTag("hex")
+        Dim tag() As Byte
+        tag = HexToBytes(tagHex)
+        If ArrLen(tag) <> TagLen Then
+            EncryptNote = "ERR:auth tag " & ArrLen(tag) & " bytes"
+            Exit Function
+        End If
+
+        Dim full() As Byte
+        full = ConcatBytes(enc, tag)
+
+        Dim emptySalt() As Byte
+        Dim packed() As Byte
+        packed = m_HP.Pack(PkgNote, 2, AlgAes, nonce, "", emptySalt, "", "", full)
+
+        EncryptNote = m_B64.Encode(packed)
+        m_Ck.ExitCtx
+        Exit Function
+encFail:
+        m_Ck.ExitCtx
+        EncryptNote = "ERR:EncryptBytes failed; LastMethodSuccess=" & crypt.LastMethodSuccess
+        Exit Function
+fail:
+        m_Ck.ExitCtx
+        EncryptNote = "ERR:" & Err.Number & " " & AsciiMask(Err.Description)
+    End Function
+
+    ' Cryptor("SilentNote").Decrypt(packed, safeKey) - raw-key path.
+    ' Wrong key = GCM auth failure = False + errText (recognizable).
+    Public Function DecryptNote(keyHex As String, packedB64 As String, _
+        ByRef plainB64 As String, ByRef errText As String) As Boolean
+
+        On Error GoTo fail
+        plainB64 = ""
+        errText = ""
+        If Len(keyHex) <> SafeKeyLen * 2 Then
+            errText = "key hex must be " & (SafeKeyLen * 2) & " chars"
+            Exit Function
+        End If
+
+        Dim pv As Variant
+        pv = m_B64.Decode(packedB64)
+        If Not IsArray(pv) Then
+            errText = "packedB64 is not valid base64"
+            Exit Function
+        End If
+        Dim packed() As Byte
+        packed = pv
+
+        Dim header As TbCryptoHeader, cipherFull() As Byte
+        If Not m_HP.Unpack(packed, PkgNote, header, cipherFull, errText) Then
+            errText = "note header: " & errText
+            Exit Function
+        End If
+        If header.AlgorithmName <> AlgAes And header.AlgorithmName <> AlgTwofish Then
+            errText = "unsupported_algorithm:" & AsciiMask(header.AlgorithmName)
+            Exit Function
+        End If
+
+        Dim total As Long
+        total = ArrLen(cipherFull)
+        If total < TagLen Then
+            errText = "cipher too short (" & total & " bytes)"
+            Exit Function
+        End If
+
+        ' split BouncyCastle layout cipher||tag16
+        Dim clen As Long
+        clen = total - TagLen
+        Dim cipherOnly() As Byte, tag() As Byte
+        If clen > 0 Then
+            ReDim cipherOnly(0 To clen - 1)
+            Dim i As Long
+            For i = 0 To clen - 1
+                cipherOnly(i) = cipherFull(i)
+            Next
+        End If
+        ReDim tag(0 To TagLen - 1)
+        For i = 0 To TagLen - 1
+            tag(i) = cipherFull(clen + i)
+        Next
+
+        ' pit 23: the whole Chilkat section runs under the activation context
+        If Not m_Ck.EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(m_Ck.LastActivateError)
+            Exit Function
+        End If
+        Dim crypt As Object
+        Set crypt = m_Crypto.Crypt
+        crypt.CryptAlgorithm = "aes"
+        crypt.CipherMode = "gcm"
+        crypt.KeyLength = 256
+        crypt.SetEncodedIV m_Crypto.BytesToHex(header.Nonce), "hex"
+        crypt.SetEncodedKey keyHex, "hex"
+        crypt.SetEncodedAuthTag m_Crypto.BytesToHex(tag), "hex"
+
+        If clen = 0 Then
+            ' empty ciphertext = valid BC GCM of an empty message. Probe tB
+            ' zero-length arrays + Chilkat; report honestly either way.
+            Dim z() As Byte, zPl As Variant
+            Dim zErr As Long, zDesc As String
+            On Error Resume Next
+            Err.Clear
+            ReDim z(0 To -1)
+            zErr = Err.Number
+            zDesc = Err.Description
+            If zErr = 0 Then
+                Err.Clear
+                zPl = crypt.DecryptBytes(z)
+                zErr = Err.Number
+                zDesc = Err.Description
+                If zErr = 0 And IsArray(zPl) Then
+                    If crypt.LastMethodSuccess = 0 Then zErr = -2: zDesc = "LMS=0"
+                End If
+            End If
+            On Error GoTo fail
+            If zErr = 0 And IsArray(zPl) Then
+                Dim zb() As Byte
+                zb = zPl
+                plainB64 = m_B64.Encode(zb)
+                DecryptNote = True
+                m_Ck.ExitCtx
+                Exit Function
+            End If
+            errText = "empty ciphertext rejected (err " & zErr & " " & AsciiMask(zDesc) & ")"
+            m_Ck.ExitCtx
+            Exit Function
+        End If
+
+        Dim plain As Variant
+        plain = crypt.DecryptBytes(cipherOnly)
+        If Not IsArray(plain) Then GoTo decFail
+        If crypt.LastMethodSuccess = 0 Then GoTo decFail
+
+        Dim pb() As Byte
+        pb = plain
+        plainB64 = m_B64.Encode(pb)
+        DecryptNote = True
+        m_Ck.ExitCtx
+        Exit Function
+decFail:
+        m_Ck.ExitCtx
+        errText = "wrong_password_or_corrupt (DecryptBytes LastMethodSuccess=" & crypt.LastMethodSuccess & ")"
+        Exit Function
+fail:
+        m_Ck.ExitCtx
+        errText = "DecryptNote err=" & Err.Number & " " & AsciiMask(Err.Description)
+    End Function
+
+    ' ------------------------------------------------------------ meta probe
+
+    ' Header fields of a packed block WITHOUT touching crypto (for the real-
+    ' repo structure assertions). Returns "" and fills outs, or an error text.
+    Public Function Inspect(packedB64 As String, expectedPkg As String, _
+        ByRef alg As String, ByRef kdf As String, ByRef cost As String, _
+        ByRef nonceLen As Long, ByRef saltLen As Long, ByRef cipherLen As Long, _
+        ByRef errText As String) As Boolean
+
+        On Error GoTo fail
+        errText = ""
+        Dim pv As Variant
+        pv = m_B64.Decode(packedB64)
+        If Not IsArray(pv) Then
+            errText = "not valid base64"
+            Exit Function
+        End If
+        Dim packed() As Byte
+        packed = pv
+
+        Dim header As TbCryptoHeader, cipherFull() As Byte
+        If Not m_HP.Unpack(packed, expectedPkg, header, cipherFull, errText) Then
+            Exit Function
+        End If
+        alg = header.AlgorithmName
+        kdf = header.KdfName
+        cost = header.Cost
+        nonceLen = ArrLen(header.Nonce)
+        saltLen = ArrLen(header.Salt)
+        cipherLen = ArrLen(cipherFull)
+        Inspect = True
+        Exit Function
+fail:
+        errText = "Inspect err=" & Err.Number & " " & AsciiMask(Err.Description)
+    End Function
+
+    ' ------------------------------------------------------------------ misc
+
+    ' Pbkdf2.NeedsRehashForHighCost port: HighCostIterations(25000) > cost.
+    Public Function NeedsRehashForHighCost(cost As String) As Boolean
+        On Error GoTo bad
+        NeedsRehashForHighCost = (25000 > CLng(cost))
+        Exit Function
+bad:
+        NeedsRehashForHighCost = False
+    End Function
+
+    Private Sub StoreKey(safeId As String, keyHex As String)
+        If m_N = 0 Then
+            ReDim m_Ids(0 To 15)
+            ReDim m_KeyHex(0 To 15)
+        ElseIf m_N > UBound(m_Ids) Then
+            ReDim Preserve m_Ids(0 To m_N * 2)
+            ReDim Preserve m_KeyHex(0 To m_N * 2)
+        End If
+        m_Ids(m_N) = safeId
+        m_KeyHex(m_N) = keyHex
+        m_N = m_N + 1
+    End Sub
+
+    Public Function BytesToHex(b() As Byte) As String
+        BytesToHex = m_Crypto.BytesToHex(b)
+    End Function
+
+    Public Function HexToBytes(h As String) As Byte()
+        HexToBytes = m_Crypto.HexToBytes(h)
+    End Function
+
+    Private Function ConcatBytes(a As Variant, b() As Byte) As Byte()
+        Dim la As Long, lb As Long
+        la = UBound(a) + 1
+        lb = ArrLen(b)
+        Dim out() As Byte
+        ReDim out(0 To la + lb - 1)
+        Dim i As Long
+        For i = 0 To la - 1
+            out(i) = a(i)
+        Next
+        For i = 0 To lb - 1
+            out(la + i) = b(i)
+        Next
+        ConcatBytes = out
+    End Function
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+    ' ASCII-only mask for error texts that ride into reports/logs
+    Public Function AsciiMask(ByRef s As String) As String
+        Dim out As String, i As Long, n As Long, c As Long
+        n = Len(s)
+        out = Space$(n)
+        For i = 1 To n
+            c = AscW(Mid$(s, i, 1))
+            If c < 0 Then c = c + 65536
+            If c >= 32 And c <= 126 Then
+                Mid$(out, i, 1) = ChrW$(c)
+            Else
+                Mid$(out, i, 1) = "?"
+            End If
+        Next
+        AsciiMask = out
+    End Function
+
+End Class

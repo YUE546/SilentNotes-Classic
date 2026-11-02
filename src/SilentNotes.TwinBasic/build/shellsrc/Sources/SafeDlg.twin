@@ -1,0 +1,363 @@
+Option Explicit
+
+[Description("Safe dialog: safe list + password, unlock/create/lock-all, modal, owner-centered")]
+[FormDesignerId("7E4C1A02-93B5-4F6D-8A21-C0D51B9F3A31")]
+[PredeclaredId]
+Class SafeDlg
+
+    ' set by MainForm before Show 1. The dialog drives the repository
+    ' through the SAME TbRepo wrappers the main window uses (each success
+    ' path saves + reloads inside), so a wrong password keeps the dialog
+    ' open with the error line - VB ShowSafePasswordDialog semantics.
+    Public Action As String        ' "" | "unlocked" | "created" | "locked"
+    Public CreatedSafeId As String
+    Public LastErr As String
+    ' gate automation: "unlock:<pw>" / "create:<pw>" / "lock" / "close",
+    ' consumed on every Activate (NO m_once latch - this dialog opens
+    ' more than once per run, P5-A pit 18)
+    Public GateAnswer As String
+
+    Private m_Repo As TbRepo
+    Private m_ownerHwnd As Long
+    Private m_ids() As String      ' safe guids parallel to lstSafes rows
+    Private m_rowN As Long
+    Private m_focusDone As Boolean
+
+    ' PHYSICAL-pixel sizing (tbform Width/Height are pixels; twips-style
+    ' values blow the window up). AdjustWindowRectEx + SetWindowPos pin
+    ' the true size and center on the owner - LinkDlg/ConfirmDlg recipe.
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 460      ' client, physical px
+    Private Const DlgH As Long = 336
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    ' m_ownerHwnd/m_Repo are stored BEFORE the first control access - that
+    ' access fires Form_Load, which reads them
+    Public Sub Preload(repo As TbRepo, ByVal ownerHwnd As Long)
+        Action = ""
+        CreatedSafeId = ""
+        LastErr = ""
+        GateAnswer = ""
+        Set m_Repo = repo
+        m_ownerHwnd = ownerHwnd
+        m_focusDone = False
+        RefreshList                ' control access triggers Form_Load
+    End Sub
+
+    Private Sub Form_Load()
+        Me.Caption = SSafeTitle()
+        lblList.Caption = SSafeListLbl()
+        lblPw.Caption = SPwLbl()
+        lblPw2.Caption = SPw2Lbl()
+        cmdUnlock.Caption = SUnlockBtn()
+        cmdCreate.Caption = SCreateBtn()
+        cmdLockAll.Caption = SLockAllBtn()
+        cmdClose.Caption = SCloseBtn()
+        lblStatus.Caption = ""
+        SnapCenter
+        ' physical-pixel layout (tbform geometry is DPI-scaled by the runtime)
+        lblList.Move 12, 14, 200, 20
+        lstSafes.Move 12, 38, 436, 110
+        lblPw.Move 12, 164, 92, 20
+        txtPw.Move 108, 160, 220, 28
+        lblPw2.Move 12, 204, 92, 20
+        txtPw2.Move 108, 200, 220, 28
+        lblStatus.Move 12, 244, 436, 40
+        cmdUnlock.Move 12, 296, 100, 30
+        cmdCreate.Move 120, 296, 100, 30
+        cmdLockAll.Move 236, 296, 100, 30
+        cmdClose.Move 348, 296, 100, 30
+        On Error Resume Next
+        txtPw.PasswordChar = "*"            ' tB: string property (Asc bug -> "4")
+        txtPw2.PasswordChar = "*"
+        RefreshList
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    ' fills lstSafes from the gateway's ListSafes payload (TbRepo.SafeList):
+    ' row = id|created|modified|maintained|open|algo -> "12345678... [state] algo"
+    Public Sub RefreshList()
+        On Error Resume Next
+        lstSafes.Clear
+        m_rowN = 0
+        ReDim m_ids(0 To 0)
+        lblStatus.Caption = ""
+        If m_Repo Is Nothing Then Exit Sub
+        Dim s As String
+        s = m_Repo.SafeList()
+        If Left$(s, 4) = "ERR:" Then
+            lblStatus.Caption = s
+            Exit Sub
+        End If
+        If Len(s) = 0 Then Exit Sub
+        Dim rows() As String
+        rows = Split(s, ChrW$(31))
+        Dim i As Long
+        Dim f() As String
+        ReDim m_ids(0 To UBound(rows))
+        For i = 0 To UBound(rows)
+            f = Split(rows(i), "|")
+            If UBound(f) >= 5 Then
+                m_ids(m_rowN) = f(0)
+                lstSafes.AddItem Left$(f(0), 8) & "... " & SOpenState(f(4)) & "  " & f(5)
+                m_rowN = m_rowN + 1
+            End If
+        Next
+    End Sub
+
+    ' "[unlocked]" / "[locked]" (ChrW$ assembled, ASCII-only source)
+    Private Function SOpenState(ByVal flag As String) As String
+        If StrComp(flag, "1", vbBinaryCompare) = 0 Then
+            SOpenState = "[" & ChrW$(&H5DF2&) & ChrW$(&H89E3&) & ChrW$(&H9501&) & "]"
+        Else
+            SOpenState = "[" & ChrW$(&H5DF2&) & ChrW$(&H9501&) & ChrW$(&H5B9A&) & "]"
+        End If
+    End Function
+
+    ' NO m_once latch (ConfirmDlg lesson): the dialog opens several times
+    ' per run; every Activate with a pending answer consumes it (idempotent)
+    Private Sub Form_Activate()
+        If Len(GateAnswer) > 0 Then
+            Dim a As String
+            a = GateAnswer
+            GateAnswer = ""
+            If Left$(a, 7) = "unlock:" Then
+                On Error Resume Next
+                txtPw.Text = Mid$(a, 8)
+                txtPw2.Text = ""
+                cmdUnlock_Click
+            ElseIf Left$(a, 7) = "create:" Then
+                On Error Resume Next
+                txtPw.Text = Mid$(a, 8)
+                txtPw2.Text = Mid$(a, 8)
+                cmdCreate_Click
+            ElseIf StrComp(a, "lock", vbTextCompare) = 0 Then
+                cmdLockAll_Click
+            Else
+                cmdClose_Click
+            End If
+        ElseIf Not m_focusDone Then
+            m_focusDone = True
+            On Error Resume Next
+            txtPw.SetFocus
+        End If
+    End Sub
+
+    ' gate path: consume a pending GateAnswer through the real button
+    ' handlers WITHOUT Show - the Activate-driven auto-answer loses to any
+    ' foreground focus fight (ConfirmDlg lesson, 10-30)
+    Public Sub AutoAnswerNow()
+        If Len(GateAnswer) > 0 Then
+            Dim a As String
+            a = GateAnswer
+            GateAnswer = ""
+            If Left$(a, 7) = "unlock:" Then
+                On Error Resume Next
+                txtPw.Text = Mid$(a, 8)
+                txtPw2.Text = ""
+                cmdUnlock_Click
+            ElseIf Left$(a, 7) = "create:" Then
+                On Error Resume Next
+                txtPw.Text = Mid$(a, 8)
+                txtPw2.Text = Mid$(a, 8)
+                cmdCreate_Click
+            ElseIf StrComp(a, "lock", vbTextCompare) = 0 Then
+                cmdLockAll_Click
+            Else
+                cmdClose_Click
+            End If
+        End If
+    End Sub
+
+    ' Default/Cancel button properties are dropped by the minimal tbform
+    ' blocks - Enter/Esc route explicitly (KeyPreview=true). Enter picks
+    ' the flow by the confirm field: filled = create (cmdCreate_Click
+    ' re-validates), empty = unlock
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 13 Then
+            KeyCode = 0
+            If Len(txtPw2.Text) > 0 Then
+                cmdCreate_Click
+            Else
+                cmdUnlock_Click
+            End If
+        ElseIf KeyCode = 27 Then
+            KeyCode = 0
+            cmdClose_Click
+        End If
+    End Sub
+
+    ' unlock: one password against EVERY safe (VB TryOpenSafes); on failure
+    ' the dialog STAYS OPEN with the error line
+    Private Sub cmdUnlock_Click()
+        On Error Resume Next
+        Dim pw As String
+        pw = txtPw.Text
+        If Len(pw) = 0 Then
+            lblStatus.Caption = SEnterPw()
+            Exit Sub
+        End If
+        LastErr = ""
+        Dim r As String
+        r = m_Repo.SafeOpenAll(pw)
+        If Left$(r, 3) = "OK:" Then
+            Action = "unlocked"
+            RefreshList
+            Me.Hide
+        Else
+            LastErr = r
+            lblStatus.Caption = SWrongPw()
+        End If
+    End Sub
+
+    ' create: password >= 5 chars + confirmation (VB ShowSafePasswordDialog
+    ' create branch); the gateway verifies by actually opening the safe
+    Private Sub cmdCreate_Click()
+        On Error Resume Next
+        Dim pw As String
+        pw = txtPw.Text
+        If Len(pw) < 5 Then
+            lblStatus.Caption = SShortPw()
+            Exit Sub
+        End If
+        If StrComp(pw, txtPw2.Text, vbBinaryCompare) <> 0 Then
+            lblStatus.Caption = SMismatch()
+            Exit Sub
+        End If
+        LastErr = ""
+        Dim r As String
+        r = m_Repo.SafeCreate(pw)
+        If Left$(r, 3) = "OK:" Then
+            Action = "created"
+            CreatedSafeId = Mid$(r, 4)
+            RefreshList
+            Me.Hide
+        Else
+            LastErr = r
+            lblStatus.Caption = SCreateFail() & " " & r
+        End If
+    End Sub
+
+    Private Sub cmdLockAll_Click()
+        On Error Resume Next
+        LastErr = ""
+        Dim r As String
+        r = m_Repo.SafeCloseAll()
+        If Left$(r, 3) = "OK:" Then
+            Action = "locked"
+            RefreshList
+            Me.Hide
+        Else
+            LastErr = r
+            lblStatus.Caption = SLockFail() & " " & r
+        End If
+    End Sub
+
+    Private Sub cmdClose_Click()
+        On Error Resume Next
+        Action = ""
+        Me.Hide
+    End Sub
+
+    ' ---------------------------------------------------- captions (ChrW$)
+
+    Private Function SSafeTitle() As String    ' an-quan-xiang (safe)
+        SSafeTitle = ChrW$(&H5B89&) & ChrW$(&H5168&) & ChrW$(&H7BB1&)
+    End Function
+
+    Private Function SSafeListLbl() As String  ' bao-xian-xiang (vault list)
+        SSafeListLbl = ChrW$(&H4FDD&) & ChrW$(&H9669&) & ChrW$(&H7BB1&)
+    End Function
+
+    Private Function SPwLbl() As String        ' mi-ma: (password:)
+        SPwLbl = ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SPw2Lbl() As String       ' que-ren-mi-ma: (confirm password:)
+        SPw2Lbl = ChrW$(&H786E&) & ChrW$(&H8BA4&) & ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SUnlockBtn() As String    ' jie-suo (unlock)
+        SUnlockBtn = ChrW$(&H89E3&) & ChrW$(&H9501&)
+    End Function
+
+    Private Function SCreateBtn() As String    ' xin-jian (create)
+        SCreateBtn = ChrW$(&H65B0&) & ChrW$(&H5EFA&)
+    End Function
+
+    Private Function SLockAllBtn() As String   ' suo-ding-quan-bu (lock all)
+        SLockAllBtn = ChrW$(&H9501&) & ChrW$(&H5B9A&) & ChrW$(&H5168&) & ChrW$(&H90E8&)
+    End Function
+
+    Private Function SCloseBtn() As String     ' guan-bi (close)
+        SCloseBtn = ChrW$(&H5173&) & ChrW$(&H95ED&)
+    End Function
+
+    Private Function SEnterPw() As String      ' qing-shu-ru-mi-ma. (enter a password.)
+        SEnterPw = ChrW$(&H8BF7&) & ChrW$(&H8F93&) & ChrW$(&H5165&) & ChrW$(&H5BC6&) & _
+            ChrW$(&H7801&) & ChrW$(&H3002&)
+    End Function
+
+    Private Function SWrongPw() As String      ' wrong password message (VB text)
+        SWrongPw = ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&H9519&) & ChrW$(&H8BEF&) & _
+            ChrW$(&HFF0C&) & ChrW$(&H65E0&) & ChrW$(&H6CD5&) & ChrW$(&H6253&) & ChrW$(&H5F00&) & _
+            ChrW$(&H5B89&) & ChrW$(&H5168&) & ChrW$(&H7BB1&) & ChrW$(&H3002&)
+    End Function
+
+    Private Function SShortPw() As String      ' min 5 chars message (VB text)
+        SShortPw = ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&H81F3&) & ChrW$(&H5C11&) & _
+            ChrW$(&H9700&) & ChrW$(&H8981&) & " 5 " & ChrW$(&H4E2A&) & ChrW$(&H5B57&) & _
+            ChrW$(&H7B26&) & ChrW$(&H3002&)
+    End Function
+
+    Private Function SMismatch() As String     ' confirm mismatch message (VB text)
+        SMismatch = ChrW$(&H4E24&) & ChrW$(&H6B21&) & ChrW$(&H8F93&) & ChrW$(&H5165&) & _
+            ChrW$(&H7684&) & ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&H4E0D&) & ChrW$(&H4E00&) & _
+            ChrW$(&H81F4&) & ChrW$(&H3002&)
+    End Function
+
+    Private Function SCreateFail() As String   ' create failed prefix
+        SCreateFail = ChrW$(&H521B&) & ChrW$(&H5EFA&) & ChrW$(&H5B89&) & ChrW$(&H5168&) & _
+            ChrW$(&H7BB1&) & ChrW$(&H5931&) & ChrW$(&H8D25&)
+    End Function
+
+    Private Function SLockFail() As String     ' lock failed prefix
+        SLockFail = ChrW$(&H9501&) & ChrW$(&H5B9A&) & ChrW$(&H5931&) & ChrW$(&H8D25&)
+    End Function
+End Class

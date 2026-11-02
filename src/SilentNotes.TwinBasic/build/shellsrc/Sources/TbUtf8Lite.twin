@@ -1,0 +1,183 @@
+Option Explicit
+
+' TbUtf8Lite - UTF-8 <-> VB String codec with CORRECT astral-plane handling
+' (4-byte sequences <-> UTF-16 surrogate pairs). Unlike the p3 TbUtf8 codec
+' (CESU-8 style for surrogates, fine for headers/ini but not byte-exact on
+' emoji), this one round-trips real UTF-8 byte-for-byte, which the p3 repo
+' file requires (it contains 7 four-byte emoji sequences).
+'
+' All bulk output uses Space$ preallocation + Mid$ statement writes; there is
+' no per-character string concatenation anywhere (O(n^2) trap).
+' Invalid sequences are skipped and counted (never crash); the probe report
+' surfaces the count so silent data loss cannot hide.
+
+Module TbUtf8Lite
+
+Public Function Decode(b() As Byte, ByVal offset As Long, ByVal count As Long, ByRef badBytes As Long) As String
+    Dim out As String
+    Dim i As Long, last As Long, w As Long
+    Dim c As Long, cp As Long
+    badBytes = 0
+    If count <= 0 Then
+        Decode = ""
+        Exit Function
+    End If
+    out = Space$(count)          ' upper bound: every byte ASCII
+    last = offset + count - 1
+    i = offset
+    w = 0
+    Do While i <= last
+        c = b(i)
+        If c < &H80 Then
+            w = w + 1
+            Mid$(out, w, 1) = ChrW$(c)
+            i = i + 1
+        ElseIf (c And &HE0) = &HC0 Then
+            If i + 1 <= last Then
+                w = w + 1
+                Mid$(out, w, 1) = ChrW$(((c And &H1F&) * 64&) Or (b(i + 1) And &H3F&))
+            Else
+                badBytes = badBytes + 1
+            End If
+            i = i + 2
+        ElseIf (c And &HF0) = &HE0 Then
+            If i + 2 <= last Then
+                w = w + 1
+                Mid$(out, w, 1) = ChrW$(((c And &HF&) * 4096&) Or ((b(i + 1) And &H3F&) * 64&) Or (b(i + 2) And &H3F&))
+            Else
+                badBytes = badBytes + 1
+            End If
+            i = i + 3
+        ElseIf (c And &HF8) = &HF0 Then
+            If i + 3 <= last Then
+                cp = ((c And 7&) * 262144) Or ((b(i + 1) And &H3F&) * 4096&) _
+                     Or ((b(i + 2) And &H3F&) * 64&) Or (b(i + 3) And &H3F&)
+                cp = cp - 65536
+                w = w + 1
+                Mid$(out, w, 1) = ChrW$(&HD800& Or (cp \ 1024&))
+                w = w + 1
+                Mid$(out, w, 1) = ChrW$(&HDC00& Or (cp And 1023&))
+            Else
+                badBytes = badBytes + 1
+            End If
+            i = i + 4
+        Else
+            badBytes = badBytes + 1
+            i = i + 1
+        End If
+    Loop
+    Decode = Left$(out, w)
+End Function
+
+Public Function Encode(ByRef s As String) As Byte()
+    Dim n As Long, i As Long, w As Long
+    Dim code As Long, lo As Long, cp As Long
+    Dim buf() As Byte
+    n = Len(s)
+    If n = 0 Then
+        ReDim buf(0 To 0)
+        Encode = buf
+        Exit Function
+    End If
+    ReDim buf(0 To n * 4 - 1)    ' worst case: every char astral
+    i = 1
+    w = 0
+    Do While i <= n
+        code = AscW(Mid$(s, i, 1))
+        If code < 0 Then code = code + 65536
+        If code < &H80 Then
+            buf(w) = CByte(code)
+            w = w + 1
+            i = i + 1
+        ElseIf code < &H800 Then
+            buf(w) = CByte(&HC0 Or (code \ 64&))
+            w = w + 1
+            buf(w) = CByte(&H80 Or (code And 63&))
+            w = w + 1
+            i = i + 1
+        ElseIf code >= &HD800& And code <= &HDBFF& Then
+            ' high surrogate: must pair with the next char
+            If i < n Then
+                lo = AscW(Mid$(s, i + 1, 1))
+                If lo < 0 Then lo = lo + 65536
+                If lo >= &HDC00& And lo <= &HDFFF& Then
+                    cp = (code - &HD800&) * 1024& + (lo - &HDC00&) + 65536
+                    buf(w) = CByte(&HF0 Or (cp \ 262144))
+                    w = w + 1
+                    buf(w) = CByte(&H80 Or ((cp \ 4096&) And 63&))
+                    w = w + 1
+                    buf(w) = CByte(&H80 Or ((cp \ 64&) And 63&))
+                    w = w + 1
+                    buf(w) = CByte(&H80 Or (cp And 63&))
+                    w = w + 1
+                    i = i + 2
+                Else
+                    ' lone high surrogate: 3-byte fallback (invalid UTF-8; the
+                    ' repo format never produces this - would surface as diff)
+                    w = Write3Byte(buf, w, code)
+                    i = i + 1
+                End If
+            Else
+                i = i + 1
+            End If
+        ElseIf code >= &HDC00& And code <= &HDFFF& Then
+            ' lone low surrogate: 3-byte fallback
+            w = Write3Byte(buf, w, code)
+            i = i + 1
+        Else
+            w = Write3Byte(buf, w, code)
+            i = i + 1
+        End If
+    Loop
+    If w = 0 Then
+        ReDim buf(0 To 0)
+    Else
+        ReDim Preserve buf(0 To w - 1)
+    End If
+    Encode = buf
+End Function
+
+Private Function Write3Byte(buf() As Byte, ByVal w As Long, ByVal code As Long) As Long
+    buf(w) = CByte(&HE0 Or (code \ 4096&))
+    buf(w + 1) = CByte(&H80 Or ((code \ 64&) And 63&))
+    buf(w + 2) = CByte(&H80 Or (code And 63&))
+    Write3Byte = w + 3
+End Function
+
+' Hex dump of a byte window, ASCII-safe (non-printables shown as '.'),
+' 16 bytes per line: "00001234: hh hh ... |ascii|"
+Public Function HexWindow(b() As Byte, ByVal startIdx As Long, ByVal count As Long, ByVal totalLen As Long) As String
+    Dim res As String
+    Dim i As Long, j As Long, v As Long, last As Long
+    Dim ln As String, a As String
+    If totalLen <= 0 Then
+        HexWindow = "(empty array)"
+        Exit Function
+    End If
+    If startIdx < 0 Then startIdx = 0
+    last = startIdx + count - 1
+    If last > totalLen - 1 Then last = totalLen - 1
+    i = startIdx
+    Do While i <= last
+        ln = Right$("00000000" & Hex(i), 8) & ": "
+        a = ""
+        For j = 0 To 15
+            If i + j <= last Then
+                v = b(i + j)
+                ln = ln & Right$("0" & Hex(v), 2) & " "
+                If v >= 32 And v <= 126 Then
+                    a = a & Chr$(v)
+                Else
+                    a = a & "."
+                End If
+            Else
+                ln = ln & "   "
+            End If
+        Next
+        res = res & ln & " |" & a & "|" & vbCrLf
+        i = i + 16
+    Loop
+    HexWindow = res
+End Function
+
+End Module

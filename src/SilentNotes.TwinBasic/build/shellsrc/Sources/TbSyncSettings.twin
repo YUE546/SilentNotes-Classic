@@ -1,0 +1,189 @@
+Option Explicit
+
+' TbSyncSettings - WebDAV + transfer-code settings of the tB shell, stored in
+' its own ini (never the original client's file). Same key layout as the
+' original settings ([Synchronization] ServerUrl/Username/Password/TransferCode)
+' so a first-run ImportFromOriginal can copy the values verbatim: the DPAPI
+' blobs are user-bound, not app-bound, and decrypt unchanged.
+
+Class TbSyncSettings
+
+    Private m_Ini As TbIni
+    Private m_Dpapi As TbDpapi
+
+    Private m_serverUrl As String
+    Private m_userBlob As String       ' stored form (dpapi blob or plain)
+    Private m_passBlob As String
+    Private m_userPlain As String      ' cache of the decoded value (or new input)
+    Private m_passPlain As String
+    Private m_transferCode As String
+
+    Public Property Get ServerUrl() As String
+        ServerUrl = m_serverUrl
+    End Property
+
+    Public Property Let ServerUrl(ByVal v As String)
+        m_serverUrl = Trim$(v)
+    End Property
+
+    Public Property Get Username() As String
+        If Len(m_userPlain) > 0 Then
+            Username = m_userPlain
+        ElseIf Left$(m_userBlob, 4) = "AQAA" Then
+            Dim p As String
+            If m_Dpapi.Unprotect(m_userBlob, p) Then Username = p
+        Else
+            Username = m_userBlob
+        End If
+    End Property
+
+    Public Property Let Username(ByVal v As String)
+        m_userPlain = v
+        m_userBlob = ""                ' re-protected on Save
+    End Property
+
+    Public Property Get Password() As String
+        If Len(m_passPlain) > 0 Then
+            Password = m_passPlain
+        ElseIf Left$(m_passBlob, 4) = "AQAA" Then
+            Dim p As String
+            If m_Dpapi.Unprotect(m_passBlob, p) Then Password = p
+        Else
+            Password = m_passBlob
+        End If
+    End Property
+
+    Public Property Let Password(ByVal v As String)
+        m_passPlain = v
+        m_passBlob = ""
+    End Property
+
+    Public Property Get TransferCode() As String
+        TransferCode = m_transferCode
+    End Property
+
+    Public Property Let TransferCode(ByVal v As String)
+        m_transferCode = Trim$(v)
+    End Property
+
+    ' remote file name (dev build convention, same as the reference clients)
+    Public Property Get RepoFileName() As String
+        ' RELEASE cloud convention of the original clients (NoteRepositoryModel.
+        ' RepositoryFileName); the real cloud holds this name, syncing under the
+        ' debug _dev name would fork the remote data
+        RepoFileName = "silentnotes_repository.silentnotes"
+    End Property
+
+    ' full remote url of the repository file (CombineUrl: trim '/' + '/' + name)
+    Public Function RepoFileUrl() As String
+        RepoFileUrl = TrimUrlSlash(m_serverUrl) & "/" & RepoFileName()
+    End Function
+
+    Public Function IsConfigured() As Boolean
+        IsConfigured = (Len(m_serverUrl) > 0) And (Len(Username) > 0) And (Len(Password) > 0)
+    End Function
+
+    ' lengths + dpapi stage info for the synccheck diagnostics (no plaintext)
+    Public Function DiagCredInfo() As String
+        Dim s As String
+        s = "blobU=" & Len(m_userBlob) & " blobP=" & Len(m_passBlob)
+        Dim p As String
+        If Len(m_userBlob) > 0 Then
+            If m_Dpapi.Unprotect(m_userBlob, p) Then
+                s = s & " decU=" & Len(p)
+            Else
+                s = s & " decU=FAIL[" & m_Dpapi.LastStage & "]"
+            End If
+        End If
+        If Len(m_passBlob) > 0 Then
+            If m_Dpapi.Unprotect(m_passBlob, p) Then
+                s = s & " decP=" & Len(p)
+            Else
+                s = s & " decP=FAIL[" & m_Dpapi.LastStage & "]"
+            End If
+        End If
+        DiagCredInfo = s
+    End Function
+
+    ' ------------------------------------------------------------------ io
+
+    Public Function Load(ByVal path As String) As Boolean
+        On Error GoTo fail
+        Set m_Ini = New TbIni
+        If Not m_Ini.Load(path) Then Exit Function
+        m_serverUrl = m_Ini.GetValue("Synchronization", "ServerUrl", "")
+        m_userBlob = m_Ini.GetValue("Synchronization", "Username", "")
+        m_userPlain = ""
+        m_passBlob = m_Ini.GetValue("Synchronization", "Password", "")
+        m_passPlain = ""
+        m_transferCode = m_Ini.GetValue("Synchronization", "TransferCode", "")
+        Load = True
+        Exit Function
+    fail:
+    End Function
+
+    Public Function Save(ByVal path As String) As Boolean
+        On Error GoTo fail
+        If m_Ini Is Nothing Then Set m_Ini = New TbIni
+        If Not m_Ini.Load(path) Then
+            ' header-only skeleton so TbIni.Load never sees a 0-byte file
+            Dim f As Integer
+            f = FreeFile
+            Open path For Output As #f
+            Print #f, "; snTbSyncSettings"
+            Close #f
+            If Not m_Ini.Load(path) Then Exit Function
+        End If
+        If Len(m_userPlain) > 0 Then
+            m_userBlob = m_Dpapi.Protect(m_userPlain)
+            m_userPlain = ""
+        End If
+        If Len(m_passPlain) > 0 Then
+            m_passBlob = m_Dpapi.Protect(m_passPlain)
+            m_passPlain = ""
+        End If
+        m_Ini.SetValue "Synchronization", "ServerUrl", m_serverUrl
+        m_Ini.SetValue "Synchronization", "Username", m_userBlob
+        m_Ini.SetValue "Synchronization", "Password", m_passBlob
+        m_Ini.SetValue "Synchronization", "TransferCode", m_transferCode
+        Save = m_Ini.Save(path)
+        Exit Function
+    fail:
+    End Function
+
+    ' one-shot copy of the original client's [Synchronization] values (read
+    ' only - the original file is never written). Returns True when the
+    ' section existed and at least the url was found.
+    Public Function ImportFromOriginal(ByVal originalIniPath As String) As Boolean
+        On Error GoTo fail
+        Dim ini As TbIni
+        Set ini = New TbIni
+        If Not ini.Load(originalIniPath) Then Exit Function
+        Dim u As String
+        u = ini.GetValue("Synchronization", "ServerUrl", "")
+        If Len(u) = 0 Then Exit Function
+        m_serverUrl = u
+        m_userBlob = ini.GetValue("Synchronization", "Username", "")
+        m_userPlain = ""
+        m_passBlob = ini.GetValue("Synchronization", "Password", "")
+        m_passPlain = ""
+        m_transferCode = ini.GetValue("Synchronization", "TransferCode", "")
+        ImportFromOriginal = True
+        Exit Function
+    fail:
+    End Function
+
+    Private Function TrimUrlSlash(ByVal s As String) As String
+        Dim r As String
+        r = Trim$(s)
+        Do While Len(r) > 0 And Right$(r, 1) = "/"
+            r = Left$(r, Len(r) - 1)
+        Loop
+        TrimUrlSlash = r
+    End Function
+
+    Private Sub Class_Initialize()
+        Set m_Dpapi = New TbDpapi
+    End Sub
+
+End Class

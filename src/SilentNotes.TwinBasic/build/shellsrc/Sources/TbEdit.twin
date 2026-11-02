@@ -1,0 +1,558 @@
+Option Explicit
+
+' TbEdit - MSHTML editor controller (late-bound DOM), P3.
+'
+' Hosting recipe proven in p0\wbsrc: SHDocVw WebBrowser ActiveX hosted by the
+' designer (.tbform static child + "Microsoft Internet Controls" typelib).
+' Editing semantics follow the VB rewrite line
+' (src\SilentNotes.WindowsVb\Controls\HtmlEditorControl.vb + MsHtmlLateBound.vb):
+'   - designMode On + execCommand / queryCommandState
+'   - editor CSS via a <style id="sn-editor-style"> element rebuilt through
+'     styleSheet.cssText (the only reliable way MSHTML accepts a new sheet)
+'   - IE8-era DOM only: document.selection.createRange, elementFromPoint,
+'     currentStyle, parentWindow - no window.getSelection/addEventListener.
+' All DOM access is late-bound through Object (MSHTML nulls marshal back as
+' DBNull through COM - every read goes through On Error guards here).
+
+Class TbEdit
+
+    Private m_wb As Object      ' SHDocVw.WebBrowser (designer control)
+    Private m_doc As Object     ' IHTMLDocument2, late-bound
+    Private m_ready As Boolean
+    Private m_docReady As Boolean
+    Private m_dark As Boolean
+    Private m_lastErr As String
+    Private m_cln As TbClean
+
+    Private Declare Function FindWindowExW Lib "user32" (ByVal hWndParent As Long, ByVal hWndChildAfter As Long, ByVal cls As Long, ByVal title As Long) As Long
+    Private Declare Function GetClassNameE Lib "user32" Alias "GetClassNameW" (ByVal hWnd As Long, ByVal buf As Long, ByVal nMax As Long) As Long
+    Private Declare Function GetTickCountE Lib "kernel32" Alias "GetTickCount" () As Long
+
+    Public Property Get Ready() As Boolean
+        Ready = m_ready
+    End Property
+
+    ' class-name walk trail of the last FindIEServerHwnd (diagnostics)
+    Public Property Get WalkLog() As String
+        WalkLog = m_walkLog
+    End Property
+
+    Public Property Let WalkLog(ByVal s As String)
+        m_walkLog = s
+    End Property
+
+    Private m_walkLog As String
+
+    Public Property Get LastErr() As String
+        LastErr = m_lastErr
+    End Property
+
+    ' designMode readback ("On" expected) - asserted by the Editor.host gate
+    Public Property Get DocMode() As String
+        On Error GoTo fail
+        DocMode = CStr(m_doc.designMode)
+        Exit Property
+fail:
+        DocMode = ""
+    End Property
+
+    ' Trident doc mode number as text ("8" under FEATURE_BROWSER_EMULATION
+    ' 8888; "" when the property is absent - pre-IE8 hosts). Asserted by
+    ' the Editor.docmode gate (degradation contract)
+    Public Function DocModeNumber() As String
+        On Error GoTo fail
+        DocModeNumber = CStr(m_doc.documentMode)
+        Exit Function
+fail:
+        DocModeNumber = ""
+    End Function
+
+    Public Sub SetBrowser(w As Object)
+        Set m_wb = w
+    End Sub
+
+    ' Two-stage bring-up (deterministic):
+    '   1. OnDocumentComplete - the event only RECORDS that the current
+    '      navigation finished (m_docReady). No DOM work here: the
+    '      designMode flip can rebuild the document and there is no second
+    '      event to wait on.
+    '   2. EditorInit - called by the host once the window is visible:
+    '      flips designMode On, then waits with a REAL time budget (8s,
+    '      DoEvents) for the rebuilt body to accept writes, then themes.
+    Public Sub OnDocumentComplete()
+        m_docReady = True
+    End Sub
+
+    Public Sub ResetDocReady()
+        m_docReady = False
+    End Sub
+
+    Public Property Get DocReady() As Boolean
+        DocReady = m_docReady
+    End Property
+
+    Public Function EditorInit() As Boolean
+        On Error GoTo fail
+        m_lastErr = ""
+        Set m_doc = m_wb.Document
+        If m_doc Is Nothing Then
+            m_lastErr = "Document is Nothing"
+            Exit Function
+        End If
+        m_doc.designMode = "On"
+        Set m_doc = m_wb.Document   ' re-fetch: designMode may rebuild the doc
+
+        ' Chinese-locale MSHTML auto-spacing (text-autospace) inserts REAL
+        ' spaces at Han/Latin/digit boundaries while editing - notes would
+        ' silently corrupt on every save. Kill it before any content goes
+        ' in: the CSS property + the two MSHTML autospacing commands.
+        InjectCss BuildCss(m_dark)
+        On Error Resume Next
+        m_doc.execCommand "AutoSpaceDE", False, "false"
+        m_doc.execCommand "AutoSpacePunct", False, "false"
+        ' inline belt: body-level font beats the IE edit-surface default
+        ' even where the stylesheet loses the glyph fallback war
+        m_doc.body.style.fontFamily = "SimSun"
+        On Error GoTo fail
+
+        Dim okBody As Boolean
+        Dim t0 As Long
+        t0 = GetTickCountE()
+        Do
+            On Error Resume Next
+            Err.Clear
+            If m_doc Is Nothing Then Set m_doc = m_wb.Document
+            If Not m_doc Is Nothing Then m_doc.body.innerHTML = "<p><br></p>"
+            If Err.Number = 0 Then okBody = True
+            On Error GoTo fail
+            If Not okBody Then
+                DoEvents
+                If GetTickCountE() - t0 > 8000 Then Exit Do
+            End If
+        Loop Until okBody
+        If Not okBody Then
+            m_lastErr = "body never became available after designMode"
+            Exit Function
+        End If
+
+        If m_cln Is Nothing Then Set m_cln = New TbClean
+        m_ready = True
+        EditorInit = True
+        Exit Function
+fail:
+        m_lastErr = "EditorInit err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' ------------------------------------------------------------- theming
+
+    Public Sub ApplyTheme(ByVal dark As Boolean)
+        m_dark = dark
+        If Not m_ready Then Exit Sub
+        InjectCss BuildCss(dark)
+    End Sub
+
+    ' body computed background color (IE8 currentStyle, hex like "#202429")
+    ' - asserted by the Theme.editor_css gate
+    Public Function BodyBackground() As String
+        On Error GoTo fail
+        BodyBackground = CStr(m_doc.body.currentStyle.backgroundColor)
+        Exit Function
+fail:
+        BodyBackground = ""
+    End Function
+
+    ' body computed font-family (IE9 currentStyle) - Theme.editor_css
+    ' asserts the chain reached the document (SimSun default defeated)
+    Public Function BodyFontFamily() As String
+        On Error GoTo fail
+        BodyFontFamily = CStr(m_doc.body.currentStyle.fontFamily)
+        Exit Function
+fail:
+        BodyFontFamily = ""
+    End Function
+
+    ' the css text of the last injected sheet (gate reads it back)
+    Private m_lastCss As String
+
+    Public Property Get LastCss() As String
+        LastCss = m_lastCss
+    End Property
+
+    ' MsHtmlLateBound.ApplyEditorStyle pattern: remove #sn-editor-style,
+    ' append a fresh <style>, write cssText (MSHTML only honors the sheet
+    ' through styleSheet.cssText).
+    Private Sub InjectCss(ByVal css As String)
+        On Error Resume Next
+        Dim head As Object, old As Object, st As Object
+        Set head = m_doc.head
+        If head Is Nothing Then Set head = m_doc.getElementsByTagName("head").item(0)
+        Set old = m_doc.getElementById("sn-editor-style")
+        If Not old Is Nothing Then old.removeNode True
+        Set st = m_doc.createElement("style")
+        st.id = "sn-editor-style"
+        head.appendChild st
+        st.styleSheet.cssText = css
+        m_lastCss = css
+    End Sub
+
+    ' Editor palette. blue = sunken white paper; graphite = dark recessed
+    ' paper. IE7-safe subset (no rgba, no border-radius) because the hosted
+    ' Trident runs in whatever doc mode the FEATURE_BROWSER_EMULATION key
+    ' grants this exe. Heading ladder = blue tokens (SelBar/PinTri family).
+    Private Function BuildCss(ByVal dark As Boolean) As String
+        Dim paper As String, txt As String, divider As String
+        Dim quoteBg As String, codeBg As String, linkC As String
+        Dim h1c As String, h2c As String, h3c As String
+        If dark Then
+            paper = "#202429"
+            txt = "#E8EAED"
+            divider = "#3F444C"
+            quoteBg = "#2B3036"
+            codeBg = "#2B3036"
+            linkC = "#9DB8E0"
+            h1c = "#9DB8E0"
+            h2c = "#A9C2E4"
+            h3c = "#B5CCE8"
+        Else
+            paper = "#FFFFFF"
+            txt = "#212529"
+            divider = "#E2E4E8"
+            quoteBg = "#F5F5F7"
+            codeBg = "#F5F5F7"
+            linkC = "#2A609E"
+            h1c = "#2A609E"
+            h2c = "#3F74B4"
+            h3c = "#5688C4"
+        End If
+
+        Dim s As String
+        s = "html{background:" & paper & ";}"
+        ' P6 font unification: the MSHTML edit-mode DEFAULT character format
+        ' (per-script IEPropFont from the registry - SimSun on a Chinese
+        ' system) rides ABOVE a plain body font-family rule. Fix both layers:
+        ' !important on the body chain (beats the edit default) + an inherit
+        ' rule that re-anchors every inline/container element (kills
+        ' per-element overrides too).
+        ' Chain = SimSun FIRST (Song look); SimSun resolves in MSHTML on
+        ' every system since Win2000. Trust the rendered glyphs, not
+        ' currentStyle.
+        s = s & "body{font-family:SimSun,'Microsoft YaHei',sans-serif !important;font-size:18px;line-height:1.8;text-autospace:none;text-justify:auto;"
+        s = s & "color:" & txt & ";background:" & paper & ";padding:24px 36px;margin:0;outline:none;}"
+        s = s & "font,span,div,p,li{font-family:inherit !important;}"
+        s = s & "h1{color:" & h1c & ";font-size:30px;font-weight:700;margin:0 0 16px 0;padding-bottom:8px;border-bottom:1px solid " & divider & ";}"
+        s = s & "h2{color:" & h2c & ";font-size:25px;font-weight:700;margin:22px 0 12px 0;}"
+        s = s & "h3{color:" & h3c & ";font-size:21px;font-weight:700;margin:18px 0 10px 0;}"
+        s = s & "p{margin:0 0 12px 0;color:" & txt & ";font-size:18px;line-height:1.8;}"
+        s = s & "blockquote{border-left:3px solid " & linkC & ";background:" & quoteBg & ";color:" & txt & ";margin:12px 0;padding:10px 16px;font-size:16px;line-height:1.7;}"
+        s = s & "blockquote p{margin:4px 0;color:" & txt & ";}"
+        s = s & "pre{background:" & codeBg & ";padding:12px;white-space:pre-wrap;font-family:Consolas,monospace;font-size:15px;line-height:1.6;}"
+        s = s & "code{font-family:Consolas,monospace;background:" & codeBg & ";padding:2px 6px;color:" & linkC & ";font-size:15px;}"
+        s = s & "hr{border:0;border-top:1px solid " & divider & ";margin:18px 0;}"
+        s = s & "ul,ol{margin:0 0 12px 24px;padding:0;font-size:18px;line-height:1.8;}"
+        s = s & "li{margin-bottom:6px;}"
+        s = s & "a{color:" & linkC & ";text-decoration:underline;cursor:pointer;}"
+        BuildCss = s
+    End Function
+
+    ' --------------------------------------------------------------- content
+
+    Public Sub SetHtml(ByVal h As String)
+        On Error Resume Next
+        If Len(h) = 0 Then h = "<p><br></p>"
+        m_doc.body.innerHTML = h
+    End Sub
+
+    Public Function GetHtml() As String
+        On Error GoTo fail
+        GetHtml = CStr(m_doc.body.innerHTML)
+        Exit Function
+fail:
+        GetHtml = ""
+    End Function
+
+    ' sanitize through TbClean (paste cleaning + save-time cleaning)
+    Public Function CleanHtml(ByVal h As String) As String
+        If m_cln Is Nothing Then Set m_cln = New TbClean
+        CleanHtml = m_cln.Clean(h)
+    End Function
+
+    Public Function Cleaner() As TbClean
+        If m_cln Is Nothing Then Set m_cln = New TbClean
+        Set Cleaner = m_cln
+    End Function
+
+    ' ------------------------------------------------------------ commands
+
+    Public Function Exec(ByVal cmd As String, ByVal v As String) As Boolean
+        On Error GoTo fail
+        Exec = CBool(m_doc.execCommand(cmd, False, v))
+        Exit Function
+fail:
+        Exec = False
+    End Function
+
+    Public Function QueryState(ByVal cmd As String) As Boolean
+        On Error GoTo fail
+        QueryState = CBool(m_doc.queryCommandState(cmd))
+        Exit Function
+fail:
+        QueryState = False
+    End Function
+
+    ' current block tag (P/H1/H2/H3/BLOCKQUOTE/PRE/LI/DIV) via the IE8
+    ' selection API - queryCommandState cannot distinguish FormatBlock hits
+    Public Function BlockTag() As String
+        On Error GoTo fail
+        Dim selType As String
+        selType = CStr(m_doc.selection.Type)
+        If selType <> "Text" And selType <> "None" Then Exit Function
+        Dim r As Object, el As Object, tg As String, n As Long
+        Set r = m_doc.selection.createRange()
+        Set el = r.parentElement()
+        Do While Not el Is Nothing
+            If n > 32 Then Exit Do
+            tg = CStr(el.tagName)
+            Select Case tg
+                Case "P", "H1", "H2", "H3", "BLOCKQUOTE", "PRE", "LI", "DIV"
+                    BlockTag = tg
+                    Exit Function
+            End Select
+            Set el = el.parentElement
+            n = n + 1
+        Loop
+        Exit Function
+fail:
+        BlockTag = ""
+    End Function
+
+    ' selection text (empty when collapsed/non-text) - link dialog prefill
+    Public Function SelectionText() As String
+        On Error GoTo fail
+        If CStr(m_doc.selection.Type) <> "Text" Then Exit Function
+        Dim r As Object
+        Set r = m_doc.selection.createRange()
+        SelectionText = CStr(r.text)
+        Exit Function
+fail:
+        SelectionText = ""
+    End Function
+
+    ' Insert a link: text selection -> execCommand CreateLink; collapsed
+    ' selection -> range.pasteHTML with an <a> (IE4+ range API, IE8-safe).
+    ' The link dialog steals focus (its TextBox), which disturbs the
+    ' editor selection - callers SaveSelection before opening the dialog
+    ' and RestoreSelection before InsertLink.
+    Private m_savedRange As Object
+
+    Public Function SaveSelection() As Boolean
+        On Error GoTo fail
+        Dim t As String
+        t = CStr(m_doc.selection.Type)
+        If t = "Text" Or t = "None" Then
+            Set m_savedRange = m_doc.selection.createRange()
+            SaveSelection = True
+        End If
+        Exit Function
+fail:
+        SaveSelection = False
+    End Function
+
+    Public Function RestoreSelection() As Boolean
+        On Error GoTo fail
+        If m_savedRange Is Nothing Then Exit Function
+        m_savedRange.select
+        RestoreSelection = True
+        Exit Function
+fail:
+        RestoreSelection = False
+    End Function
+
+    Public Function InsertLink(ByVal url As String, Optional ByVal txt As String = "") As Boolean
+        On Error GoTo fail
+        Dim r As Object
+        If CStr(m_doc.selection.Type) = "Text" Then
+            Set r = m_doc.selection.createRange()
+            If Len(CStr(r.text)) > 0 Then
+                If Len(txt) > 0 And StrComp(txt, CStr(r.text), vbBinaryCompare) <> 0 Then
+                    ' the dialog edited the link text: replace the selection
+                    ' with the edited text wrapped in the anchor
+                    Dim et As String
+                    et = txt
+                    et = Replace(et, "&", "&amp;")
+                    et = Replace(et, "<", "&lt;")
+                    et = Replace(et, ">", "&gt;")
+                    r.pasteHTML "<a href=""" & url & """>" & et & "</a>"
+                    InsertLink = True
+                    Exit Function
+                End If
+                InsertLink = CBool(m_doc.execCommand("CreateLink", False, url))
+                If Not InsertLink Then
+                    ' CreateLink is focus-sensitive: returns False when the
+                    ' editor is not the focused window (e.g. right after the
+                    ' link dialog closed). Wrap the selection manually with
+                    ' the IE4+ range API instead.
+                    Dim t As String
+                    t = CStr(r.text)
+                    t = Replace(t, "&", "&amp;")
+                    t = Replace(t, "<", "&lt;")
+                    t = Replace(t, ">", "&gt;")
+                    r.pasteHTML "<a href=""" & url & """>" & t & "</a>"
+                    InsertLink = True
+                End If
+                Exit Function
+            End If
+        End If
+        If CStr(m_doc.selection.Type) = "None" Then
+            Set r = m_doc.selection.createRange()
+            r.pasteHTML "<a href=""" & url & """>" & url & "</a>"
+            InsertLink = True
+        End If
+        Exit Function
+fail:
+    End Function
+
+    ' select the whole body (gates use this before format commands)
+    Public Function SelectAll() As Boolean
+        On Error GoTo fail
+        Dim r As Object
+        Set r = m_doc.body.createTextRange()
+        r.select
+        SelectAll = True
+        Exit Function
+fail:
+        SelectAll = False
+    End Function
+
+    ' select the first block element of the body (formatBlock refuses to
+    ' convert a body-spanning selection)
+    Public Function SelectFirstBlock() As Boolean
+        On Error GoTo fail
+        Dim kids As Object, first As Object, r As Object
+        Set kids = m_doc.body.childNodes
+        If kids.length < 1 Then Exit Function
+        Set first = kids.item(0)
+        Set r = m_doc.body.createTextRange()
+        r.moveToElementText first
+        r.select
+        SelectFirstBlock = True
+        Exit Function
+fail:
+        SelectFirstBlock = False
+    End Function
+
+    ' Doc-mode-independent block retag: execCommand formatBlock proved
+    ' unreliable on a body-spanning selection, so replace the current block
+    ' element via outerHTML (IE4+). Lists/blockquotes are left alone.
+    Public Function SetBlockTag(ByVal tag As String) As Boolean
+        On Error GoTo fail
+        If CStr(m_doc.selection.Type) <> "Text" And CStr(m_doc.selection.Type) <> "None" Then Exit Function
+        Dim r As Object, el As Object, tg As String
+        Set r = m_doc.selection.createRange()
+        Set el = r.parentElement()
+        Do While Not el Is Nothing
+            tg = CStr(el.tagName)
+            If StrComp(tg, "BODY", vbTextCompare) = 0 Then Exit Function
+            Select Case tg
+                Case "P", "H1", "H2", "H3", "PRE", "DIV"
+                    Exit Do
+            End Select
+            Set el = el.parentElement
+        Loop
+        If el Is Nothing Then Exit Function
+        Dim html As String
+        html = CStr(el.innerHTML)
+        If Len(html) = 0 Then html = "<br>"
+        el.outerHTML = "<" & tag & ">" & html & "</" & tag & ">"
+        SetBlockTag = True
+        Exit Function
+fail:
+        SetBlockTag = False
+    End Function
+
+    ' ---------------------------------------------------------------- links
+
+    ' Resolves the anchor at editor-client coords (x, y) by walking
+    ' ancestors from elementFromPoint. href returns the absolute URL.
+    Public Function LinkAtPoint(ByVal x As Long, ByVal y As Long, ByRef href As String) As Boolean
+        On Error GoTo fail
+        Dim el As Object, n As Long
+        Set el = m_doc.elementFromPoint(CDbl(x), CDbl(y))
+        Do While Not el Is Nothing
+            If n > 32 Then Exit Do
+            If StrComp(CStr(el.tagName), "A", vbTextCompare) = 0 Then
+                href = CStr(el.href)
+                If Len(href) > 0 Then LinkAtPoint = True
+                Exit Function
+            End If
+            If StrComp(CStr(el.tagName), "BODY", vbTextCompare) = 0 Then Exit Function
+            Set el = el.parentElement
+            n = n + 1
+        Loop
+        Exit Function
+fail:
+    End Function
+
+    ' rect of the first anchor in the doc (gate: synthesize a Ctrl+click)
+    Public Function FirstAnchorRect(ByRef x As Long, ByRef y As Long) As Boolean
+        On Error GoTo fail
+        Dim links As Object, a As Object, rc As Object
+        Set links = m_doc.getElementsByTagName("a")
+        If links.length < 1 Then Exit Function
+        Set a = links.item(0)
+        Set rc = a.getBoundingClientRect()
+        x = CLng(rc.left) + 2
+        y = CLng(rc.top) + 2
+        FirstAnchorRect = True
+        Exit Function
+fail:
+    End Function
+
+    ' native child window of the WebBrowser that owns the keyboard/mouse.
+    ' The tB designer control does not expose its HWND through IDispatch
+    ' (invoke fails with DISP_E_EXCEPTION), so walk the FORM's window tree
+    ' depth-first (max 5 levels) for the "Internet Explorer_Server" class.
+    Public Function FindIEServerHwnd(ByVal formHwnd As Long) As Long
+        On Error GoTo fail
+        m_walkLog = ""
+        FindIEServerHwnd = WalkForServer(formHwnd, 0)
+        Exit Function
+fail:
+        m_walkLog = m_walkLog & " ERR=" & Err.Number & " " & Err.Description
+        FindIEServerHwnd = 0
+    End Function
+
+    Private Function WalkForServer(ByVal parent As Long, ByVal depth As Long) As Long
+        On Error GoTo fail
+        If depth > 5 Or parent = 0 Then Exit Function
+        Dim h As Long
+        Dim nm As String
+        h = FindWindowExW(parent, 0, 0, 0)
+        Do While h <> 0
+            nm = ClassOf(h)
+            m_walkLog = m_walkLog & "/" & nm
+            If StrComp(nm, "Internet Explorer_Server", vbTextCompare) = 0 Then
+                WalkForServer = h
+                Exit Function
+            End If
+            WalkForServer = WalkForServer(h, depth + 1)
+            If WalkForServer <> 0 Then Exit Function
+            h = FindWindowExW(parent, h, 0, 0)
+        Loop
+        Exit Function
+fail:
+        WalkForServer = 0
+    End Function
+
+    Private Function ClassOf(ByVal hWnd As Long) As String
+        On Error GoTo fail
+        Dim s As String
+        Dim r As Long
+        s = Space$(128)
+        r = GetClassNameE(hWnd, StrPtr(s), 128)
+        If r > 0 Then ClassOf = Left$(s, r)
+        Exit Function
+fail:
+        ClassOf = ""
+    End Function
+
+End Class

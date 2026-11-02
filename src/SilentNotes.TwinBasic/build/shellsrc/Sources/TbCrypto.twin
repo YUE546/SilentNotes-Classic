@@ -1,0 +1,350 @@
+Option Explicit
+
+' TbCrypto - full encryption chain for the tB shell (Chilkat route, P0-proven):
+'   Encrypt(plainB64, password) -> packedB64   (or "ERR:<reason>")
+'     GenRandomBytes nonce16/salt16 -> Pbkdf2(password, utf-8, sha1, saltHex,
+'     1500, 256, "hex") -> Crypt2 aes/gcm/256 with SetEncodedIV/SetEncodedKey ->
+'     EncryptBytes (pure ciphertext) -> GetEncodedAuthTag("hex") -> pack
+'     cipher||tag behind a revision-2 TbHeaderPacker header.
+'   Decrypt(packedB64, password) -> plainB64  (or "ERR:<reason>")
+'     Unpack -> split trailing 16-byte tag -> SetEncodedAuthTag ->
+'     DecryptBytes(cipherOnly) -> MUST check LastMethodSuccess (late binding
+'     does not raise on GCM auth failure; ignoring it = silent corruption).
+'
+' Chilkat traps (P0): Pbkdf2's salt is an ENCODED STRING (hex), not byte[].
+
+Class TbCrypto
+
+    Private Declare Function CryptAcquireContextW Lib "advapi32" (ByRef hProv As Long, ByVal pszContainer As Long, ByVal pszProvider As Long, ByVal dwProvType As Long, ByVal dwFlags As Long) As Long
+    Private Declare Function CryptGenRandom Lib "advapi32" (ByVal hProv As Long, ByVal dwLen As Long, ByVal pbBuffer As Long) As Long
+    Private Declare Function CryptReleaseContext Lib "advapi32" (ByVal hProv As Long, ByVal dwFlags As Long) As Long
+
+    Private Const PROV_RSA_FULL As Long = 1
+    Private Const CRYPT_VERIFYCONTEXT As Long = &HF0000000
+
+    ' tB TB5250: constants in a class cannot be Public
+    Private Const PackageName As String = "SilentNote"
+    Private Const AlgorithmName As String = "aes_gcm"
+    Private Const KdfName As String = "pbkdf2"
+    Private Const CostLow As String = "1500"
+
+    Private m_Chilkat As TbChilkat
+    Private m_Crypt As Object
+    Private m_U8 As TbUtf8
+    Private m_B64 As TbBase64
+    Private m_HP As TbHeaderPacker
+    Private m_RandomFallback As Boolean
+    Private m_LastRandomDetail As String
+
+    Public Property Get RandomUsedFallback() As Boolean
+        RandomUsedFallback = m_RandomFallback
+    End Property
+
+    Public Property Get LastRandomDetail() As String
+        LastRandomDetail = m_LastRandomDetail
+    End Property
+
+    Public Property Get Crypt() As Object
+        Set Crypt = m_Crypt
+    End Property
+
+    ' the reg-free loader (TbSafeCore/TbTransfer wrap their direct Chilkat
+    ' call sections with EnterCtx/ExitCtx - per-operation activation, pit 23)
+    Public Property Get ChilkatRef() As TbChilkat
+        Set ChilkatRef = m_Chilkat
+    End Property
+
+    Public Function Init(chilkat As TbChilkat, ByRef errText As String) As Boolean
+        Set m_U8 = New TbUtf8
+        Set m_B64 = New TbBase64
+        Set m_HP = New TbHeaderPacker
+        Set m_Chilkat = chilkat
+        ' versioned ProgID - the reg-free manifest only declares "Chilkat.Crypt2.1"
+        Init = chilkat.GetChilkat("Chilkat.Crypt2.1", m_Crypt, errText)
+    End Function
+
+    ' ------------------------------------------------------------------ random
+
+    ' n random bytes; prefers Chilkat Crypt2.GenRandomBytes, falls back to
+    ' advapi32 CryptGenRandom (Chilkat.Prng.GetRandomBytes is not visible on
+    ' IDispatch - P0 finding). P4: generalized to n bytes (safe key = 32).
+    Public Function RandomBytesN(n As Long) As Byte()
+        Dim out() As Byte
+        If n <= 0 Then
+            RandomBytesN = out
+            Exit Function
+        End If
+        ReDim out(0 To n - 1)
+
+        If Not m_RandomFallback Then
+            On Error Resume Next
+            Dim v As Variant
+            Err.Clear
+            Dim ent As Boolean
+            ent = m_Chilkat.EnterCtx()      ' pit 23: per-operation activation
+            v = m_Crypt.GenRandomBytes(n)
+            If ent Then m_Chilkat.ExitCtx
+            If Err.Number = 0 Then
+                If IsArray(v) Then
+                    If VarType(v) = (vbArray + vbByte) Then
+                        If (UBound(v) - LBound(v) + 1) = n Then
+                            Dim i As Long
+                            For i = 0 To n - 1
+                                out(i) = v(LBound(v) + i)
+                            Next
+                            m_LastRandomDetail = "Crypt2.GenRandomBytes(" & n & ")"
+                            RandomBytesN = out
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+            m_RandomFallback = True
+            m_LastRandomDetail = "Crypt2.GenRandomBytes unavailable (err " & Err.Number & ") -> advapi32 CryptGenRandom"
+        Else
+            m_LastRandomDetail = "advapi32 CryptGenRandom"
+        End If
+
+        On Error GoTo 0              ' raise from here on must reach the caller's fail handler
+        Dim hProv As Long
+        If CryptAcquireContextW(hProv, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) <> 0 Then
+            If CryptGenRandom(hProv, n, VarPtr(out(0))) = 0 Then
+                Err.Raise 51, "TbCrypto.RandomBytesN", "CryptGenRandom failed"
+            End If
+            CryptReleaseContext hProv, 0
+        Else
+            Err.Raise 51, "TbCrypto.RandomBytesN", "CryptAcquireContextW failed"
+        End If
+        RandomBytesN = out
+    End Function
+
+    Public Function RandomBytes16() As Byte()
+        RandomBytes16 = RandomBytesN(16)
+    End Function
+
+    ' ------------------------------------------------------------------ encrypt
+
+    ' P1 entry point: SilentNote package, cost 1500 (note Cryptor semantics).
+    Public Function Encrypt(plainB64 As String, password As String, ByRef errText As String) As String
+        Encrypt = EncryptAs(PackageName, plainB64, password, CostLow, errText)
+    End Function
+
+    ' P4 entry point: parameterized package name + cost, so the safe key block
+    ' ("SilentSafe", High cost 25000) and safe notes ("SilentNote", 1500) share
+    ' the identical proven primitive chain. Same format as the frozen
+    ' SilentNotes.Crypto.Cryptor: PBKDF2-SHA1(salt16) -> AES-256-GCM, 16B nonce,
+    ' tag appended, revision-2 header via TbHeaderPacker.
+    Public Function EncryptAs(packageName As String, plainB64 As String, password As String, cost As String, ByRef errText As String) As String
+        On Error GoTo fail
+        errText = ""
+
+        Dim v As Variant
+        v = m_B64.Decode(plainB64)
+        If Not IsArray(v) Then
+            errText = "plainB64 is not valid base64"
+            GoTo fail
+        End If
+        Dim plain() As Byte
+        plain = v
+
+        ' pit 23: the whole Chilkat section runs under the activation context
+        If Not m_Chilkat.EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(m_Chilkat.LastActivateError)
+            GoTo fail
+        End If
+
+        Dim nonce() As Byte, salt() As Byte
+        nonce = RandomBytesN(16)
+        salt = RandomBytesN(16)
+
+        Dim keyHex As String
+        keyHex = m_Crypt.Pbkdf2(password, "utf-8", "sha1", BytesToHex(salt), CLng(cost), 256, "hex")
+
+        m_Crypt.CryptAlgorithm = "aes"
+        m_Crypt.CipherMode = "gcm"
+        m_Crypt.KeyLength = 256
+        m_Crypt.SetEncodedIV BytesToHex(nonce), "hex"
+        m_Crypt.SetEncodedKey keyHex, "hex"
+
+        Dim enc As Variant
+        enc = m_Crypt.EncryptBytes(plain)
+        If Not IsArray(enc) Then GoTo encryptFail
+        If m_Crypt.LastMethodSuccess = 0 Then GoTo encryptFail
+
+        Dim tagHex As String
+        tagHex = m_Crypt.GetEncodedAuthTag("hex")
+        Dim tag() As Byte
+        tag = HexToBytes(tagHex)
+        If ArrLen(tag) <> 16 Then
+            errText = "GetEncodedAuthTag returned " & ArrLen(tag) & " bytes"
+            GoTo fail
+        End If
+
+        Dim full() As Byte
+        full = ConcatBytes(enc, tag)
+
+        Dim packed() As Byte
+        packed = m_HP.Pack(packageName, 2, AlgorithmName, nonce, KdfName, salt, cost, "", full)
+
+        EncryptAs = m_B64.Encode(packed)
+        m_Chilkat.ExitCtx
+        Exit Function
+    encryptFail:
+        m_Chilkat.ExitCtx
+        errText = "EncryptBytes failed; LastMethodSuccess=" & m_Crypt.LastMethodSuccess
+    fail:
+        m_Chilkat.ExitCtx
+        EncryptAs = "ERR:" & errText & " (le=" & Err.Number & " " & Err.Description & ")"
+    End Function
+
+    ' ------------------------------------------------------------------ decrypt
+
+    ' P1 entry point: SilentNote package.
+    Public Function Decrypt(packedB64 As String, password As String, ByRef errText As String) As String
+        Decrypt = DecryptAs(PackageName, packedB64, password, errText)
+    End Function
+
+    ' P4 entry point: parameterized package name (SilentSafe key block).
+    Public Function DecryptAs(packageName As String, packedB64 As String, password As String, ByRef errText As String) As String
+        On Error GoTo fail
+        errText = ""
+
+        Dim v As Variant
+        v = m_B64.Decode(packedB64)
+        If Not IsArray(v) Then
+            errText = "packedB64 is not valid base64"
+            GoTo fail
+        End If
+        Dim packed() As Byte
+        packed = v
+
+        Dim header As TbCryptoHeader, cipherFull() As Byte
+        If Not m_HP.Unpack(packed, packageName, header, cipherFull, errText) Then
+            GoTo fail
+        End If
+        If ArrLen(cipherFull) <= 16 Then
+            errText = "cipher too short (" & ArrLen(cipherFull) & " bytes)"
+            GoTo fail
+        End If
+
+        ' split BC layout cipher||tag16
+        Dim clen As Long
+        clen = ArrLen(cipherFull) - 16
+        Dim cipherOnly() As Byte, tag() As Byte
+        ReDim cipherOnly(0 To clen - 1)
+        ReDim tag(0 To 15)
+        Dim i As Long
+        For i = 0 To clen - 1
+            cipherOnly(i) = cipherFull(i)
+        Next
+        For i = 0 To 15
+            tag(i) = cipherFull(clen + i)
+        Next
+
+        Dim salt() As Byte
+        salt = header.Salt
+
+        ' pit 23: the whole Chilkat section runs under the activation context
+        If Not m_Chilkat.EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(m_Chilkat.LastActivateError)
+            GoTo fail
+        End If
+
+        Dim keyHex As String
+        keyHex = m_Crypt.Pbkdf2(password, "utf-8", "sha1", BytesToHex(salt), CLng(header.Cost), 256, "hex")
+
+        m_Crypt.CryptAlgorithm = "aes"
+        m_Crypt.CipherMode = "gcm"
+        m_Crypt.KeyLength = 256
+        m_Crypt.SetEncodedIV BytesToHex(header.Nonce), "hex"
+        m_Crypt.SetEncodedKey keyHex, "hex"
+        m_Crypt.SetEncodedAuthTag BytesToHex(tag), "hex"
+
+        Dim plain As Variant
+        plain = m_Crypt.DecryptBytes(cipherOnly)
+        If Not IsArray(plain) Then GoTo decryptFail
+        If m_Crypt.LastMethodSuccess = 0 Then GoTo decryptFail
+
+        DecryptAs = m_B64.Encode(plain)
+        m_Chilkat.ExitCtx
+        Exit Function
+    decryptFail:
+        m_Chilkat.ExitCtx
+        errText = "DecryptBytes failed; LastMethodSuccess=" & m_Crypt.LastMethodSuccess
+    fail:
+        m_Chilkat.ExitCtx
+        DecryptAs = "ERR:" & errText & " (le=" & Err.Number & " " & Err.Description & ")"
+    End Function
+
+    ' ------------------------------------------------------------------ hash
+
+    ' SHA256 of a byte array as lowercase hex (sync fingerprints). Self-test in
+    ' the gate uses sha256("abc") to prove the property/method pair before use.
+    Public Function Sha256Bytes(data() As Byte) As String
+        On Error GoTo fail
+        If Not m_Chilkat.EnterCtx() Then GoTo fail
+        m_Crypt.HashAlgorithm = "sha256"
+        Dim v As Variant
+        v = m_Crypt.HashBytes(data)
+        If IsArray(v) Then
+            Dim ha() As Byte
+            ha = v                   ' Variant -> strong-typed before hex
+            Sha256Bytes = LCase$(BytesToHex(ha))
+        End If
+        m_Chilkat.ExitCtx
+        Exit Function
+    fail:
+        m_Chilkat.ExitCtx
+        Sha256Bytes = ""
+    End Function
+
+    ' ------------------------------------------------------------------ helpers
+
+    Public Function BytesToHex(b() As Byte) As String
+        Dim s As String, i As Long
+        For i = 0 To UBound(b)
+            s = s & Right$("0" & Hex$(b(i)), 2)
+        Next
+        BytesToHex = s
+    End Function
+
+    Public Function HexToBytes(h As String) As Byte()
+        Dim n As Long, i As Long
+        Dim out() As Byte
+        n = Len(h) \ 2
+        If n <= 0 Then
+            HexToBytes = out
+            Exit Function
+        End If
+        ReDim out(0 To n - 1)
+        For i = 0 To n - 1
+            out(i) = CByte(CLng("&H" & Mid$(h, i * 2 + 1, 2)) And 255)
+        Next
+        HexToBytes = out
+    End Function
+
+    Private Function ConcatBytes(a As Variant, b() As Byte) As Byte()
+        Dim la As Long, lb As Long
+        la = UBound(a) + 1
+        lb = ArrLen(b)
+        Dim out() As Byte
+        ReDim out(0 To la + lb - 1)
+        Dim i As Long
+        For i = 0 To la - 1
+            out(i) = a(i)
+        Next
+        For i = 0 To lb - 1
+            out(la + i) = b(i)
+        Next
+        ConcatBytes = out
+    End Function
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

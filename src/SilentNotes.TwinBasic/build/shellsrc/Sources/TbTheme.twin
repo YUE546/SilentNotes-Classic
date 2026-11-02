@@ -1,0 +1,628 @@
+﻿Option Explicit
+
+' TbTheme - skeuomorphic dual theme token table for the P2 shell.
+' blue     = classic Office 2007 Blue family (replaces flat "light")
+' graphite = Krypton Sparkle dark family  (replaces flat "dark")
+' Legacy ini values map on read: light -> blue, dark -> graphite; the ini is
+' only ever written the new names. Values are COLORREF (0x00BBGGRR).
+'
+' Tokens are stored in m_t() indexed by T_* constants; named Property Gets
+' expose them to the drawing code, TokenValue/TokenName/TokenCount let the
+' startup gate diff the applied table against SpecValue (the spec table).
+
+Class TbTheme
+
+    ' ------------------------------------------------------- token indices
+
+    Private Const T_TITLEGRADTOP = 0
+    Private Const T_TITLEGRADBOT = 1
+    Private Const T_TITLELINE = 2
+    Private Const T_TITLETEXT = 3
+    Private Const T_FRAME = 4
+    Private Const T_TOOLGRADTOP = 5
+    Private Const T_TOOLGRADBOT = 6
+    Private Const T_TOOLLINE = 7
+    Private Const T_BTNHOVERTOP = 8
+    Private Const T_BTNHOVERBOT = 9
+    Private Const T_BTNHOVERLINE = 10
+    Private Const T_CAPHOVERTOP = 11
+    Private Const T_CAPHOVERBOT = 12
+    Private Const T_CAPHOVERLINE = 13
+    Private Const T_CLOSEHOVERTOP = 14
+    Private Const T_CLOSEHOVERBOT = 15
+    Private Const T_TAGBG = 16
+    Private Const T_CHIPTOP = 17
+    Private Const T_CHIPBOT = 18
+    Private Const T_CHIPLINE = 19
+    Private Const T_CHIPTEXT = 20
+    Private Const T_CHIPSELTOP = 21
+    Private Const T_CHIPSELBOT = 22
+    Private Const T_CHIPSELLINE = 23
+    Private Const T_LISTBG = 24
+    Private Const T_ITEMHOVER = 25
+    Private Const T_SELTOP = 26
+    Private Const T_SELBOT = 27
+    Private Const T_SELLINE = 28
+    Private Const T_SELBAR = 29
+    Private Const T_PINTRI = 30
+    Private Const T_LOCKC = 31
+    Private Const T_EDITPANEL = 32
+    Private Const T_EDITSHEET = 33
+    Private Const T_SUNKENLIGHT = 34
+    Private Const T_SUNKENDARK = 35
+    Private Const T_SEARCHLINE = 36
+    Private Const T_SEARCHFOCUS = 37
+    Private Const T_STATUSTOP = 38
+    Private Const T_STATUSBOT = 39
+    Private Const T_STATUSLINE = 40
+    Private Const T_GRIP = 41
+    Private Const T_TEXT = 42
+    Private Const T_TEXTMUTED = 43
+    Private Const T_BRANDDOT = 44
+    Private Const T_ROWSEP = 45
+
+    Private Const T_COUNT = 46
+
+    Private m_Name As String
+    Private m_t(0 To 45) As Long
+
+    Private Sub Class_Initialize()
+        Apply "blue"
+    End Sub
+
+    ' -------------------------------------------------------------- counts
+
+    Public Property Get TokenCount() As Long
+        TokenCount = T_COUNT
+    End Property
+
+    Public Property Get TokenValue(ByVal i As Long) As Long
+        If i >= 0 And i < T_COUNT Then TokenValue = m_t(i)
+    End Property
+
+    Public Property Get TokenName(ByVal i As Long) As String
+        TokenName = TokenNameByIdx(i)
+    End Property
+
+    Private Function TokenNameByIdx(ByVal i As Long) As String
+        Select Case i
+            Case T_TITLEGRADTOP: TokenNameByIdx = "titleGradTop"
+            Case T_TITLEGRADBOT: TokenNameByIdx = "titleGradBot"
+            Case T_TITLELINE: TokenNameByIdx = "titleLine"
+            Case T_TITLETEXT: TokenNameByIdx = "titleText"
+            Case T_FRAME: TokenNameByIdx = "frame"
+            Case T_TOOLGRADTOP: TokenNameByIdx = "toolGradTop"
+            Case T_TOOLGRADBOT: TokenNameByIdx = "toolGradBot"
+            Case T_TOOLLINE: TokenNameByIdx = "toolLine"
+            Case T_BTNHOVERTOP: TokenNameByIdx = "btnHoverTop"
+            Case T_BTNHOVERBOT: TokenNameByIdx = "btnHoverBot"
+            Case T_BTNHOVERLINE: TokenNameByIdx = "btnHoverLine"
+            Case T_CAPHOVERTOP: TokenNameByIdx = "capHoverTop"
+            Case T_CAPHOVERBOT: TokenNameByIdx = "capHoverBot"
+            Case T_CAPHOVERLINE: TokenNameByIdx = "capHoverLine"
+            Case T_CLOSEHOVERTOP: TokenNameByIdx = "closeHoverTop"
+            Case T_CLOSEHOVERBOT: TokenNameByIdx = "closeHoverBot"
+            Case T_TAGBG: TokenNameByIdx = "tagBg"
+            Case T_CHIPTOP: TokenNameByIdx = "chipTop"
+            Case T_CHIPBOT: TokenNameByIdx = "chipBot"
+            Case T_CHIPLINE: TokenNameByIdx = "chipLine"
+            Case T_CHIPTEXT: TokenNameByIdx = "chipText"
+            Case T_CHIPSELTOP: TokenNameByIdx = "chipSelTop"
+            Case T_CHIPSELBOT: TokenNameByIdx = "chipSelBot"
+            Case T_CHIPSELLINE: TokenNameByIdx = "chipSelLine"
+            Case T_LISTBG: TokenNameByIdx = "listBg"
+            Case T_ITEMHOVER: TokenNameByIdx = "itemHover"
+            Case T_SELTOP: TokenNameByIdx = "selTop"
+            Case T_SELBOT: TokenNameByIdx = "selBot"
+            Case T_SELLINE: TokenNameByIdx = "selLine"
+            Case T_SELBAR: TokenNameByIdx = "selBar"
+            Case T_PINTRI: TokenNameByIdx = "pinTri"
+            Case T_LOCKC: TokenNameByIdx = "lock"
+            Case T_EDITPANEL: TokenNameByIdx = "editPanel"
+            Case T_EDITSHEET: TokenNameByIdx = "editSheet"
+            Case T_SUNKENLIGHT: TokenNameByIdx = "sunkenLight"
+            Case T_SUNKENDARK: TokenNameByIdx = "sunkenDark"
+            Case T_SEARCHLINE: TokenNameByIdx = "searchLine"
+            Case T_SEARCHFOCUS: TokenNameByIdx = "searchFocus"
+            Case T_STATUSTOP: TokenNameByIdx = "statusTop"
+            Case T_STATUSBOT: TokenNameByIdx = "statusBot"
+            Case T_STATUSLINE: TokenNameByIdx = "statusLine"
+            Case T_GRIP: TokenNameByIdx = "grip"
+            Case T_TEXT: TokenNameByIdx = "text"
+            Case T_TEXTMUTED: TokenNameByIdx = "textMuted"
+            Case T_BRANDDOT: TokenNameByIdx = "brandDot"
+        Case T_ROWSEP: TokenNameByIdx = "rowSep"
+        End Select
+    End Function
+
+    ' ------------------------------------------------------- named getters
+
+    Public Property Get Name() As String
+        Name = m_Name
+    End Property
+
+    Public Property Get TitleGradTop() As Long
+        TitleGradTop = m_t(T_TITLEGRADTOP)
+    End Property
+
+    Public Property Get TitleGradBot() As Long
+        TitleGradBot = m_t(T_TITLEGRADBOT)
+    End Property
+
+    Public Property Get TitleLine() As Long
+        TitleLine = m_t(T_TITLELINE)
+    End Property
+
+    Public Property Get TitleText() As Long
+        TitleText = m_t(T_TITLETEXT)
+    End Property
+
+    Public Property Get Frame() As Long
+        Frame = m_t(T_FRAME)
+    End Property
+
+    Public Property Get ToolGradTop() As Long
+        ToolGradTop = m_t(T_TOOLGRADTOP)
+    End Property
+
+    Public Property Get ToolGradBot() As Long
+        ToolGradBot = m_t(T_TOOLGRADBOT)
+    End Property
+
+    Public Property Get ToolLine() As Long
+        ToolLine = m_t(T_TOOLLINE)
+    End Property
+
+    Public Property Get BtnHoverTop() As Long
+        BtnHoverTop = m_t(T_BTNHOVERTOP)
+    End Property
+
+    Public Property Get BtnHoverBot() As Long
+        BtnHoverBot = m_t(T_BTNHOVERBOT)
+    End Property
+
+    Public Property Get BtnHoverLine() As Long
+        BtnHoverLine = m_t(T_BTNHOVERLINE)
+    End Property
+
+    Public Property Get CapHoverTop() As Long
+        CapHoverTop = m_t(T_CAPHOVERTOP)
+    End Property
+
+    Public Property Get CapHoverBot() As Long
+        CapHoverBot = m_t(T_CAPHOVERBOT)
+    End Property
+
+    Public Property Get CapHoverLine() As Long
+        CapHoverLine = m_t(T_CAPHOVERLINE)
+    End Property
+
+    Public Property Get CloseHoverTop() As Long
+        CloseHoverTop = m_t(T_CLOSEHOVERTOP)
+    End Property
+
+    Public Property Get CloseHoverBot() As Long
+        CloseHoverBot = m_t(T_CLOSEHOVERBOT)
+    End Property
+
+    Public Property Get TagBg() As Long
+        TagBg = m_t(T_TAGBG)
+    End Property
+
+    Public Property Get ChipTop() As Long
+        ChipTop = m_t(T_CHIPTOP)
+    End Property
+
+    Public Property Get ChipBot() As Long
+        ChipBot = m_t(T_CHIPBOT)
+    End Property
+
+    Public Property Get ChipLine() As Long
+        ChipLine = m_t(T_CHIPLINE)
+    End Property
+
+    Public Property Get ChipText() As Long
+        ChipText = m_t(T_CHIPTEXT)
+    End Property
+
+    Public Property Get ChipSelTop() As Long
+        ChipSelTop = m_t(T_CHIPSELTOP)
+    End Property
+
+    Public Property Get ChipSelBot() As Long
+        ChipSelBot = m_t(T_CHIPSELBOT)
+    End Property
+
+    Public Property Get ChipSelLine() As Long
+        ChipSelLine = m_t(T_CHIPSELLINE)
+    End Property
+
+    Public Property Get ListBg() As Long
+        ListBg = m_t(T_LISTBG)
+    End Property
+
+    Public Property Get ItemHover() As Long
+        ItemHover = m_t(T_ITEMHOVER)
+    End Property
+
+    Public Property Get SelTop() As Long
+        SelTop = m_t(T_SELTOP)
+    End Property
+
+    Public Property Get SelBot() As Long
+        SelBot = m_t(T_SELBOT)
+    End Property
+
+    Public Property Get SelLine() As Long
+        SelLine = m_t(T_SELLINE)
+    End Property
+
+    Public Property Get SelBar() As Long
+        SelBar = m_t(T_SELBAR)
+    End Property
+
+    Public Property Get PinTri() As Long
+        PinTri = m_t(T_PINTRI)
+    End Property
+
+    Public Property Get LockC() As Long
+        LockC = m_t(T_LOCKC)
+    End Property
+
+    Public Property Get EditPanel() As Long
+        EditPanel = m_t(T_EDITPANEL)
+    End Property
+
+    Public Property Get EditSheet() As Long
+        EditSheet = m_t(T_EDITSHEET)
+    End Property
+
+    Public Property Get SunkenLight() As Long
+        SunkenLight = m_t(T_SUNKENLIGHT)
+    End Property
+
+    Public Property Get SunkenDark() As Long
+        SunkenDark = m_t(T_SUNKENDARK)
+    End Property
+
+    Public Property Get SearchLine() As Long
+        SearchLine = m_t(T_SEARCHLINE)
+    End Property
+
+    Public Property Get SearchFocus() As Long
+        SearchFocus = m_t(T_SEARCHFOCUS)
+    End Property
+
+    Public Property Get StatusTop() As Long
+        StatusTop = m_t(T_STATUSTOP)
+    End Property
+
+    Public Property Get StatusBot() As Long
+        StatusBot = m_t(T_STATUSBOT)
+    End Property
+
+    Public Property Get StatusLine() As Long
+        StatusLine = m_t(T_STATUSLINE)
+    End Property
+
+    Public Property Get Grip() As Long
+        Grip = m_t(T_GRIP)
+    End Property
+
+    Public Property Get Text() As Long
+        Text = m_t(T_TEXT)
+    End Property
+
+    Public Property Get TextMuted() As Long
+        TextMuted = m_t(T_TEXTMUTED)
+    End Property
+
+    Public Property Get BrandDot() As Long
+        BrandDot = m_t(T_BRANDDOT)
+    End Property
+
+    Public Property Get RowSep() As Long
+        RowSep = m_t(T_ROWSEP)
+    End Property
+
+    ' --------------------------------------------------------------- apply
+
+    ' Applies the named theme. Legacy flat names map: light->blue,
+    ' dark->graphite. Returns False for unknown names.
+    Public Function Apply(themeName As String) As Boolean
+        Dim canon As String
+        canon = CanonicalName(themeName)
+        If Len(canon) = 0 Then Exit Function
+        If canon = "blue" Then
+            ApplyBlue
+        Else
+            ApplyGraphite
+        End If
+        m_Name = canon
+        Apply = True
+    End Function
+
+    ' light -> blue, dark -> graphite (legacy ini values keep working)
+    Public Function CanonicalName(themeName As String) As String
+        If StrComp(themeName, "blue", vbTextCompare) = 0 Or StrComp(themeName, "light", vbTextCompare) = 0 Then
+            CanonicalName = "blue"
+        ElseIf StrComp(themeName, "graphite", vbTextCompare) = 0 Or StrComp(themeName, "dark", vbTextCompare) = 0 Then
+            CanonicalName = "graphite"
+        End If
+    End Function
+
+    Private Sub ApplyBlue()
+        ' classic gray family (VB6/Win2000 button face #D4D0C8): chrome
+        ' strips flat, list white, XP solid selection #316AC5
+        m_t(T_TITLEGRADTOP) = RGB(&HFA, &HFC, &HFE)   ' #FAFCFE (unused by drawing)
+        m_t(T_TITLEGRADBOT) = RGB(&HC9, &HD9, &HEC)   ' #C9D9EC (unused by drawing)
+        m_t(T_TITLELINE) = RGB(&H99, &HB3, &HCE)      ' #99B3CE (unused by drawing)
+        m_t(T_TITLETEXT) = RGB(&H1E, &H39, &H5B)      ' #1E395B (unused by drawing)
+        m_t(T_FRAME) = RGB(&H6E, &H8B, &HB0)          ' #6E8BB0 (unused by drawing)
+        m_t(T_TOOLGRADTOP) = RGB(&HD4, &HD0, &HC8)    ' #D4D0C8 (flat)
+        m_t(T_TOOLGRADBOT) = RGB(&HD4, &HD0, &HC8)    ' #D4D0C8 (flat)
+        m_t(T_TOOLLINE) = RGB(&H80, &H80, &H80)       ' #808080
+        m_t(T_BTNHOVERTOP) = RGB(&HFF, &HFF, &HFF)    ' #FFFFFF (unused by drawing)
+        m_t(T_BTNHOVERBOT) = RGB(&HDC, &HE4, &HEF)    ' #DCE4EF (unused by drawing)
+        m_t(T_BTNHOVERLINE) = RGB(&H98, &HB5, &HD1)   ' #98B5D1 (unused by drawing)
+        m_t(T_CAPHOVERTOP) = RGB(&HFD, &HE8, &HCC)    ' #FDE8CC (unused by drawing)
+        m_t(T_CAPHOVERBOT) = RGB(&HF8, &HDD, &HC0)    ' #F8DDC0 (unused by drawing)
+        m_t(T_CAPHOVERLINE) = RGB(&HE1, &H96, &H02)   ' #E19602 (unused by drawing)
+        m_t(T_CLOSEHOVERTOP) = RGB(&HD1, &H4B, &H4B)  ' #D14B4B (unused by drawing)
+        m_t(T_CLOSEHOVERBOT) = RGB(&HC2, &H44, &H44)  ' #C24444 (unused by drawing)
+        m_t(T_TAGBG) = RGB(&HD4, &HD0, &HC8)          ' #D4D0C8
+        m_t(T_CHIPTOP) = RGB(&HD4, &HD0, &HC8)        ' #D4D0C8
+        m_t(T_CHIPBOT) = RGB(&HD4, &HD0, &HC8)        ' #D4D0C8
+        m_t(T_CHIPLINE) = RGB(&H80, &H80, &H80)       ' #808080
+        m_t(T_CHIPTEXT) = RGB(&H00, &H00, &H00)       ' #000000
+        m_t(T_CHIPSELTOP) = RGB(&H31, &H6A, &HC5)     ' #316AC5
+        m_t(T_CHIPSELBOT) = RGB(&H31, &H6A, &HC5)     ' #316AC5
+        m_t(T_CHIPSELLINE) = RGB(&H31, &H6A, &HC5)    ' #316AC5
+        m_t(T_LISTBG) = RGB(&HFF, &HFF, &HFF)         ' #FFFFFF
+        m_t(T_ITEMHOVER) = RGB(&HE0, &HE0, &HE0)      ' #E0E0E0 (gray hover wash)
+        m_t(T_SELTOP) = RGB(&H31, &H6A, &HC5)         ' #316AC5 (XP solid selection)
+        m_t(T_SELBOT) = RGB(&H31, &H6A, &HC5)         ' #316AC5
+        m_t(T_SELLINE) = RGB(&H31, &H6A, &HC5)        ' #316AC5
+        m_t(T_SELBAR) = RGB(&H31, &H6A, &HC5)         ' #316AC5
+        m_t(T_PINTRI) = RGB(&H0A, &H24, &H6A)         ' #0A246A (classic navy)
+        m_t(T_LOCKC) = RGB(&H80, &H80, &H80)          ' #808080
+        m_t(T_EDITPANEL) = RGB(&HD4, &HD0, &HC8)      ' #D4D0C8
+        m_t(T_EDITSHEET) = RGB(&HFF, &HFF, &HFF)      ' #FFFFFF
+        m_t(T_SUNKENLIGHT) = RGB(&HFF, &HFF, &HFF)    ' #FFFFFF
+        m_t(T_SUNKENDARK) = RGB(&H80, &H80, &H80)     ' #808080
+        m_t(T_SEARCHLINE) = RGB(&H80, &H80, &H80)     ' #808080
+        m_t(T_SEARCHFOCUS) = RGB(&H31, &H6A, &HC5)    ' #316AC5
+        m_t(T_STATUSTOP) = RGB(&HD4, &HD0, &HC8)      ' #D4D0C8 (flat)
+        m_t(T_STATUSBOT) = RGB(&HD4, &HD0, &HC8)      ' #D4D0C8 (flat)
+        m_t(T_STATUSLINE) = RGB(&H80, &H80, &H80)     ' #808080
+        m_t(T_GRIP) = RGB(&H80, &H80, &H80)           ' #808080
+        m_t(T_TEXT) = RGB(&H00, &H00, &H00)           ' #000000
+        m_t(T_TEXTMUTED) = RGB(&H80, &H80, &H80)      ' #808080
+        m_t(T_BRANDDOT) = RGB(&H2A, &H60, &H9E)       ' #2A609E (unused by drawing)
+        m_t(T_ROWSEP) = RGB(&HC0, &HC0, &HC0)         ' #C0C0C0
+    End Sub
+
+    Private Sub ApplyGraphite()
+        m_t(T_TITLEGRADTOP) = RGB(&H4A, &H50, &H58)   ' #4A5058
+        m_t(T_TITLEGRADBOT) = RGB(&H2F, &H34, &H3A)   ' #2F343A
+        m_t(T_TITLELINE) = RGB(&H22, &H26, &H2A)      ' #22262A
+        m_t(T_TITLETEXT) = RGB(&HE8, &HEA, &HED)      ' #E8EAED
+        m_t(T_FRAME) = RGB(&H1A, &H1D, &H20)          ' #1A1D20
+        m_t(T_TOOLGRADTOP) = RGB(&H3A, &H40, &H46)    ' #3A4046
+        m_t(T_TOOLGRADBOT) = RGB(&H2E, &H34, &H39)    ' #2E3439
+        m_t(T_TOOLLINE) = RGB(&H22, &H26, &H2A)       ' #22262A
+        m_t(T_BTNHOVERTOP) = RGB(&H4E, &H56, &H5F)    ' #4E565F
+        m_t(T_BTNHOVERBOT) = RGB(&H4A, &H51, &H5A)    ' #4A515A (hue of #4E565F, slight deepen)
+        m_t(T_BTNHOVERLINE) = RGB(&H6B, &H74, &H80)   ' #6B7480
+        m_t(T_CAPHOVERTOP) = RGB(&H5C, &H64, &H6E)    ' #5C646E
+        m_t(T_CAPHOVERBOT) = RGB(&H56, &H5E, &H67)    ' #565E67 (hue of #5C646E, slight deepen)
+        m_t(T_CAPHOVERLINE) = RGB(&H6B, &H74, &H80)   ' #6B7480
+        m_t(T_CLOSEHOVERTOP) = RGB(&HB0, &H3A, &H3A)  ' #B03A3A
+        m_t(T_CLOSEHOVERBOT) = RGB(&HA5, &H35, &H35)  ' #A53535 (slight deepen)
+        m_t(T_TAGBG) = RGB(&H2B, &H30, &H36)          ' #2B3036
+        m_t(T_CHIPTOP) = RGB(&H3E, &H45, &H4D)        ' #3E454D
+        m_t(T_CHIPBOT) = RGB(&H3A, &H40, &H48)        ' #3A4048 (hue of #3E454D, slight deepen)
+        m_t(T_CHIPLINE) = RGB(&H5A, &H64, &H70)       ' #5A6470
+        m_t(T_CHIPTEXT) = RGB(&HCD, &HD3, &HDA)       ' #CDD3DA
+        m_t(T_CHIPSELTOP) = RGB(&H4E, &H61, &H78)     ' #4E6178
+        m_t(T_CHIPSELBOT) = RGB(&H42, &H54, &H6A)     ' #42546A
+        m_t(T_CHIPSELLINE) = RGB(&H74, &H89, &HA4)    ' #7489A4
+        m_t(T_LISTBG) = RGB(&H32, &H37, &H3D)         ' #32373D
+        m_t(T_ITEMHOVER) = RGB(&H3E, &H45, &H4D)      ' #3E454D (chip-family hover wash, keeps #E8EAED text readable)
+        m_t(T_SELTOP) = RGB(&H00, &H78, &HD7)         ' #0078D7 (solid selection blue)
+        m_t(T_SELBOT) = RGB(&H00, &H78, &HD7)         ' #0078D7
+        m_t(T_SELLINE) = RGB(&H00, &H78, &HD7)        ' #0078D7
+        m_t(T_SELBAR) = RGB(&H00, &H78, &HD7)         ' #0078D7
+        m_t(T_PINTRI) = RGB(&H9D, &HB8, &HE0)         ' #9DB8E0
+        m_t(T_LOCKC) = RGB(&H9A, &HA5, &HB1)          ' #9AA5B1
+        m_t(T_EDITPANEL) = RGB(&H26, &H29, &H2E)      ' #26292E
+        m_t(T_EDITSHEET) = RGB(&H20, &H24, &H29)      ' #202429 (recessed sheet)
+        m_t(T_SUNKENLIGHT) = RGB(&H4A, &H51, &H58)    ' #4A5158
+        m_t(T_SUNKENDARK) = RGB(&H14, &H17, &H1A)     ' #14171A
+        m_t(T_SEARCHLINE) = RGB(&H14, &H17, &H1A)     ' #14171A
+        m_t(T_SEARCHFOCUS) = RGB(&H7C, &H93, &HB5)    ' #7C93B5
+        m_t(T_STATUSTOP) = RGB(&H34, &H39, &H40)      ' #343940
+        m_t(T_STATUSBOT) = RGB(&H2A, &H2E, &H33)      ' #2A2E33
+        m_t(T_STATUSLINE) = RGB(&H22, &H26, &H2A)     ' #22262A
+        m_t(T_GRIP) = RGB(&H4E, &H56, &H5F)           ' #4E565F
+        m_t(T_TEXT) = RGB(&HE8, &HEA, &HED)           ' #E8EAED
+        m_t(T_TEXTMUTED) = RGB(&H8A, &H92, &H9C)      ' #8A929C
+        m_t(T_BRANDDOT) = RGB(&H7C, &H93, &HB5)       ' #7C93B5
+        m_t(T_ROWSEP) = RGB(&H3C, &H43, &H4B)         ' #3C434B
+    End Sub
+
+    ' spec reference table (hex written 0xRRGGBB) used by the startup gate
+    Public Function SpecValue(ByVal themeName As String, ByVal i As Long) As Long
+        Dim v As Long
+        v = -1
+        If CanonicalName(themeName) = "blue" Then
+            Select Case i
+                Case T_TITLEGRADTOP: v = &HFAFCFE
+                Case T_TITLEGRADBOT: v = &HC9D9EC
+                Case T_TITLELINE: v = &H99B3CE
+                Case T_TITLETEXT: v = &H1E395B
+                Case T_FRAME: v = &H6E8BB0
+                Case T_TOOLGRADTOP: v = &HD4D0C8
+                Case T_TOOLGRADBOT: v = &HD4D0C8
+                Case T_TOOLLINE: v = &H808080
+                Case T_BTNHOVERTOP: v = &HFFFFFF
+                Case T_BTNHOVERBOT: v = &HDCE4EF
+                Case T_BTNHOVERLINE: v = &H98B5D1
+                Case T_CAPHOVERTOP: v = &HFDE8CC
+                Case T_CAPHOVERBOT: v = &HF8DDC0
+                Case T_CAPHOVERLINE: v = &HE19602
+                Case T_CLOSEHOVERTOP: v = &HD14B4B
+                Case T_CLOSEHOVERBOT: v = &HC24444
+                Case T_TAGBG: v = &HD4D0C8
+                Case T_CHIPTOP: v = &HD4D0C8
+                Case T_CHIPBOT: v = &HD4D0C8
+                Case T_CHIPLINE: v = &H808080
+                Case T_CHIPTEXT: v = &H0
+                Case T_CHIPSELTOP: v = &H316AC5
+                Case T_CHIPSELBOT: v = &H316AC5
+                Case T_CHIPSELLINE: v = &H316AC5
+                Case T_LISTBG: v = &HFFFFFF
+                Case T_ITEMHOVER: v = &HE0E0E0
+                Case T_SELTOP: v = &H316AC5
+                Case T_SELBOT: v = &H316AC5
+                Case T_SELLINE: v = &H316AC5
+                Case T_SELBAR: v = &H316AC5
+                Case T_PINTRI: v = &HA246A
+                Case T_LOCKC: v = &H808080
+                Case T_EDITPANEL: v = &HD4D0C8
+                Case T_EDITSHEET: v = &HFFFFFF
+                Case T_SUNKENLIGHT: v = &HFFFFFF
+                Case T_SUNKENDARK: v = &H808080
+                Case T_SEARCHLINE: v = &H808080
+                Case T_SEARCHFOCUS: v = &H316AC5
+                Case T_STATUSTOP: v = &HD4D0C8
+                Case T_STATUSBOT: v = &HD4D0C8
+                Case T_STATUSLINE: v = &H808080
+                Case T_GRIP: v = &H808080
+                Case T_TEXT: v = &H0
+                Case T_TEXTMUTED: v = &H808080
+                Case T_BRANDDOT: v = &H2A609E
+                Case T_ROWSEP: v = &HC0C0C0
+            End Select
+        Else
+            Select Case i
+                Case T_TITLEGRADTOP: v = &H4A5058
+                Case T_TITLEGRADBOT: v = &H2F343A
+                Case T_TITLELINE: v = &H22262A
+                Case T_TITLETEXT: v = &HE8EAED
+                Case T_FRAME: v = &H1A1D20
+                Case T_TOOLGRADTOP: v = &H3A4046
+                Case T_TOOLGRADBOT: v = &H2E3439
+                Case T_TOOLLINE: v = &H22262A
+                Case T_BTNHOVERTOP: v = &H4E565F
+                Case T_BTNHOVERBOT: v = &H4A515A
+                Case T_BTNHOVERLINE: v = &H6B7480
+                Case T_CAPHOVERTOP: v = &H5C646E
+                Case T_CAPHOVERBOT: v = &H565E67
+                Case T_CAPHOVERLINE: v = &H6B7480
+                Case T_CLOSEHOVERTOP: v = &HB03A3A
+                Case T_CLOSEHOVERBOT: v = &HA53535
+                Case T_TAGBG: v = &H2B3036
+                Case T_CHIPTOP: v = &H3E454D
+                Case T_CHIPBOT: v = &H3A4048
+                Case T_CHIPLINE: v = &H5A6470
+                Case T_CHIPTEXT: v = &HCDD3DA
+                Case T_CHIPSELTOP: v = &H4E6178
+                Case T_CHIPSELBOT: v = &H42546A
+                Case T_CHIPSELLINE: v = &H7489A4
+                Case T_LISTBG: v = &H32373D
+                Case T_ITEMHOVER: v = &H3E454D
+                Case T_SELTOP: v = &H0078D7
+                Case T_SELBOT: v = &H0078D7
+                Case T_SELLINE: v = &H0078D7
+                Case T_SELBAR: v = &H0078D7
+                Case T_PINTRI: v = &H9DB8E0
+                Case T_LOCKC: v = &H9AA5B1
+                Case T_EDITPANEL: v = &H26292E
+                Case T_EDITSHEET: v = &H202429
+                Case T_SUNKENLIGHT: v = &H4A5158
+                Case T_SUNKENDARK: v = &H14171A
+                Case T_SEARCHLINE: v = &H14171A
+                Case T_SEARCHFOCUS: v = &H7C93B5
+                Case T_STATUSTOP: v = &H343940
+                Case T_STATUSBOT: v = &H2A2E33
+                Case T_STATUSLINE: v = &H22262A
+                Case T_GRIP: v = &H4E565F
+                Case T_TEXT: v = &HE8EAED
+                Case T_TEXTMUTED: v = &H8A929C
+                Case T_BRANDDOT: v = &H7C93B5
+                Case T_ROWSEP: v = &H3C434B
+            End Select
+        End If
+        If v < 0 Then
+            SpecValue = -1
+        Else
+            SpecValue = RGB((v \ &H10000) And &HFF, (v \ &H100) And &HFF, v And &HFF)
+        End If
+    End Function
+
+    Public Function Toggle() As String
+        If StrComp(m_Name, "graphite", vbTextCompare) = 0 Then
+            Apply "blue"
+        Else
+            Apply "graphite"
+        End If
+        Toggle = m_Name
+    End Function
+
+    ' --------------------------------------------------------- persistence
+
+    ' Reads ui.theme from the ini; legacy light/dark map to blue/graphite.
+    ' Missing file / key / unknown value -> "blue".
+    Public Function LoadFromIni(iniPath As String) As String
+        Dim ini As TbIni
+        Dim v As String
+        On Error GoTo fallback
+        Set ini = New TbIni
+        If ini.Load(iniPath) Then
+            v = ini.GetValue("ui", "theme", "blue")
+        Else
+            v = "blue"
+        End If
+        If Len(v) = 0 Then v = "blue"
+        If Not Apply(v) Then Apply "blue"
+        LoadFromIni = m_Name
+        Exit Function
+fallback:
+        Apply "blue"
+        LoadFromIni = m_Name
+    End Function
+
+    ' Writes ui.theme=<canonical name> into the ini (creates it when missing).
+    Public Function SaveToIni(iniPath As String) As Boolean
+        Dim ini As TbIni
+        On Error GoTo fail
+        Set ini = New TbIni
+        If Not ini.Load(iniPath) Then
+            SeedIniFile iniPath
+            Set ini = New TbIni
+            If Not ini.Load(iniPath) Then Exit Function
+        End If
+        ini.SetValue "ui", "theme", m_Name
+        SaveToIni = ini.Save(iniPath)
+        Exit Function
+fail:
+        SaveToIni = False
+    End Function
+
+    ' TbIni.SetValue is a no-op on an unloaded instance, so a missing file is
+    ' seeded with a minimal [ui] section first (UTF-8, BOM-less).
+    Private Sub SeedIniFile(ByVal iniPath As String)
+        On Error Resume Next
+        Dim u8 As TbUtf8
+        Dim ba() As Byte
+        Dim f As Integer
+        Set u8 = New TbUtf8
+        ba = u8.Encode("[ui]" & vbCrLf & "theme=" & m_Name & vbCrLf)
+        f = FreeFile
+        Open iniPath For Binary Access Write As #f
+        Put #f, , ba
+        Close #f
+    End Sub
+
+End Class

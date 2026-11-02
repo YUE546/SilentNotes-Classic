@@ -1,0 +1,225 @@
+Option Explicit
+
+' TbHeaderPacker - tB port of SilentNotes CryptoHeaderPacker (frozen source
+' src\SilentNotes.AllPlatforms\Crypto\CryptoHeaderPacker.cs), byte-aligned:
+'
+'   revision 2: "<pkg> v=2$<alg>$<nonce_b64>$<kdf>$<salt_b64>$<cost>$<compression>$" + cipher
+'   revision 1: "<pkg>$<alg>$<nonce_b64>$<kdf>$<salt_b64>$<cost>$" + cipher   (6 separators,
+'               no " v=" marker, no compression field)
+'   Unpack: locate the Nth '$' (7 for rev>1 else 6); cipher = bytes after it;
+'           header text = UTF-8 of bytes[0..Nth inclusive], split on '$'.
+'   Base64 = standard alphabet, no line breaks (.NET Convert.ToBase64String).
+
+Class TbHeaderPacker
+
+    Private m_U8 As TbUtf8
+    Private m_B64 As TbBase64
+
+    Private Sub Class_Initialize()
+        Set m_U8 = New TbUtf8
+        Set m_B64 = New TbBase64
+    End Sub
+
+    Public Function NewestSupportedRevision() As Long
+        NewestSupportedRevision = 2
+    End Function
+
+    ' Packs header fields and cipher. salt may be an empty dynamic array
+    ' (= "no salt" in the original when header.Salt Is Nothing).
+    Public Function Pack(packageName As String, revision As Long, algorithmName As String, _
+        nonce() As Byte, kdfName As String, salt() As Byte, cost As String, _
+        compression As String, cipher() As Byte) As Byte()
+
+        Dim sb As String
+        sb = packageName
+        If revision > 1 Then sb = sb & " v=" & revision
+        sb = sb & "$" & algorithmName & "$" & m_B64.Encode(nonce) & "$" & kdfName & "$"
+        If ArrLen(salt) > 0 Then sb = sb & m_B64.Encode(salt)
+        sb = sb & "$" & cost & "$"
+        If revision > 1 Then sb = sb & compression & "$"
+
+        Dim hb() As Byte
+        hb = m_U8.Encode(sb)
+
+        Dim clen As Long
+        clen = ArrLen(cipher)
+        Dim out() As Byte
+        ReDim out(0 To (UBound(hb) + 1) + clen - 1)
+        Dim i As Long
+        For i = 0 To UBound(hb)
+            out(i) = hb(i)
+        Next
+        For i = 0 To clen - 1
+            out(UBound(hb) + 1 + i) = cipher(i)
+        Next
+        Pack = out
+    End Function
+
+    ' Unpacks. Returns True and fills header + cipher; False + errText otherwise.
+    Public Function Unpack(packed() As Byte, expectedAppName As String, _
+        ByRef header As TbCryptoHeader, ByRef cipher() As Byte, ByRef errText As String) As Boolean
+
+        errText = ""
+        Dim revision As Long
+        If Not HasMatchingHeader(packed, expectedAppName, revision) Then
+            errText = "no matching header for '" & expectedAppName & "'"
+            Exit Function
+        End If
+        If revision > 2 Then
+            errText = "unsupported revision " & revision
+            Exit Function
+        End If
+
+        Dim sepCount As Long
+        If revision > 1 Then sepCount = 7 Else sepCount = 6
+        Dim lastPos As Long
+        lastPos = IndexOfLastSeparator(packed, sepCount)
+        If lastPos < 0 Then
+            errText = "expected " & sepCount & " separators not found"
+            Exit Function
+        End If
+
+        ' cipher part: bytes after the Nth separator
+        Dim clen As Long
+        clen = ArrLen(packed) - lastPos - 1
+        If clen < 0 Then
+            errText = "cipher part empty"
+            Exit Function
+        End If
+        If clen > 0 Then
+            ReDim cipher(0 To clen - 1)
+            Dim i As Long
+            For i = 0 To clen - 1
+                cipher(i) = packed(lastPos + 1 + i)
+            Next
+        End If
+
+        ' header text: bytes 0..lastPos inclusive (UTF-8)
+        Dim hb() As Byte
+        ReDim hb(0 To lastPos)
+        For i = 0 To lastPos
+            hb(i) = packed(i)
+        Next
+        Dim headerString As String
+        headerString = m_U8.Decode(hb)
+
+        On Error GoTo badFormat
+        Dim parts() As String
+        parts = Split(headerString, "$")
+        If revision > 1 Then
+            If UBound(parts) < 6 Then GoTo badFormat
+        Else
+            If UBound(parts) < 5 Then GoTo badFormat
+        End If
+
+        Dim nv As Variant, sv As Variant
+        nv = m_B64.Decode(parts(2))
+        If Not IsArray(nv) Then GoTo badFormat
+        If Len(parts(4)) > 0 Then
+            sv = m_B64.Decode(parts(4))
+            If Not IsArray(sv) Then GoTo badFormat
+        End If
+
+        Set header = New TbCryptoHeader
+        header.PackageName = expectedAppName
+        header.Revision = revision
+        header.AlgorithmName = parts(1)
+        header.Nonce = nv
+        If Len(parts(3)) > 0 Then header.KdfName = parts(3) Else header.KdfName = ""
+        If Len(parts(4)) > 0 Then header.Salt = sv
+        If Len(parts(5)) > 0 Then header.Cost = parts(5) Else header.Cost = ""
+        If revision > 1 Then
+            header.Compression = parts(6)
+        Else
+            header.Compression = ""
+        End If
+        Unpack = True
+        Exit Function
+    badFormat:
+        errText = "header fields invalid: '" & Left$(headerString, 80) & "'"
+    End Function
+
+    ' Port of HasMatchingHeader: "<pkg>$" -> rev 1; "<pkg> v=<digits>$" -> that rev.
+    Private Function HasMatchingHeader(packed() As Byte, expectedAppName As String, ByRef revision As Long) As Boolean
+        Dim nb() As Byte
+        nb = m_U8.Encode(expectedAppName)
+        If ArrLen(packed) < ArrLen(nb) Then Exit Function
+        If Not ContainsAt(packed, nb, 0) Then Exit Function
+
+        Dim pos As Long
+        pos = ArrLen(nb)
+
+        If ContainsByteAt(packed, 36, pos) Then ' '$'
+            revision = 1
+            HasMatchingHeader = True
+            Exit Function
+        End If
+
+        Dim rb() As Byte
+        rb = m_U8.Encode(" v=")
+        If Not ContainsAt(packed, rb, pos) Then Exit Function
+
+        Dim digitsStart As Long, digitsEnd As Long
+        digitsStart = pos + ArrLen(rb)
+        digitsEnd = digitsStart
+        Do While IsDigitByteAt(packed, digitsEnd)
+            digitsEnd = digitsEnd + 1
+        Loop
+        If digitsEnd <= digitsStart Then Exit Function
+        If Not ContainsByteAt(packed, 36, digitsEnd) Then Exit Function
+
+        Dim s As String, i As Long
+        For i = digitsStart To digitsEnd - 1
+            s = s & Chr$(packed(i))
+        Next
+        On Error GoTo fail
+        revision = CLng(s)
+        HasMatchingHeader = True
+        Exit Function
+    fail:
+        HasMatchingHeader = False
+    End Function
+
+    Private Function IndexOfLastSeparator(packed() As Byte, ByVal expectedSeparatorCount As Long) As Long
+        Dim count As Long, i As Long
+        For i = 0 To ArrLen(packed) - 1
+            If packed(i) = 36 Then
+                count = count + 1
+                If count = expectedSeparatorCount Then
+                    IndexOfLastSeparator = i
+                    Exit Function
+                End If
+            End If
+        Next
+        IndexOfLastSeparator = -1
+    End Function
+
+    Private Function ContainsAt(packed() As Byte, needle() As Byte, ByVal at As Long) As Boolean
+        Dim i As Long
+        If at + ArrLen(needle) > ArrLen(packed) Then Exit Function
+        For i = 0 To ArrLen(needle) - 1
+            If packed(at + i) <> needle(i) Then Exit Function
+        Next
+        ContainsAt = True
+    End Function
+
+    Private Function ContainsByteAt(packed() As Byte, ByVal b As Long, ByVal at As Long) As Boolean
+        If at >= ArrLen(packed) Then Exit Function
+        ContainsByteAt = (packed(at) = b)
+    End Function
+
+    Private Function IsDigitByteAt(packed() As Byte, ByVal at As Long) As Boolean
+        If at >= ArrLen(packed) Then Exit Function
+        IsDigitByteAt = (packed(at) >= 48 And packed(at) <= 57)
+    End Function
+
+    ' Length of a dynamic byte array; 0 when unassigned (UBound would raise).
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

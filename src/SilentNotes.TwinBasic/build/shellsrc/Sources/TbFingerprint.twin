@@ -1,0 +1,171 @@
+Option Explicit
+
+' TbFingerprint - pure twinBASIC port of NoteRepositoryModel.GetModificationFingerprint
+' + ModificationDetector.CombineHashCodes (frozen reference:
+' src/SilentNotes.AllPlatforms/, verified against the .NET Framework 4.8
+' mscorlib that hosts the Core oracle).
+'
+' C# reference (NoteRepositoryModel.GetModificationFingerprint):
+'   hashCodes.Add(Id.GetHashCode());            // Guid
+'   hashCodes.Add(Revision);                    // int
+'   hashCodes.Add(OrderModifiedAt.GetHashCode());
+'   per note: ModifiedAt.GetHashCode(); if (MetaModifiedAt != null) MetaModifiedAt.GetHashCode();
+'             InRecyclingBin.GetHashCode();     // bool = 1/0
+'   per deleted note: Id.GetHashCode();
+'   per safe: ModifiedAt.GetHashCode(); if (MaintainedAt != null) MaintainedAt.GetHashCode();
+'   return ModificationDetector.CombineHashCodes(hashCodes);
+'
+' Ported primitives (all empirically verified against live mscorlib):
+' - CombineHashCodes: result = unchecked(result * 397) ^ hashCode  (int64 wrap).
+'   tB has no unchecked context -> 64-bit multiply done via unsigned 32-bit
+'   halves (no overflow anywhere).
+' - Guid.GetHashCode (IL-verified against mscorlib 4.8):
+'       return _a ^ ((_b << 16) | (ushort)_c) ^ ((_f << 24) | _k);
+'   _a = Data1 (int, bit pattern), _b/_c = Data2/Data3 (ushort), _f = Data4[2],
+'   _k = Data4[7].
+' - DateTime.GetHashCode: (int)ticks ^ (int)(ticks >> 32) (ticks >= 0 here).
+' - bool.GetHashCode: 1 / 0.
+' Note: String.GetHashCode is NOT part of this fingerprint (only
+' Guid/DateTime/bool/int are hashed), so its randomization behavior is
+' irrelevant - numeric equality between sides is the acceptance criterion.
+
+Module TbFingerprint
+
+Private Const MASK32 As LongLong = 4294967295^
+Private Const TWO32 As LongLong = 4294967296^
+Private Const MASK64HI As LongLong = &HFFFFFFFF00000000^
+
+' One CombineHashCodes step: r = unchecked(r * 397) ^ h  (h sign-extended i32)
+Public Function CombineStep(ByVal r As LongLong, ByVal h As Long) As LongLong
+    Dim lo As LongLong
+    Dim hi As LongLong
+    Dim t As LongLong
+    Dim carry As LongLong
+    Dim hiSum As LongLong
+    Dim newLo As LongLong
+    Dim newHi As LongLong
+    Dim prod As LongLong
+    lo = r And MASK32
+    hi = (r And MASK64HI) \ TWO32
+    If hi < 0 Then hi = hi + TWO32
+    t = lo * 397^
+    carry = t \ TWO32
+    hiSum = hi * 397^ + carry
+    newLo = t And MASK32
+    newHi = hiSum And MASK32
+    If newHi >= 2147483648^ Then
+        prod = (newHi - TWO32) * TWO32
+    Else
+        prod = newHi * TWO32
+    End If
+    prod = prod + newLo
+    Dim hx As LongLong
+    hx = h                       ' Long -> LongLong sign-extends (C# int->long)
+    CombineStep = prod Xor hx
+End Function
+
+' Guid.GetHashCode port. Input: canonical lowercase "d" guid text.
+Public Function GuidHash32(ByRef idText As String) As Long
+    Dim hex32 As String
+    Dim aU As LongLong
+    Dim bU As LongLong
+    Dim cU As LongLong
+    Dim fU As LongLong
+    Dim kU As LongLong
+    Dim t2 As LongLong
+    Dim t3 As LongLong
+    Dim res As LongLong
+    If Len(idText) = 0 Then
+        GuidHash32 = 0
+        Exit Function
+    End If
+    hex32 = idText
+    hex32 = Replace(hex32, "-", "")
+    hex32 = LCase$(Trim$(hex32))
+    If Len(hex32) <> 32 Then Err.Raise 1780, "TbFingerprint", "bad guid: " & TbMergeModel.AsciiMask(idText)
+    aU = HexSpan(hex32, 1, 8)
+    bU = HexSpan(hex32, 9, 4)
+    cU = HexSpan(hex32, 13, 4)
+    fU = HexSpan(hex32, 21, 2)   ' Data4[2]
+    kU = HexSpan(hex32, 31, 2)   ' Data4[7]
+    t2 = ((bU * 65536^) Or cU) And MASK32
+    t3 = ((fU * 16777216^) Or kU) And MASK32
+    res = (aU Xor t2 Xor t3) And MASK32
+    If res >= 2147483648^ Then res = res - TWO32
+    GuidHash32 = CLng(res)
+End Function
+
+' DateTime.GetHashCode port over a TbMergeModel DateKey.
+Public Function DateTicksHash(ByRef key As String) As Long
+    Dim t As LongLong
+    Dim lo As LongLong
+    Dim hi As LongLong
+    Dim res As LongLong
+    t = TbRepoModel.DateKeyToTicks(key)
+    If t < 0 Then Err.Raise 1781, "TbFingerprint", "negative ticks"
+    lo = t And MASK32
+    hi = t \ TWO32
+    res = (lo Xor hi) And MASK32
+    If res >= 2147483648^ Then res = res - TWO32
+    DateTicksHash = CLng(res)
+End Function
+
+' Full NoteRepositoryModel.GetModificationFingerprint over the TbRepoModel state
+Public Function Fingerprint() As LongLong
+    Dim r As LongLong
+    Dim i As Long
+    r = 0
+    r = CombineStep(r, GuidHash32(TbRepoModel.RootIdText))
+    r = CombineStep(r, TbRepoModel.RootRevision)
+    r = CombineStep(r, DateTicksHash(TbRepoModel.RootOrderKey))
+    For i = 0 To TbRepoModel.n_Count - 1
+        r = CombineStep(r, DateTicksHash(TbRepoModel.n_ModKey(i)))
+        If TbRepoModel.NoteHasEffectiveMeta(i) Then
+            r = CombineStep(r, DateTicksHash(TbRepoModel.n_MetaKey(i)))
+        End If
+        If TbRepoModel.n_InBin(i) Then
+            r = CombineStep(r, 1)
+        Else
+            r = CombineStep(r, 0)
+        End If
+    Next
+    For i = 0 To TbRepoModel.d_Count - 1
+        r = CombineStep(r, GuidHash32(TbRepoModel.d_Id(i)))
+    Next
+    For i = 0 To TbRepoModel.s_Count - 1
+        r = CombineStep(r, DateTicksHash(TbRepoModel.s_ModKey(i)))
+        If TbRepoModel.s_HasMaint(i) Then
+            r = CombineStep(r, DateTicksHash(TbRepoModel.s_MaintKey(i)))
+        End If
+    Next
+    Fingerprint = r
+End Function
+
+' hex substring -> unsigned value in LongLong (<= 8 digits)
+Private Function HexSpan(ByRef s As String, ByVal off As Long, ByVal cnt As Long) As LongLong
+    Dim v As LongLong
+    Dim i As Long
+    Dim d As LongLong
+    v = 0
+    For i = off To off + cnt - 1
+        d = HexDigit(Mid$(s, i, 1))
+        If d < 0 Then Err.Raise 1782, "TbFingerprint", "bad hex char"
+        v = v * 16^ + d
+    Next
+    HexSpan = v
+End Function
+
+Private Function HexDigit(ByRef ch As String) As LongLong
+    Select Case ch
+    Case "0" To "9"
+        HexDigit = CLngLng(Asc(ch)) - 48^
+    Case "a" To "f"
+        HexDigit = CLngLng(Asc(ch)) - 87^
+    Case "A" To "F"
+        HexDigit = CLngLng(Asc(ch)) - 55^
+    Case Else
+        HexDigit = -1
+    End Select
+End Function
+
+End Module

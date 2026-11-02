@@ -1,0 +1,322 @@
+Option Explicit
+
+' TbIni - hand-written INI reader/writer for the tB shell (replaces SunnyUI
+' IniUTF8Config + .NET at the shell layer).
+'
+' Fidelity contract: Load -> Save with no modifications reproduces the input
+' file byte-for-byte (BOM state, CRLF/LF endings, section order, key order,
+' comments, blank lines, trailing newlines). This is the P1 acceptance gate
+' for silentnotes_user_settings.ini / _dev.ini roundtrips.
+'
+' Value semantics follow SunnyUI IniFile (= GetPrivateProfileString):
+'   - value = text after the FIRST '=' of the line, inline ';' comment stripped,
+'     surrounding whitespace trimmed on read;
+'   - keys/sections matched case-insensitively;
+'   - no escape sequences (SunnyUI passes values raw through WritePrivateProfileString).
+'
+' Encoding: UTF-8. SunnyUI IniUTF8Config.Save actually emits a BOM (Encoding.UTF8
+' static instance), so the real files carry one; the loader preserves whatever
+' BOM state the input had. Fresh files default to BOM-less UTF-8.
+
+Class TbIni
+
+    Private m_U8 As TbUtf8
+    Private m_HadBom As Boolean
+    Private m_CrLf As Boolean          ' True = CRLF line endings, False = bare LF
+    Private m_EndsWithNewline As Boolean
+    Private m_LineCount As Long
+    Private m_Lines() As String
+    Private m_Loaded As Boolean
+
+    Private Sub Class_Initialize()
+        Set m_U8 = New TbUtf8
+    End Sub
+
+    Public Property Get IsLoaded() As Boolean
+        IsLoaded = m_Loaded
+    End Property
+
+    Public Property Get HadBom() As Boolean
+        HadBom = m_HadBom
+    End Property
+
+    Public Property Get LineCount() As Long
+        LineCount = m_LineCount
+    End Property
+
+    ' ---------------------------------------------------------------- loading
+
+    Public Function Load(path As String) As Boolean
+        On Error GoTo fail
+        Dim ba() As Byte
+        Dim f As Integer, n As Long
+
+        f = FreeFile
+        Open path For Binary Access Read As #f
+        n = LOF(f)
+        If n > 0 Then
+            ReDim ba(0 To n - 1)
+            Get #f, , ba
+        End If
+        Close #f
+
+        m_HadBom = False
+        Dim start As Long
+        start = 0
+        If n >= 3 Then
+            If ba(0) = &HEF And ba(1) = &HBB And ba(2) = &HBF Then
+                m_HadBom = True
+                start = 3
+            End If
+        End If
+
+        Dim text As String
+        If n - start > 0 Then
+            Dim body() As Byte
+            Dim i As Long
+            ReDim body(0 To n - start - 1)
+            For i = 0 To UBound(body)
+                body(i) = ba(start + i)
+            Next
+            text = m_U8.Decode(body)
+        Else
+            text = ""
+        End If
+
+        m_CrLf = (InStr(text, vbCr) > 0)
+        Dim sep As String
+        If m_CrLf Then sep = vbCrLf Else sep = vbLf
+        m_EndsWithNewline = (Len(text) >= Len(sep))
+        If m_EndsWithNewline Then m_EndsWithNewline = (Right$(text, Len(sep)) = sep)
+
+        Dim parts() As String
+        parts = Split(text, sep)
+
+        m_LineCount = UBound(parts) + 1
+        If m_EndsWithNewline Then
+            ' the final separator produced a phantom trailing empty element
+            If m_LineCount > 0 Then
+                If Len(parts(m_LineCount - 1)) = 0 Then m_LineCount = m_LineCount - 1
+            End If
+        End If
+
+        If m_LineCount > 0 Then
+            ReDim m_Lines(0 To m_LineCount - 1)
+            For i = 0 To m_LineCount - 1
+                m_Lines(i) = parts(i)
+            Next
+        Else
+            m_LineCount = 0
+        End If
+
+        m_Loaded = True
+        Load = True
+        Exit Function
+    fail:
+        m_Loaded = False
+        Load = False
+    End Function
+
+    ' ---------------------------------------------------------------- saving
+
+    Public Function Save(path As String) As Boolean
+        On Error GoTo fail
+        Dim sep As String
+        If m_CrLf Then sep = vbCrLf Else sep = vbLf
+
+        Dim text As String
+        If m_LineCount > 0 Then
+            Dim tmp() As String
+            Dim i As Long
+            ReDim tmp(0 To m_LineCount - 1)
+            For i = 0 To m_LineCount - 1
+                tmp(i) = m_Lines(i)
+            Next
+            If m_EndsWithNewline Then
+                ReDim Preserve tmp(0 To m_LineCount)
+                tmp(m_LineCount) = ""
+            End If
+            text = Join(tmp, sep)
+        ElseIf m_EndsWithNewline Then
+            text = sep
+        Else
+            text = ""
+        End If
+
+        Dim enc() As Byte
+        If Len(text) > 0 Then enc = m_U8.Encode(text)
+
+        ' FIX (backfilled from p4): the original code reused the length
+        ' variable o as a BOM-prefill cursor and reset it to 0 inside the
+        ' build block, then guarded the Put with "If o > 0" - always False
+        ' for BOM-less files -> silent 0-byte write. Track the total length
+        ' separately from the write cursor.
+        Dim out() As Byte
+        Dim totalLen As Long
+        Dim o As Long             ' write cursor inside the buffer
+        totalLen = 0
+        If m_HadBom Then totalLen = 3
+        If Len(text) > 0 Then totalLen = totalLen + (UBound(enc) + 1)
+        If totalLen > 0 Then
+            ReDim out(0 To totalLen - 1)
+            o = 0
+            If m_HadBom Then
+                out(0) = &HEF: out(1) = &HBB: out(2) = &HBF
+                o = 3
+            End If
+            For i = 0 To UBound(enc)
+                out(o + i) = enc(i)
+            Next
+        End If
+
+        If Len(Dir$(path, vbNormal)) > 0 Then Kill path
+        Dim f As Integer
+        f = FreeFile
+        Open path For Binary Access Write As #f
+        If totalLen > 0 Then Put #f, , out
+        Close #f
+        Save = True
+        Exit Function
+    fail:
+        Save = False
+    End Function
+
+    ' ---------------------------------------------------------------- accessors
+
+    ' SunnyUI/GetPrivateProfileString semantics: value after first '=', inline ';'
+    ' comment stripped, trimmed. Returns defaultValue when missing.
+    Public Function GetValue(section As String, key As String, Optional defaultValue As String = "") As String
+        GetValue = defaultValue
+        If Not m_Loaded Then Exit Function
+        Dim ki As Long
+        ki = FindKeyLine(section, key)
+        If ki >= 0 Then GetValue = ExtractValue(m_Lines(ki))
+    End Function
+
+    ' Replaces or inserts a key. Returns True when the content actually changed.
+    Public Function SetValue(section As String, key As String, value As String) As Boolean
+        SetValue = False
+        If Not m_Loaded Then Exit Function
+        Dim newLine As String
+        newLine = key & "=" & value
+
+        Dim si As Long
+        si = FindSectionStart(section)
+        If si < 0 Then
+            ' append new section at the end (blank separator line first)
+            If m_LineCount > 0 Then
+                If Len(Trim$(m_Lines(m_LineCount - 1))) > 0 Then AppendLine ""
+            End If
+            AppendLine "[" & section & "]"
+            AppendLine newLine
+            SetValue = True
+            Exit Function
+        End If
+
+        Dim ki As Long
+        ki = FindKeyLineFrom(si, key)
+        If ki >= 0 Then
+            If StrComp(m_Lines(ki), newLine, vbBinaryCompare) = 0 Then Exit Function
+            m_Lines(ki) = newLine
+            SetValue = True
+            Exit Function
+        End If
+
+        ' insert after the last existing key line of the section
+        Dim insertAt As Long, i As Long, l As String
+        insertAt = si + 1
+        For i = si + 1 To m_LineCount - 1
+            l = Trim$(m_Lines(i))
+            If Len(l) > 0 Then
+                If Left$(l, 1) = "[" Then Exit For
+                If Left$(l, 1) <> ";" And Left$(l, 1) <> "#" Then insertAt = i + 1
+            End If
+        Next
+        InsertLine insertAt, newLine
+        SetValue = True
+    End Function
+
+    Public Function HasSection(section As String) As Boolean
+        HasSection = (FindSectionStart(section) >= 0)
+    End Function
+
+    ' ---------------------------------------------------------------- internals
+
+    Private Function FindSectionStart(section As String) As Long
+        Dim i As Long
+        For i = 0 To m_LineCount - 1
+            Dim l As String
+            l = Trim$(m_Lines(i))
+            If Len(l) >= 2 Then
+                If Left$(l, 1) = "[" And Right$(l, 1) = "]" Then
+                    If StrComp(Mid$(l, 2, Len(l) - 2), section, vbTextCompare) = 0 Then
+                        FindSectionStart = i
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next
+        FindSectionStart = -1
+    End Function
+
+    Private Function FindKeyLine(section As String, key As String) As Long
+        Dim si As Long
+        si = FindSectionStart(section)
+        If si < 0 Then
+            FindKeyLine = -1
+        Else
+            FindKeyLine = FindKeyLineFrom(si, key)
+        End If
+    End Function
+
+    Private Function FindKeyLineFrom(sectionStart As Long, key As String) As Long
+        Dim i As Long
+        For i = sectionStart + 1 To m_LineCount - 1
+            Dim l As String
+            l = Trim$(m_Lines(i))
+            If Len(l) > 0 Then
+                If Left$(l, 1) = "[" Then Exit For
+                If Left$(l, 1) <> ";" And Left$(l, 1) <> "#" Then
+                    Dim p As Long
+                    p = InStr(l, "=")
+                    If p > 1 Then
+                        If StrComp(Trim$(Left$(l, p - 1)), key, vbTextCompare) = 0 Then
+                            FindKeyLineFrom = i
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+        Next
+        FindKeyLineFrom = -1
+    End Function
+
+    Private Function ExtractValue(line As String) As String
+        Dim p As Long, v As String
+        p = InStr(line, "=")
+        If p <= 0 Then Exit Function
+        v = Mid$(line, p + 1)
+        Dim c As Long
+        c = InStr(v, ";")
+        If c > 0 Then v = Left$(v, c - 1)
+        ExtractValue = Trim$(v)
+    End Function
+
+    Private Sub AppendLine(s As String)
+        ReDim Preserve m_Lines(0 To m_LineCount)
+        m_Lines(m_LineCount) = s
+        m_LineCount = m_LineCount + 1
+    End Sub
+
+    Private Sub InsertLine(ByVal at As Long, s As String)
+        If at > m_LineCount Then at = m_LineCount
+        ReDim Preserve m_Lines(0 To m_LineCount)
+        Dim i As Long
+        For i = m_LineCount To at + 1 Step -1
+            m_Lines(i) = m_Lines(i - 1)
+        Next
+        m_Lines(at) = s
+        m_LineCount = m_LineCount + 1
+    End Sub
+
+End Class

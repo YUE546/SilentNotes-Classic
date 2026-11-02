@@ -1,0 +1,145 @@
+Option Explicit
+
+[Description("Insert-link dialog: native Label/TextBox/CommandButton, modal, owner-centered")]
+[FormDesignerId("7E4C1A02-93B5-4F6D-8A21-C0D51B9F1A07")]
+[PredeclaredId]
+Class LinkDlg
+
+    ' set by MainForm before Show 1; read back after the modal returns
+    Public Confirmed As Boolean
+    Public LinkText As String
+    Public LinkUrl As String
+    ' gate automation: non-empty = auto-type the url + auto-OK on first
+    ' activate, exercising the real txtUrl/cmdOK path without a user
+    Public GateUrl As String
+
+    Private m_once As Boolean
+    Private m_ownerHwnd As Long
+
+    ' PHYSICAL-pixel sizing: the tbform Width/Height numbers are honored
+    ' as pixels by the runtime, so any twips-style value would blow the
+    ' window up to many thousands of pixels (the "full-screen white"
+    ' regression). AdjustWindowRectEx + SetWindowPos pin the true size
+    ' and center the dialog on the owner, same recipe as MainForm.
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 320      ' client, physical px
+    Private Const DlgH As Long = 168
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    Public Sub Preload(ByVal selText As String, ByVal ownerHwnd As Long)
+        Confirmed = False
+        LinkText = ""
+        LinkUrl = ""
+        m_ownerHwnd = ownerHwnd
+        txtText.Text = selText
+        txtUrl.Text = ""
+    End Sub
+
+    Private Sub Form_Load()
+        Me.Caption = SInsLink()
+        lblText.Caption = STextLbl()
+        lblUrl.Caption = "URL" & ChrW$(&HFF1A&)
+        cmdOK.Caption = SOkBtn()
+        cmdCancel.Caption = SCancelBtn()
+        m_once = False
+        SnapCenter
+        ' tbform control geometry is DPI-scaled by the runtime (x1.25 here),
+        ' which overflows the pinned 320x168 client - layout every control
+        ' in physical pixels instead, same as MainForm's LayoutAll
+        lblText.Move 12, 19, 64, 20
+        txtText.Move 84, 15, 224, 28
+        lblUrl.Move 12, 59, 64, 20
+        txtUrl.Move 84, 55, 224, 28
+        cmdOK.Move 132, 112, 88, 28
+        cmdCancel.Move 226, 112, 88, 28
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    Private Sub Form_Activate()
+        If m_once Then Exit Sub
+        m_once = True
+        If Len(GateUrl) > 0 Then
+            txtUrl.Text = GateUrl
+            GateUrl = ""
+            cmdOK_Click
+        Else
+            txtUrl.SetFocus
+        End If
+    End Sub
+
+    ' Default/Cancel button properties are dropped by the minimal tbform
+    ' blocks, so Enter/Esc route explicitly (KeyPreview=true)
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 13 Then
+            KeyCode = 0
+            cmdOK_Click
+        ElseIf KeyCode = 27 Then
+            KeyCode = 0
+            cmdCancel_Click
+        End If
+    End Sub
+
+    Private Sub cmdOK_Click()
+        LinkText = Trim$(txtText.Text)
+        LinkUrl = Trim$(txtUrl.Text)
+        Confirmed = True
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCancel_Click()
+        Confirmed = False
+        Me.Hide
+    End Sub
+
+    Private Function SInsLink() As String      ' "插入链接"
+        SInsLink = ChrW$(&H63D2&) & ChrW$(&H5165&) & ChrW$(&H94FE&) & ChrW$(&H63A5&)
+    End Function
+
+    Private Function STextLbl() As String      ' "文本："
+        STextLbl = ChrW$(&H6587&) & ChrW$(&H672C&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SOkBtn() As String        ' "确定"
+        SOkBtn = ChrW$(&H786E&) & ChrW$(&H5B9A&)
+    End Function
+
+    Private Function SCancelBtn() As String    ' "取消"
+        SCancelBtn = ChrW$(&H53D6&) & ChrW$(&H6D88&)
+    End Function
+End Class

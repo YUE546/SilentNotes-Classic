@@ -1,0 +1,1161 @@
+Option Explicit
+
+' TbMergeModel - pure twinBASIC port of SilentNotes.Workers.NoteRepositoryMerger
+' (C#, 322 lines, frozen reference: src/SilentNotes.AllPlatforms/Workers/).
+' Line-by-line port of Merge / BuildMergedListOfDeletedNotes /
+' BuildListOfLivingNotes / BuildMergedListOfNotes / BuildMergedListOfSafes /
+' OuterJoin / AddAdjacentSingles / ChooseLastModified / BringPinnedToTop.
+'
+' Representation: repositories are harvested from TbRepoXml's order-preserving
+' raw-value tree into typed summaries (id / modified_at / nullable
+' meta_modified_at / in_recycling_bin / note_pinned / created_at / safe_id for
+' notes; id / deleted_at for deleted_notes; id / modified_at / nullable
+' maintained_at for safes), each keeping the ORIGINAL subtree text (Raw) so
+' the merged output replays the winner's bytes verbatim (entities intact).
+'
+' twinBASIC portability note: UDT array-element WHOLE-VALUE assignment
+' (arrA(i) = arrB(j)) fails to compile (TB5030), so every merge view is
+' expressed as (side, index) accessors instead of copied UDTs. Algorithm
+' structure still mirrors the C# line by line.
+'
+' Nullable semantics aligned with the C# model:
+'  - NoteModel.MetaModifiedAt getter nulls any value <= ModifiedAt (side
+'    effect in the C# getter) -> applied at harvest time.
+'  - SafeModel.MaintainedAtSerializeableSpecified only serializes
+'    maintained_at > modified_at -> applied at harvest time.
+'  - Nullable.Compare: both null = equal, null < has-value.
+'  - Missing date attributes deserialize as default(DateTime) = 0001-01-01.
+'
+' Date comparison: ISO-8601 UTC strings are normalized by DateKey() into a
+' fixed-width "yyyyMMddHHmmss.fffffff" key (fraction zero-padded to 7 digits
+' = 100ns ticks resolution), so "....5Z" and "....5000000Z" compare EQUAL and
+' plain binary string order == chronologic order.
+'
+' Guid comparison: equality via canonical lowercase strings (OuterJoin keys,
+' ContainsById); ordering (deleted-notes sort) mirrors .NET Guid.CompareTo:
+' Data1/Data2/Data3 signed numeric, Data4 unsigned byte order.
+
+Module TbMergeModel
+
+Public Const MAX_ITEMS As Long = 1024
+Public Const MAX_JOIN As Long = 4096
+Public Const EPOCH_KEY As String = "00010101000000.0000000"
+Public Const SIDE_LOCAL As Long = 0
+Public Const SIDE_REMOTE As Long = 1
+
+Public Type TbNoteRef
+    Id As String
+    ModKey As String
+    HasMeta As Boolean
+    MetaKey As String
+    InBin As Boolean
+    Pinned As Boolean
+    CreatedKey As String
+    HasSafe As Boolean
+    SafeId As String
+    Raw As String
+End Type
+
+Public Type TbDelRef
+    Id As String
+    DelKey As String     ' normalized deleted_at (EPOCH_KEY when attribute absent)
+    AtRaw As String      ' raw deleted_at attribute value (escaped form as in file)
+    IdText As String     ' raw XmlText of the element (escaped form)
+End Type
+
+Public Type TbSafeRef
+    Id As String
+    ModKey As String
+    HasMaint As Boolean
+    MaintKey As String
+    Raw As String
+End Type
+
+Public Type TbJoinPair
+    li As Long           ' index into left key array, -1 = only right side
+    ri As Long           ' index into right key array, -1 = only left side
+End Type
+
+' ---- harvested summaries (both sides resident at merge time) ----
+' Dynamic arrays (ReDim'd in EnsureBuffers) because they are passed to
+' "arr() As T" parameters.
+Public LocalNotes() As TbNoteRef
+Public LocalNoteCount As Long
+Public LocalDels() As TbDelRef
+Public LocalDelCount As Long
+Public LocalSafes() As TbSafeRef
+Public LocalSafeCount As Long
+Public LocalRootId As String
+Public LocalOrderKey As String
+Public LocalOrderRaw As String
+
+Public RemoteNotes() As TbNoteRef
+Public RemoteNoteCount As Long
+Public RemoteDels() As TbDelRef
+Public RemoteDelCount As Long
+Public RemoteSafes() As TbSafeRef
+Public RemoteSafeCount As Long
+Public RemoteRootId As String
+Public RemoteOrderKey As String
+Public RemoteOrderRaw As String
+
+' ---- merge output ----
+' notes/safes: (side, index) pairs pointing back at the winning summary
+Public OutNBase(0 To MAX_ITEMS - 1) As Long
+Public OutNIdx(0 To MAX_ITEMS - 1) As Long
+Public OutNCount As Long
+Public OutSBase(0 To MAX_ITEMS - 1) As Long
+Public OutSIdx(0 To MAX_ITEMS - 1) As Long
+Public OutSCount As Long
+' deleted notes: side/index plus EFFECTIVE deleted_at (max-merge may override)
+Public OutDBase() As Long
+Public OutDIdx() As Long
+Public OutDKey() As String
+Public OutDAtRaw() As String
+Public OutDCount As Long
+Public OutRootId As String
+Public OutOrderRaw As String
+
+' deleted-notes sort order (sorted indices into the OutD parallel arrays)
+Private SortOrder() As Long
+
+Private JoinPairs() As TbJoinPair
+Private JoinPairCount As Long
+Private JoinL() As String
+Private JoinR() As String
+
+' Idempotent buffer allocation (call before each pair's harvest/merge)
+Public Sub EnsureBuffers()
+    ReDim LocalNotes(0 To MAX_ITEMS - 1)
+    ReDim LocalDels(0 To MAX_ITEMS - 1)
+    ReDim LocalSafes(0 To MAX_ITEMS - 1)
+    ReDim RemoteNotes(0 To MAX_ITEMS - 1)
+    ReDim RemoteDels(0 To MAX_ITEMS - 1)
+    ReDim RemoteSafes(0 To MAX_ITEMS - 1)
+    ReDim OutDBase(0 To MAX_ITEMS - 1)
+    ReDim OutDIdx(0 To MAX_ITEMS - 1)
+    ReDim OutDKey(0 To MAX_ITEMS - 1)
+    ReDim OutDAtRaw(0 To MAX_ITEMS - 1)
+    ReDim SortOrder(0 To MAX_ITEMS - 1)
+    ReDim JoinPairs(0 To MAX_JOIN - 1)
+    ReDim JoinL(0 To MAX_JOIN - 1)
+    ReDim JoinR(0 To MAX_JOIN - 1)
+End Sub
+
+' ============================================================
+' date / guid primitives
+' ============================================================
+
+' Normalizes an ISO-8601 UTC date string (as XmlSerializer writes it:
+' yyyy-MM-ddTHH:mm:ss[.1-7 digits]Z) into fixed-width key
+' "yyyyMMddHHmmss.fffffff" so binary string order == chronologic order and
+' "...5Z" == "...5000000Z". Empty string maps to default(DateTime)
+' (0001-01-01T00:00:00). Raises on malformed input (never silently reorders).
+Public Function DateKey(ByRef raw As String) As String
+    Dim n As Long
+    Dim frac As String
+    Dim i As Long, w As Long
+    Dim ch As String
+    n = Len(raw)
+    If n = 0 Then
+        DateKey = EPOCH_KEY
+        Exit Function
+    End If
+    ' shortest legal form is 20 chars: yyyy-MM-ddTHH:mm:ssZ (Z at pos 20)
+    If n < 20 Then GoTo Bad
+    If Mid$(raw, 5, 1) <> "-" Then GoTo Bad
+    If Mid$(raw, 8, 1) <> "-" Then GoTo Bad
+    If Mid$(raw, 11, 1) <> "T" Then GoTo Bad
+    If Mid$(raw, 14, 1) <> ":" Then GoTo Bad
+    If Mid$(raw, 17, 1) <> ":" Then GoTo Bad
+    If Not DigitsAt(raw, 1, 4) Then GoTo Bad
+    If Not DigitsAt(raw, 6, 2) Then GoTo Bad
+    If Not DigitsAt(raw, 9, 2) Then GoTo Bad
+    If Not DigitsAt(raw, 12, 2) Then GoTo Bad
+    If Not DigitsAt(raw, 15, 2) Then GoTo Bad
+    If Not DigitsAt(raw, 18, 2) Then GoTo Bad
+    frac = "0000000"
+    If n > 20 Then
+        If Mid$(raw, 20, 1) <> "." Then GoTo Bad
+        i = 21
+        w = 0
+        Do While i <= n
+            ch = Mid$(raw, i, 1)
+            If ch = "Z" Then Exit Do
+            If ch < "0" Or ch > "9" Then GoTo Bad
+            If w < 7 Then
+                w = w + 1
+                Mid$(frac, w, 1) = ch
+            End If
+            i = i + 1
+        Loop
+        If i <= n Then
+            If Mid$(raw, i, 1) <> "Z" Then GoTo Bad
+        End If
+    Else
+        If Mid$(raw, 20, 1) <> "Z" Then GoTo Bad
+    End If
+    DateKey = Mid$(raw, 1, 4) & Mid$(raw, 6, 2) & Mid$(raw, 9, 2) & Mid$(raw, 12, 2) & Mid$(raw, 15, 2) & Mid$(raw, 18, 2) & "." & frac
+    Exit Function
+Bad:
+    Err.Raise 1650, "TbMergeModel", "malformed ISO date: [" & AsciiMask(raw) & "]"
+End Function
+
+Private Function DigitsAt(ByRef s As String, ByVal off As Long, ByVal cnt As Long) As Boolean
+    Dim i As Long
+    Dim ch As String
+    DigitsAt = False
+    For i = off To off + cnt - 1
+        ch = Mid$(s, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Function
+    Next
+    DigitsAt = True
+End Function
+
+' ASCII mask for error messages (report files are ANSI)
+Public Function AsciiMask(ByRef s As String) As String
+    Dim res As String
+    Dim i As Long, n As Long, code As Long
+    n = Len(s)
+    If n > 60 Then n = 60
+    res = Space$(n)
+    For i = 1 To n
+        code = AscW(Mid$(s, i, 1))
+        If code < 0 Then code = code + 65536
+        If code >= 32 And code <= 126 Then
+            Mid$(res, i, 1) = Chr$(code)
+        Else
+            Mid$(res, i, 1) = "?"
+        End If
+    Next
+    AsciiMask = res
+End Function
+
+' Canonicalizes a guid attribute/text for EQUALITY comparison (OuterJoin
+' keys, ContainsById, FindById). C# Guid equality is byte equality; lowercase
+' canonical text comparison is equivalent for "d"-format input.
+Public Function GuidEq(ByRef raw As String) As String
+    GuidEq = LCase$(Trim$(raw))
+End Function
+
+' Guid ordering for the deleted-notes sort. EMPIRICALLY VERIFIED against the
+' runtime hosting the Core oracle (64-bit PowerShell 5.1 / .NET Framework
+' 4.8, which also runs SilentNotes.Core.dll): Guid.CompareTo compares the
+' lowercase "d"-format text lexicographically - Data1/Data2/Data3 all compare
+' UNSIGNED ("ffffffff..." > "00000001...", "8000" > "7fff"), exactly the hex
+' string order. Inputs are LCase-normalized canonical "d" strings, so plain
+' binary string comparison is the faithful port.
+Public Function CmpGuid(ByRef a As String, ByRef b As String) As Long
+    If a < b Then
+        CmpGuid = -1
+    ElseIf a > b Then
+        CmpGuid = 1
+    Else
+        CmpGuid = 0
+    End If
+End Function
+
+' ============================================================
+' harvest (typed accessors over the raw-value tree)
+' ============================================================
+
+Private Function FirstElemChild(ByVal el As Long) As Long
+    Dim c As Long
+    c = TbRepoXml.m_Nodes(el).NChild1
+    Do While c <> 0
+        If TbRepoXml.m_Nodes(c).NKind = TbRepoXml.NKELEMENT Then
+            FirstElemChild = c
+            Exit Function
+        End If
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+    FirstElemChild = 0
+End Function
+
+Private Function NextElemSibling(ByVal c As Long) As Long
+    Dim n As Long
+    n = TbRepoXml.m_Nodes(c).NNext
+    Do While n <> 0
+        If TbRepoXml.m_Nodes(n).NKind = TbRepoXml.NKELEMENT Then
+            NextElemSibling = n
+            Exit Function
+        End If
+        n = TbRepoXml.m_Nodes(n).NNext
+    Loop
+    NextElemSibling = 0
+End Function
+
+Private Function GetAttr(ByVal el As Long, ByRef nm As String, ByRef val As String) As Boolean
+    Dim i As Long
+    GetAttr = False
+    For i = TbRepoXml.m_Nodes(el).NAttr1 To TbRepoXml.m_Nodes(el).NAttrN
+        If TbRepoXml.m_Attrs(i).AName = nm Then
+            val = TbXmlLite.Unescape(TbRepoXml.m_Attrs(i).AValue)
+            GetAttr = True
+            Exit Function
+        End If
+    Next
+End Function
+
+' concatenated raw text child nodes (escaped form)
+Private Function ElemTextRaw(ByVal el As Long) As String
+    Dim c As Long
+    Dim res As String
+    c = TbRepoXml.m_Nodes(el).NChild1
+    Do While c <> 0
+        If TbRepoXml.m_Nodes(c).NKind = TbRepoXml.NKTEXT Then res = res & TbRepoXml.m_Nodes(c).NText
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+    ElemTextRaw = res
+End Function
+
+Private Function BoolAttr(ByRef v As String) As Boolean
+    ' XmlSerializer writes lowercase true/false; anything else deserializes
+    ' as false for our purposes (strict, never guesses)
+    If v = "true" Then BoolAttr = True
+End Function
+
+' original (escaped) attribute value, needed for verbatim output embedding
+Private Function RawAttrOf(ByVal el As Long, ByRef nm As String) As String
+    Dim i As Long
+    For i = TbRepoXml.m_Nodes(el).NAttr1 To TbRepoXml.m_Nodes(el).NAttrN
+        If TbRepoXml.m_Attrs(i).AName = nm Then
+            RawAttrOf = TbRepoXml.m_Attrs(i).AValue
+            Exit Function
+        End If
+    Next
+End Function
+
+' Harvest the parsed tree (TbRepoXml state) into one side's summaries.
+Public Sub ExtractInto(ByVal isLocal As Boolean)
+    Dim root As Long
+    Dim c As Long
+    Dim nm As String
+    Dim v As String
+    root = FirstElemChild(0)
+    If root = 0 Then Err.Raise 1610, "TbMergeModel", "no root element"
+    If TbRepoXml.m_Nodes(root).NName <> "silentnotes" Then
+        Err.Raise 1611, "TbMergeModel", "unexpected root <" & AsciiMask(TbRepoXml.m_Nodes(root).NName) & ">"
+    End If
+    If isLocal Then
+        If Not GetAttr(root, "id", v) Then Err.Raise 1612, "TbMergeModel", "root id missing (local)"
+        LocalRootId = GuidEq(v)
+        If GetAttr(root, "order_modified_at", v) Then
+            LocalOrderRaw = TbXmlLite.Unescape(RawAttrOf(root, "order_modified_at"))
+            LocalOrderKey = DateKey(v)
+        Else
+            Err.Raise 1613, "TbMergeModel", "root order_modified_at missing (local)"
+        End If
+        LocalNoteCount = 0
+        LocalDelCount = 0
+        LocalSafeCount = 0
+    Else
+        If Not GetAttr(root, "id", v) Then Err.Raise 1612, "TbMergeModel", "root id missing (remote)"
+        RemoteRootId = GuidEq(v)
+        If GetAttr(root, "order_modified_at", v) Then
+            RemoteOrderRaw = TbXmlLite.Unescape(RawAttrOf(root, "order_modified_at"))
+            RemoteOrderKey = DateKey(v)
+        Else
+            Err.Raise 1613, "TbMergeModel", "root order_modified_at missing (remote)"
+        End If
+        RemoteNoteCount = 0
+        RemoteDelCount = 0
+        RemoteSafeCount = 0
+    End If
+    c = FirstElemChild(root)
+    Do While c <> 0
+        nm = TbRepoXml.m_Nodes(c).NName
+        Select Case nm
+        Case "notes"
+            HarvestNotes c, isLocal
+        Case "deleted_notes"
+            HarvestDels c, isLocal
+        Case "safes"
+            HarvestSafes c, isLocal
+        Case Else
+            ' ignore anything else (XmlSerializer never emits it here)
+        End Select
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestNotes(ByVal parent As Long, ByVal isLocal As Boolean)
+    Dim c As Long
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        If isLocal Then
+            HarvestNote c, LocalNotes, LocalNoteCount
+        Else
+            HarvestNote c, RemoteNotes, RemoteNoteCount
+        End If
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestNote(ByVal el As Long, refs() As TbNoteRef, ByRef cnt As Long)
+    Dim v As String
+    Dim cc As Long
+    Dim nm As String
+    If cnt > MAX_ITEMS - 1 Then Err.Raise 1620, "TbMergeModel", "note capacity exceeded"
+    refs(cnt).Raw = TbXmlLite.NodeToText(el)
+    If Not GetAttr(el, "id", v) Then Err.Raise 1621, "TbMergeModel", "note id missing"
+    refs(cnt).Id = GuidEq(v)
+    If GetAttr(el, "modified_at", v) Then
+        refs(cnt).ModKey = DateKey(v)
+    Else
+        refs(cnt).ModKey = EPOCH_KEY
+    End If
+    ' NoteModel.MetaModifiedAt getter: value <= ModifiedAt is nulled
+    refs(cnt).HasMeta = False
+    refs(cnt).MetaKey = ""
+    If GetAttr(el, "meta_modified_at", v) Then
+        refs(cnt).HasMeta = True
+        refs(cnt).MetaKey = DateKey(v)
+        If refs(cnt).MetaKey <= refs(cnt).ModKey Then
+            refs(cnt).HasMeta = False
+            refs(cnt).MetaKey = ""
+        End If
+    End If
+    If GetAttr(el, "in_recycling_bin", v) Then refs(cnt).InBin = BoolAttr(v) Else refs(cnt).InBin = False
+    If GetAttr(el, "note_pinned", v) Then refs(cnt).Pinned = BoolAttr(v) Else refs(cnt).Pinned = False
+    If GetAttr(el, "created_at", v) Then
+        refs(cnt).CreatedKey = DateKey(v)
+    Else
+        refs(cnt).CreatedKey = EPOCH_KEY
+    End If
+    refs(cnt).HasSafe = False
+    refs(cnt).SafeId = ""
+    cc = FirstElemChild(el)
+    Do While cc <> 0
+        nm = TbRepoXml.m_Nodes(cc).NName
+        If nm = "safe" Then
+            refs(cnt).SafeId = GuidEq(ElemTextRaw(cc))
+            refs(cnt).HasSafe = True
+        End If
+        cc = NextElemSibling(cc)
+    Loop
+    cnt = cnt + 1
+End Sub
+
+Private Sub HarvestDels(ByVal parent As Long, ByVal isLocal As Boolean)
+    Dim c As Long
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        If isLocal Then
+            HarvestDel c, LocalDels, LocalDelCount
+        Else
+            HarvestDel c, RemoteDels, RemoteDelCount
+        End If
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestDel(ByVal el As Long, refs() As TbDelRef, ByRef cnt As Long)
+    Dim v As String
+    If cnt > MAX_ITEMS - 1 Then Err.Raise 1630, "TbMergeModel", "deleted capacity exceeded"
+    refs(cnt).IdText = ElemTextRaw(el)
+    refs(cnt).Id = GuidEq(ElemTextRaw(el))
+    If GetAttr(el, "deleted_at", v) Then
+        refs(cnt).DelKey = DateKey(v)
+        refs(cnt).AtRaw = RawAttrOf(el, "deleted_at")
+    Else
+        refs(cnt).DelKey = EPOCH_KEY
+        refs(cnt).AtRaw = ""
+    End If
+    cnt = cnt + 1
+End Sub
+
+Private Sub HarvestSafes(ByVal parent As Long, ByVal isLocal As Boolean)
+    Dim c As Long
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        If isLocal Then
+            HarvestSafe c, LocalSafes, LocalSafeCount
+        Else
+            HarvestSafe c, RemoteSafes, RemoteSafeCount
+        End If
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestSafe(ByVal el As Long, refs() As TbSafeRef, ByRef cnt As Long)
+    Dim v As String
+    If cnt > MAX_ITEMS - 1 Then Err.Raise 1640, "TbMergeModel", "safe capacity exceeded"
+    refs(cnt).Raw = TbXmlLite.NodeToText(el)
+    If Not GetAttr(el, "id", v) Then Err.Raise 1641, "TbMergeModel", "safe id missing"
+    refs(cnt).Id = GuidEq(v)
+    If GetAttr(el, "modified_at", v) Then
+        refs(cnt).ModKey = DateKey(v)
+    Else
+        refs(cnt).ModKey = EPOCH_KEY
+    End If
+    ' SafeModel.MaintainedAtSerializeableSpecified: only serialized when
+    ' MaintainedAt != null && MaintainedAt > ModifiedAt -> treat <= as absent
+    refs(cnt).HasMaint = False
+    refs(cnt).MaintKey = ""
+    If GetAttr(el, "maintained_at", v) Then
+        refs(cnt).HasMaint = True
+        refs(cnt).MaintKey = DateKey(v)
+        If refs(cnt).MaintKey <= refs(cnt).ModKey Then
+            refs(cnt).HasMaint = False
+            refs(cnt).MaintKey = ""
+        End If
+    End If
+    cnt = cnt + 1
+End Sub
+
+' ============================================================
+' (side, index) typed accessors used by the merge algorithm
+' ============================================================
+
+Private Function NoteIdAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        NoteIdAt = LocalNotes(idx).Id
+    Else
+        NoteIdAt = RemoteNotes(idx).Id
+    End If
+End Function
+
+Private Function NoteModKeyAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        NoteModKeyAt = LocalNotes(idx).ModKey
+    Else
+        NoteModKeyAt = RemoteNotes(idx).ModKey
+    End If
+End Function
+
+Private Function NoteHasMetaAt(ByVal side As Long, ByVal idx As Long) As Boolean
+    If side = SIDE_LOCAL Then
+        NoteHasMetaAt = LocalNotes(idx).HasMeta
+    Else
+        NoteHasMetaAt = RemoteNotes(idx).HasMeta
+    End If
+End Function
+
+Private Function NoteMetaKeyAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        NoteMetaKeyAt = LocalNotes(idx).MetaKey
+    Else
+        NoteMetaKeyAt = RemoteNotes(idx).MetaKey
+    End If
+End Function
+
+Private Function NotePinnedAt(ByVal side As Long, ByVal idx As Long) As Boolean
+    If side = SIDE_LOCAL Then
+        NotePinnedAt = LocalNotes(idx).Pinned
+    Else
+        NotePinnedAt = RemoteNotes(idx).Pinned
+    End If
+End Function
+
+Private Function NoteCreatedKeyAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        NoteCreatedKeyAt = LocalNotes(idx).CreatedKey
+    Else
+        NoteCreatedKeyAt = RemoteNotes(idx).CreatedKey
+    End If
+End Function
+
+Private Function NoteHasSafeAt(ByVal side As Long, ByVal idx As Long) As Boolean
+    If side = SIDE_LOCAL Then
+        NoteHasSafeAt = LocalNotes(idx).HasSafe
+    Else
+        NoteHasSafeAt = RemoteNotes(idx).HasSafe
+    End If
+End Function
+
+Private Function NoteSafeIdAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        NoteSafeIdAt = LocalNotes(idx).SafeId
+    Else
+        NoteSafeIdAt = RemoteNotes(idx).SafeId
+    End If
+End Function
+
+Private Function NoteCountAt(ByVal side As Long) As Long
+    If side = SIDE_LOCAL Then
+        NoteCountAt = LocalNoteCount
+    Else
+        NoteCountAt = RemoteNoteCount
+    End If
+End Function
+
+Private Function DelIdAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        DelIdAt = LocalDels(idx).Id
+    Else
+        DelIdAt = RemoteDels(idx).Id
+    End If
+End Function
+
+Private Function DelKeyAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        DelKeyAt = LocalDels(idx).DelKey
+    Else
+        DelKeyAt = RemoteDels(idx).DelKey
+    End If
+End Function
+
+Private Function DelAtRawAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        DelAtRawAt = LocalDels(idx).AtRaw
+    Else
+        DelAtRawAt = RemoteDels(idx).AtRaw
+    End If
+End Function
+
+Private Function DelIdTextAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        DelIdTextAt = LocalDels(idx).IdText
+    Else
+        DelIdTextAt = RemoteDels(idx).IdText
+    End If
+End Function
+
+Private Function SafeIdAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        SafeIdAt = LocalSafes(idx).Id
+    Else
+        SafeIdAt = RemoteSafes(idx).Id
+    End If
+End Function
+
+Private Function SafeModKeyAt(ByVal side As Long, ByVal idx As Long) As String
+    If side = SIDE_LOCAL Then
+        SafeModKeyAt = LocalSafes(idx).ModKey
+    Else
+        SafeModKeyAt = RemoteSafes(idx).ModKey
+    End If
+End Function
+
+Private Function SafeCountAt(ByVal side As Long) As Long
+    If side = SIDE_LOCAL Then
+        SafeCountAt = LocalSafeCount
+    Else
+        SafeCountAt = RemoteSafeCount
+    End If
+End Function
+
+' ============================================================
+' comparison helpers (ChooseLastModified semantics)
+' ============================================================
+
+' Nullable.Compare port for note meta keys: both null = 0, null < value
+Private Function CmpMetaAt(ByVal aSide As Long, ByVal aIdx As Long, ByVal bSide As Long, ByVal bIdx As Long) As Long
+    Dim aHas As Boolean, bHas As Boolean
+    Dim aKey As String, bKey As String
+    aHas = NoteHasMetaAt(aSide, aIdx)
+    bHas = NoteHasMetaAt(bSide, bIdx)
+    If (Not aHas) And (Not bHas) Then
+        CmpMetaAt = 0
+    ElseIf Not aHas Then
+        CmpMetaAt = -1
+    ElseIf Not bHas Then
+        CmpMetaAt = 1
+    Else
+        aKey = NoteMetaKeyAt(aSide, aIdx)
+        bKey = NoteMetaKeyAt(bSide, bIdx)
+        If aKey < bKey Then
+            CmpMetaAt = -1
+        ElseIf aKey > bKey Then
+            CmpMetaAt = 1
+        Else
+            CmpMetaAt = 0
+        End If
+    End If
+End Function
+
+' ChooseLastModified note variant (modifiedAt selector + metaModifiedAt
+' selector): >= 0 keeps item1 - ties are won by the LEFT side.
+' Returns 1 = left wins, 2 = right wins.
+Public Function ChooseNoteAt(ByVal aSide As Long, ByVal aIdx As Long, ByVal bSide As Long, ByVal bIdx As Long) As Long
+    Dim aKey As String, bKey As String
+    Dim c As Long
+    aKey = NoteModKeyAt(aSide, aIdx)
+    bKey = NoteModKeyAt(bSide, bIdx)
+    If aKey < bKey Then
+        c = -1
+    ElseIf aKey > bKey Then
+        c = 1
+    Else
+        c = 0
+    End If
+    If c = 0 Then c = CmpMetaAt(aSide, aIdx, bSide, bIdx)
+    If c >= 0 Then ChooseNoteAt = 1 Else ChooseNoteAt = 2
+End Function
+
+' ChooseLastModified safe variant (metaModifiedAtSelector = null)
+Public Function ChooseSafeAt(ByVal aSide As Long, ByVal aIdx As Long, ByVal bSide As Long, ByVal bIdx As Long) As Long
+    Dim aKey As String, bKey As String
+    Dim c As Long
+    aKey = SafeModKeyAt(aSide, aIdx)
+    bKey = SafeModKeyAt(bSide, bIdx)
+    If aKey < bKey Then
+        c = -1
+    ElseIf aKey > bKey Then
+        c = 1
+    Else
+        c = 0
+    End If
+    If c >= 0 Then ChooseSafeAt = 1 Else ChooseSafeAt = 2
+End Function
+
+Private Function FindNoteIdAt(ByVal side As Long, ByRef id As String) As Long
+    Dim i As Long
+    Dim cnt As Long
+    cnt = NoteCountAt(side)
+    For i = 0 To cnt - 1
+        If NoteIdAt(side, i) = id Then
+            FindNoteIdAt = i
+            Exit Function
+        End If
+    Next
+    FindNoteIdAt = -1
+End Function
+
+Private Function FindKey(keys() As String, ByVal cnt As Long, ByRef id As String) As Long
+    Dim i As Long
+    For i = 0 To cnt - 1
+        If keys(i) = id Then
+            FindKey = i
+            Exit Function
+        End If
+    Next
+    FindKey = -1
+End Function
+
+' ============================================================
+' OuterJoin + AddAdjacentSingles (line-by-line port)
+' ============================================================
+
+' Builds pairs between left and right id lists preserving order, left side
+' has precedence. Equivalent of the C# generic OuterJoin with
+' Dictionary<TKey,int> leftKeyToPos/rightKeyToPos: ids are unique (a
+' duplicate would make C# Dictionary.Add throw; here FindKey returns the
+' first match), so first-match linear lookup is behaviorally identical.
+Private Sub OuterJoin(ByVal leftCount As Long, ByVal rightCount As Long)
+    Dim leftPos As Long
+    Dim rightPos As Long
+    JoinPairCount = 0
+    leftPos = 0
+    rightPos = 0
+    AddAdjacentSingles leftPos, True, leftCount, rightCount
+    AddAdjacentSingles rightPos, False, leftCount, rightCount
+    Do While leftPos < leftCount
+        rightPos = FindKey(JoinR, rightCount, JoinL(leftPos))
+        If rightPos < 0 Then Err.Raise 1652, "TbMergeModel", "outer join: right key missing"
+        JoinPairs(JoinPairCount).li = leftPos
+        JoinPairs(JoinPairCount).ri = rightPos
+        JoinPairCount = JoinPairCount + 1
+        leftPos = leftPos + 1
+        rightPos = rightPos + 1
+        AddAdjacentSingles leftPos, True, leftCount, rightCount
+        AddAdjacentSingles rightPos, False, leftCount, rightCount
+    Loop
+End Sub
+
+Private Sub AddAdjacentSingles(ByRef pos As Long, ByVal fromLeftSide As Boolean, ByVal leftCount As Long, ByVal rightCount As Long)
+    Dim isSingle As Boolean
+    Dim cnt As Long
+    Dim key As String
+    Dim partner As Long
+    isSingle = True
+    If fromLeftSide Then cnt = leftCount Else cnt = rightCount
+    Do While isSingle And (pos < cnt)
+        If fromLeftSide Then
+            key = JoinL(pos)
+            partner = FindKey(JoinR, rightCount, key)
+        Else
+            key = JoinR(pos)
+            partner = FindKey(JoinL, leftCount, key)
+        End If
+        isSingle = (partner < 0)
+        If isSingle Then
+            If JoinPairCount > MAX_JOIN - 1 Then Err.Raise 1653, "TbMergeModel", "join pair capacity exceeded"
+            If fromLeftSide Then
+                JoinPairs(JoinPairCount).li = pos
+                JoinPairs(JoinPairCount).ri = -1
+            Else
+                JoinPairs(JoinPairCount).li = -1
+                JoinPairs(JoinPairCount).ri = pos
+            End If
+            JoinPairCount = JoinPairCount + 1
+            pos = pos + 1
+        End If
+    Loop
+End Sub
+
+' ============================================================
+' deleted notes merge (BuildMergedListOfDeletedNotes)
+' ============================================================
+
+Private Sub PushOutDel(ByVal side As Long, ByVal idx As Long)
+    If OutDCount > MAX_ITEMS - 1 Then Err.Raise 1654, "TbMergeModel", "deleted output capacity exceeded"
+    OutDBase(OutDCount) = side
+    OutDIdx(OutDCount) = idx
+    OutDKey(OutDCount) = DelKeyAt(side, idx)
+    OutDAtRaw(OutDCount) = DelAtRawAt(side, idx)
+    OutDCount = OutDCount + 1
+End Sub
+
+Private Function FindOutDelById(ByRef id As String) As Long
+    Dim i As Long
+    For i = 0 To OutDCount - 1
+        If DelIdAt(OutDBase(i), OutDIdx(i)) = id Then
+            FindOutDelById = i
+            Exit Function
+        End If
+    Next
+    FindOutDelById = -1
+End Function
+
+Private Sub MergeDels()
+    Dim i As Long, j As Long
+    ' Add ids from remote repository (clones in C#)
+    OutDCount = 0
+    For i = 0 To RemoteDelCount - 1
+        PushOutDel SIDE_REMOTE, i
+    Next
+    For i = 0 To LocalDelCount - 1
+        j = FindOutDelById(LocalDels(i).Id)
+        If j >= 0 Then
+            ' Take the more current deletion date
+            If LocalDels(i).DelKey > OutDKey(j) Then
+                OutDKey(j) = LocalDels(i).DelKey
+                OutDAtRaw(j) = LocalDels(i).AtRaw
+            End If
+        Else
+            ' Local-only deletion survives only when the note exists in the
+            ' remote repository (otherwise created+deleted locally: ignore)
+            If FindNoteIdAt(SIDE_REMOTE, LocalDels(i).Id) >= 0 Then
+                PushOutDel SIDE_LOCAL, i
+            End If
+        End If
+    Next
+    SortOutDels
+End Sub
+
+' Insertion sort by Id via the Guid.CompareTo port. Physically permutes the
+' OutD parallel arrays (scalar String/Long swaps only - no UDT copies).
+Private Sub SortOutDels()
+    Dim i As Long, j As Long
+    Dim tSide As Long, tIdx As Long
+    Dim tKey As String, tRaw As String
+    For i = 1 To OutDCount - 1
+        tSide = OutDBase(i)
+        tIdx = OutDIdx(i)
+        tKey = OutDKey(i)
+        tRaw = OutDAtRaw(i)
+        j = i - 1
+        Do While j >= 0
+            If CmpGuid(DelIdAt(OutDBase(j), OutDIdx(j)), DelIdAt(tSide, tIdx)) > 0 Then
+                OutDBase(j + 1) = OutDBase(j)
+                OutDIdx(j + 1) = OutDIdx(j)
+                OutDKey(j + 1) = OutDKey(j)
+                OutDAtRaw(j + 1) = OutDAtRaw(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        OutDBase(j + 1) = tSide
+        OutDIdx(j + 1) = tIdx
+        OutDKey(j + 1) = tKey
+        OutDAtRaw(j + 1) = tRaw
+    Next
+End Sub
+
+' Binary search in the id-sorted deleted list (C# List.BinarySearch)
+Private Function BSearchDel(ByRef id As String) As Long
+    Dim lo As Long, hi As Long, m As Long, c As Long
+    lo = 0
+    hi = OutDCount - 1
+    Do While lo <= hi
+        m = (lo + hi) \ 2
+        c = CmpGuid(DelIdAt(OutDBase(m), OutDIdx(m)), id)
+        If c = 0 Then
+            BSearchDel = m
+            Exit Function
+        End If
+        If c < 0 Then
+            lo = m + 1
+        Else
+            hi = m - 1
+        End If
+    Loop
+    BSearchDel = -1
+End Function
+
+' BuildListOfLivingNotes: keep notes that are not deleted, or that were
+' re-imported after their deletion (CreatedAt > DeletedAt)
+Private Sub BuildLivingAt(ByVal side As Long, living() As Long, ByRef livingCnt As Long)
+    Dim i As Long, di As Long
+    Dim cnt As Long
+    cnt = NoteCountAt(side)
+    livingCnt = 0
+    For i = 0 To cnt - 1
+        di = BSearchDel(NoteIdAt(side, i))
+        If di < 0 Then
+            living(livingCnt) = i
+            livingCnt = livingCnt + 1
+        ElseIf NoteCreatedKeyAt(side, i) > OutDKey(di) Then
+            living(livingCnt) = i
+            livingCnt = livingCnt + 1
+        End If
+    Next
+End Sub
+
+' ============================================================
+' Merge entry point
+' ============================================================
+
+Public Sub MergeReps()
+    Dim livingL() As Long
+    Dim livingR() As Long
+    Dim ln As Long, rn As Long
+    Dim i As Long
+
+    ' 1. merged list of deleted notes (sorted by id, shared by both sides)
+    MergeDels
+
+    ' 2. living lists per side
+    ReDim livingL(0 To MAX_ITEMS - 1)
+    ReDim livingR(0 To MAX_ITEMS - 1)
+    BuildLivingAt SIDE_LOCAL, livingL, ln
+    BuildLivingAt SIDE_REMOTE, livingR, rn
+
+    ' 3. notes: left side = the one with the newer OrderModifiedAt
+    '    (C#: BuildMergedListOfNotes(localLiving, remoteLiving) when
+    '    local.OrderModifiedAt > remote.OrderModifiedAt, else the reverse)
+    If LocalOrderKey > RemoteOrderKey Then
+        BuildMergedNotes SIDE_LOCAL, livingL, ln, SIDE_REMOTE, livingR, rn
+        OutOrderRaw = LocalOrderRaw
+    Else
+        BuildMergedNotes SIDE_REMOTE, livingR, rn, SIDE_LOCAL, livingL, ln
+        OutOrderRaw = RemoteOrderRaw
+    End If
+
+    ' 4. safes: C# calls BuildMergedListOfSafes(remote.Safes, local.Safes) -
+    '    the remote side has precedence
+    BuildMergedSafes
+
+    ' 5. result bookkeeping
+    OutRootId = RemoteRootId
+
+    ' 6. drop safes no note refers to
+    RemoveUnusedSafes
+
+    ' 7. pinned notes stick to the top
+    BringPinnedToTop
+End Sub
+
+' BuildMergedListOfNotes(left, right)
+Private Sub BuildMergedNotes(ByVal leftSide As Long, livingL() As Long, ByVal ln As Long, _
+                             ByVal rightSide As Long, livingR() As Long, ByVal rn As Long)
+    Dim i As Long
+    Dim w As Long
+    For i = 0 To ln - 1
+        JoinL(i) = NoteIdAt(leftSide, livingL(i))
+    Next
+    For i = 0 To rn - 1
+        JoinR(i) = NoteIdAt(rightSide, livingR(i))
+    Next
+    OuterJoin ln, rn
+    OutNCount = 0
+    For i = 0 To JoinPairCount - 1
+        If JoinPairs(i).li < 0 Then
+            ' only on the right side
+            PushNoteAt rightSide, livingR(JoinPairs(i).ri)
+        ElseIf JoinPairs(i).ri < 0 Then
+            ' only on the left side
+            PushNoteAt leftSide, livingL(JoinPairs(i).li)
+        Else
+            ' take the more recent (ties: left wins)
+            w = ChooseNoteAt(leftSide, livingL(JoinPairs(i).li), rightSide, livingR(JoinPairs(i).ri))
+            If w = 1 Then
+                PushNoteAt leftSide, livingL(JoinPairs(i).li)
+            Else
+                PushNoteAt rightSide, livingR(JoinPairs(i).ri)
+            End If
+        End If
+    Next
+End Sub
+
+Private Sub PushNoteAt(ByVal side As Long, ByVal idx As Long)
+    If OutNCount > MAX_ITEMS - 1 Then Err.Raise 1655, "TbMergeModel", "note output capacity exceeded"
+    OutNBase(OutNCount) = side
+    OutNIdx(OutNCount) = idx
+    OutNCount = OutNCount + 1
+End Sub
+
+' BuildMergedListOfSafes: left = remote safes, right = local safes
+Private Sub BuildMergedSafes()
+    Dim i As Long
+    Dim w As Long
+    Dim rsCount As Long, lsCount As Long
+    rsCount = SafeCountAt(SIDE_REMOTE)
+    lsCount = SafeCountAt(SIDE_LOCAL)
+    For i = 0 To rsCount - 1
+        JoinL(i) = SafeIdAt(SIDE_REMOTE, i)
+    Next
+    For i = 0 To lsCount - 1
+        JoinR(i) = SafeIdAt(SIDE_LOCAL, i)
+    Next
+    OuterJoin rsCount, lsCount
+    OutSCount = 0
+    For i = 0 To JoinPairCount - 1
+        If JoinPairs(i).li < 0 Then
+            PushSafeAt SIDE_LOCAL, JoinPairs(i).ri
+        ElseIf JoinPairs(i).ri < 0 Then
+            PushSafeAt SIDE_REMOTE, JoinPairs(i).li
+        Else
+            w = ChooseSafeAt(SIDE_REMOTE, JoinPairs(i).li, SIDE_LOCAL, JoinPairs(i).ri)
+            If w = 1 Then
+                PushSafeAt SIDE_REMOTE, JoinPairs(i).li
+            Else
+                PushSafeAt SIDE_LOCAL, JoinPairs(i).ri
+            End If
+        End If
+    Next
+End Sub
+
+Private Sub PushSafeAt(ByVal side As Long, ByVal idx As Long)
+    If OutSCount > MAX_ITEMS - 1 Then Err.Raise 1656, "TbMergeModel", "safe output capacity exceeded"
+    OutSBase(OutSCount) = side
+    OutSIdx(OutSCount) = idx
+    OutSCount = OutSCount + 1
+End Sub
+
+' RemoveUnusedSafes: keep only safes referenced by some merged note (order
+' preserved, like List.RemoveAll). Physically compacts the OutS arrays.
+Private Sub RemoveUnusedSafes()
+    Dim i As Long, j As Long
+    Dim keep As Boolean
+    Dim w As Long
+    w = 0
+    For i = 0 To OutSCount - 1
+        keep = False
+        For j = 0 To OutNCount - 1
+            If OutNoteHasSafe(j) Then
+                If OutNoteSafeId(j) = SafeIdAt(OutSBase(i), OutSIdx(i)) Then
+                    keep = True
+                    Exit For
+                End If
+            End If
+        Next
+        If keep Then
+            If w <> i Then
+                OutSBase(w) = OutSBase(i)
+                OutSIdx(w) = OutSIdx(i)
+            End If
+            w = w + 1
+        End If
+    Next
+    OutSCount = w
+End Sub
+
+' BringPinnedToTop (line-by-line): scan from the first unpinned note on; every
+' pinned note found is RemoveAt(index) + Insert(0, note) - later pinned notes
+' end up ABOVE earlier ones, exactly like the C# loop.
+Private Sub BringPinnedToTop()
+    Dim fu As Long
+    Dim index As Long
+    fu = -1
+    For index = 0 To OutNCount - 1
+        If Not OutNoteIsPinned(index) Then
+            fu = index
+            Exit For
+        End If
+    Next
+    If fu >= 0 Then
+        For index = fu To OutNCount - 1
+            If OutNoteIsPinned(index) Then
+                OutRemoveAtInsert0 index
+            End If
+        Next
+    End If
+End Sub
+
+Private Sub OutRemoveAtInsert0(ByVal index As Long)
+    Dim s As Long, x As Long
+    Dim i As Long
+    s = OutNBase(index)
+    x = OutNIdx(index)
+    For i = index To OutNCount - 2
+        OutNBase(i) = OutNBase(i + 1)
+        OutNIdx(i) = OutNIdx(i + 1)
+    Next
+    For i = OutNCount - 1 To 1 Step -1
+        OutNBase(i) = OutNBase(i - 1)
+        OutNIdx(i) = OutNIdx(i - 1)
+    Next
+    OutNBase(0) = s
+    OutNIdx(0) = x
+End Sub
+
+' ---- output view helpers ----
+
+Public Function OutNoteIsPinned(ByVal i As Long) As Boolean
+    OutNoteIsPinned = NotePinnedAt(OutNBase(i), OutNIdx(i))
+End Function
+
+Public Function OutNoteHasSafe(ByVal i As Long) As Boolean
+    OutNoteHasSafe = NoteHasSafeAt(OutNBase(i), OutNIdx(i))
+End Function
+
+Public Function OutNoteSafeId(ByVal i As Long) As String
+    OutNoteSafeId = NoteSafeIdAt(OutNBase(i), OutNIdx(i))
+End Function
+
+Public Function OutNoteRaw(ByVal i As Long) As String
+    If OutNBase(i) = SIDE_LOCAL Then
+        OutNoteRaw = LocalNotes(OutNIdx(i)).Raw
+    Else
+        OutNoteRaw = RemoteNotes(OutNIdx(i)).Raw
+    End If
+End Function
+
+Public Function OutSafeRaw(ByVal i As Long) As String
+    If OutSBase(i) = SIDE_LOCAL Then
+        OutSafeRaw = LocalSafes(OutSIdx(i)).Raw
+    Else
+        OutSafeRaw = RemoteSafes(OutSIdx(i)).Raw
+    End If
+End Function
+
+' rebuilt deleted_note element: the C# merged model carries the winning
+' (Id, DeletedAt) pair; XmlSerializer output shape is
+' <deleted_note deleted_at="...">GUID</deleted_note>, rebuilt here from raw
+' (escaped) attribute + text so no re-escaping decisions are made.
+Public Function OutDelRaw(ByVal i As Long) As String
+    OutDelRaw = "<deleted_note deleted_at=""" & OutDAtRaw(i) & """>" & DelIdTextAt(OutDBase(i), OutDIdx(i)) & "</deleted_note>"
+End Function
+
+' Sum of all raw texts that can flow into the output (size estimate for the
+' serialization buffer)
+Public Function OutputEstimate() As Long
+    Dim i As Long
+    Dim est As Long
+    est = 8192
+    For i = 0 To LocalNoteCount - 1
+        est = est + Len(LocalNotes(i).Raw) + 2
+    Next
+    For i = 0 To RemoteNoteCount - 1
+        est = est + Len(RemoteNotes(i).Raw) + 2
+    Next
+    For i = 0 To LocalDelCount - 1
+        est = est + Len(LocalDels(i).IdText) + 128
+    Next
+    For i = 0 To RemoteDelCount - 1
+        est = est + Len(RemoteDels(i).IdText) + 128
+    Next
+    For i = 0 To LocalSafeCount - 1
+        est = est + Len(LocalSafes(i).Raw) + 2
+    Next
+    For i = 0 To RemoteSafeCount - 1
+        est = est + Len(RemoteSafes(i).Raw) + 2
+    Next
+    OutputEstimate = est
+End Function
+
+End Module

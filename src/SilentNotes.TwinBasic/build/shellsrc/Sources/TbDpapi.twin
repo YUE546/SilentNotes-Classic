@@ -1,0 +1,109 @@
+Option Explicit
+
+' TbDpapi - CryptProtectData / CryptUnprotectData (crypt32) for the sync
+' credentials. Same parameters as the WinForms reference implementation
+' (WindowsDataProtectionService): scope CurrentUser, no optional entropy, so
+' blobs written by the original clients decrypt here and vice versa. Blobs
+' travel as base64 strings (TbBase64), payload is UTF-8 (TbUtf8).
+
+Class TbDpapi
+
+    Private Type DATA_BLOB
+        cbData As Long
+        pbData As Long
+    End Type
+
+    Private Declare Function CryptProtectData Lib "crypt32" ( _
+        ByRef pDataIn As DATA_BLOB, ByVal szDataDescr As Long, ByVal pOptionalEntropy As Long, _
+        ByVal pvReserved As Long, ByVal pPromptStruct As Long, ByVal dwFlags As Long, _
+        ByRef pDataOut As DATA_BLOB) As Long
+
+    Private Declare Function CryptUnprotectData Lib "crypt32" ( _
+        ByRef pDataIn As DATA_BLOB, ByVal ppszDataDescr As Long, ByVal pOptionalEntropy As Long, _
+        ByVal pvReserved As Long, ByVal pPromptStruct As Long, ByVal dwFlags As Long, _
+        ByRef pDataOut As DATA_BLOB) As Long
+
+    Private Declare Function LocalFree Lib "kernel32" (ByVal hMem As Long) As Long
+    ' RtlCopyMemory is NOT exported by the 32-bit kernel32 (only 64-bit) -
+    ' the win32 exe would raise a declare failure on every call; use the
+    ' RtlMoveMemory entry point, which exists in both bitnesses.
+    Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
+        ByVal dest As Long, ByVal src As Long, ByVal n As Long)
+
+    Private m_U8 As TbUtf8
+    Private m_B64 As TbBase64
+    Private m_LastStage As String      ' stage trace of the last Unprotect
+
+    Public Property Get LastStage() As String
+        LastStage = m_LastStage
+    End Property
+
+    Private Sub Class_Initialize()
+        Set m_U8 = New TbUtf8
+        Set m_B64 = New TbBase64
+    End Sub
+
+    ' plain text -> base64 DPAPI blob ("" on failure)
+    Public Function Protect(ByVal plain As String) As String
+        Dim inBytes() As Byte
+        inBytes = m_U8.Encode(plain)
+        Dim bin As DATA_BLOB, bout As DATA_BLOB
+        bin.cbData = ArrLen(inBytes)
+        If bin.cbData > 0 Then bin.pbData = VarPtr(inBytes(0))
+        If CryptProtectData(bin, 0, 0, 0, 0, 0, bout) = 0 Then Exit Function
+        Protect = BlobToB64(bout)
+        LocalFree bout.pbData
+    End Function
+
+    ' base64 DPAPI blob -> plain text (False when not decryptable / not a blob)
+    Public Function Unprotect(ByVal b64Blob As String, ByRef plain As String) As Boolean
+        On Error GoTo fail
+        plain = ""
+        m_LastStage = "b64len=" & Len(b64Blob)
+        Dim v As Variant
+        v = m_B64.Decode(b64Blob)
+        If Not IsArray(v) Then m_LastStage = m_LastStage & " decode=empty": Exit Function
+        Dim inBytes() As Byte
+        inBytes = v
+        m_LastStage = m_LastStage & " decoded=" & ArrLen(inBytes)
+        Dim bin As DATA_BLOB, bout As DATA_BLOB
+        bin.cbData = ArrLen(inBytes)
+        If bin.cbData > 0 Then bin.pbData = VarPtr(inBytes(0))
+        If CryptUnprotectData(bin, 0, 0, 0, 0, 0, bout) = 0 Then
+            m_LastStage = m_LastStage & " crypt=0 gle=" & CStr(Err.LastDllError)
+            Exit Function
+        End If
+        m_LastStage = m_LastStage & " cryptOK=" & bout.cbData
+        plain = BlobToString(bout)
+        LocalFree bout.pbData
+        Unprotect = True
+        Exit Function
+    fail:
+        m_LastStage = m_LastStage & " err=" & Err.Number
+    End Function
+
+    Private Function BlobToB64(b As DATA_BLOB) As String
+        If b.cbData <= 0 Then Exit Function
+        Dim ba() As Byte
+        ReDim ba(0 To b.cbData - 1)
+        CopyMemory VarPtr(ba(0)), b.pbData, b.cbData
+        BlobToB64 = m_B64.Encode(ba)
+    End Function
+
+    Private Function BlobToString(b As DATA_BLOB) As String
+        If b.cbData <= 0 Then Exit Function
+        Dim ba() As Byte
+        ReDim ba(0 To b.cbData - 1)
+        CopyMemory VarPtr(ba(0)), b.pbData, b.cbData
+        BlobToString = m_U8.Decode(ba)
+    End Function
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

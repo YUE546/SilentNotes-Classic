@@ -1,0 +1,1115 @@
+Option Explicit
+
+' TbRepo - pure-backend (TbPureGw) wrapper + in-memory note table for the P2 shell.
+'
+' Data safety: the debug repo is a fictional test repository opened in place
+' (OpenExisting) - no production data is involved. AddNew persists through the
+' backend (AddNote + SaveRepository).
+'
+' NoteMeta(i) = 11 pipe-separated fields:
+'   0 id | 1 pinned | 2 in_recycling_bin | 3 shopping_mode | 4 note_type
+'   5 background_color | 6 created_at | 7 modified_at | 8 meta_modified_at
+'   9 safe_id | 10 tags (US \x1F joined - matches the gateway, array-safe)
+' Title = plain text chars 1..60 of the note HTML, preview = 61..150.
+' The gateway never reorders; the document index IS the order.
+
+Class TbRepo
+
+    ' Single backend: the pure tB model stack (TbPureGw shim over Chilkat).
+    Private m_pure As TbPureGw
+    Private m_open As Boolean
+    Private m_n As Long
+
+    Private m_id() As String
+    Private m_title() As String
+    Private m_prev() As String
+    Private m_pin() As Boolean
+    Private m_safe() As Boolean
+    Private m_safeId() As String  ' safe guid of the row ("" = not encrypted, P5-B)
+    Private m_bin() As Boolean
+    Private m_bg() As Long        ' COLORREF, -1 = none/invalid
+    Private m_tags() As String
+
+    Private m_visIdx() As Long    ' visible rows -> document index
+    Private m_visN As Long
+
+    Private m_tagList() As String
+    Private m_tagN As Long
+
+    Private m_lastErr As String
+
+    ' P5-B: SafeCloseAll clears the carried safe titles once (VB clears
+    ' _safeNoteTitles on lock, so locked rows show the placeholder)
+    Private m_dropSafeTitleCache As Boolean
+
+    ' perf instrumentation (milliseconds per segment, epoch = data version)
+    Public OpenMs As Long           ' OpenExisting/OpenRepository timing
+    Public MetaMs As Long           ' LoadAll: NoteMeta loop
+    Public HtmlMs As Long           ' LoadAll: NoteHtml + HtmlToText loop
+    Private m_epoch As Long
+
+    ' bumped on every LoadAll / RebuildFilter - list caches compare it to
+    ' detect stale content
+    Public Property Get Epoch() As Long
+        Epoch = m_epoch
+    End Property
+
+    ' share the shell's Chilkat/crypto pair with the pure backend
+    Public Sub AttachCrypto(ck As TbChilkat, crypto As TbCrypto)
+        If m_pure Is Nothing Then Set m_pure = New TbPureGw
+        m_pure.AttachCrypto ck, crypto
+    End Sub
+
+    ' ----------------------------------------------------- backend routers
+    ' early-bound dispatch (late binding on the pure shim was
+    ' unreliable: string-arg methods raised DISP_E_EXCEPTION at the boundary)
+
+    Private Function BeOpenRepository(ByVal path As String) As String
+        If m_pure Is Nothing Then Set m_pure = New TbPureGw
+        BeOpenRepository = m_pure.OpenRepository(path)
+    End Function
+
+    Private Function BeNoteCount() As Long
+        BeNoteCount = m_pure.NoteCount()
+    End Function
+
+    Private Function BeNoteMeta(ByVal i As Long) As String
+        BeNoteMeta = m_pure.NoteMeta(i)
+    End Function
+
+    Private Function BeNoteHtml(ByVal i As Long) As String
+        BeNoteHtml = m_pure.NoteHtml(i)
+    End Function
+
+    Private Function BeAddNote(ByVal html As String) As String
+        BeAddNote = m_pure.AddNote(html)
+    End Function
+
+    Private Function BeUpdateNoteHtml(ByVal id As String, ByVal html As String) As String
+        BeUpdateNoteHtml = m_pure.UpdateNoteHtml(id, html)
+    End Function
+
+    Private Function BeDeleteNote(ByVal id As String) As String
+        BeDeleteNote = m_pure.DeleteNote(id)
+    End Function
+
+    Private Function BeSetNotePinned(ByVal id As String, ByVal val As Boolean) As String
+        BeSetNotePinned = m_pure.SetNotePinned(id, val)
+    End Function
+
+    Private Function BeSetNoteTags(ByVal id As String, ByVal usJoined As String) As String
+        BeSetNoteTags = m_pure.SetNoteTags(id, usJoined)
+    End Function
+
+    Private Function BeSetNoteRecyclingBin(ByVal id As String, ByVal inBin As Boolean) As String
+        BeSetNoteRecyclingBin = m_pure.SetNoteRecyclingBin(id, inBin)
+    End Function
+
+    Private Function BeSaveRepository() As String
+        BeSaveRepository = m_pure.SaveRepository()
+    End Function
+
+    Private Function BeIsSafeOpen(ByVal safeId As String) As Boolean
+        BeIsSafeOpen = m_pure.IsSafeOpen(safeId) = "1"
+    End Function
+
+    Private Function BeDecryptNoteContent(ByVal id As String) As String
+        BeDecryptNoteContent = m_pure.DecryptNoteContent(id)
+    End Function
+
+    Private Function BeListSafes() As String
+        BeListSafes = m_pure.ListSafes()
+    End Function
+
+    Private Function BeFirstOpenSafeId() As String
+        BeFirstOpenSafeId = m_pure.FirstOpenSafeId()
+    End Function
+
+    Private Function BeOpenSafesWithPassword(ByVal pw As String) As String
+        BeOpenSafesWithPassword = m_pure.OpenSafesWithPassword(pw)
+    End Function
+
+    Private Function BeCloseAllSafes() As String
+        BeCloseAllSafes = m_pure.CloseAllSafes()
+    End Function
+
+    Private Function BeCreateSafe(ByVal pw As String) As String
+        BeCreateSafe = m_pure.CreateSafe(pw)
+    End Function
+
+    Private Function BeRemoveSafe(ByVal safeId As String) As String
+        BeRemoveSafe = m_pure.RemoveSafe(safeId)
+    End Function
+
+    Private Function BeEncryptNoteToSafe(ByVal id As String, ByVal safeId As String) As String
+        BeEncryptNoteToSafe = m_pure.EncryptNoteToSafe(id, safeId)
+    End Function
+
+    Private Function BeDecryptNoteFromSafe(ByVal id As String) As String
+        BeDecryptNoteFromSafe = m_pure.DecryptNoteFromSafe(id)
+    End Function
+
+    Private Function BeMergeRepositoryXml(ByVal cloudXmlB64 As String) As String
+        BeMergeRepositoryXml = m_pure.MergeRepositoryXml(cloudXmlB64)
+    End Function
+
+    ' ------------------------------------------------------------- accessors
+
+    Public Property Get IsOpen() As Boolean
+        IsOpen = m_open
+    End Property
+
+    Public Property Get TotalCount() As Long
+        TotalCount = m_n
+    End Property
+
+    Public Property Get VisibleCount() As Long
+        VisibleCount = m_visN
+    End Property
+
+    Public Property Get TagCount() As Long
+        TagCount = m_tagN
+    End Property
+
+    Public Property Get LastErr() As String
+        LastErr = m_lastErr
+    End Property
+
+    ' number of notes not in the recycling bin (the visible pool)
+    Public Property Get NonBinCount() As Long
+        Dim i As Long, c As Long
+        For i = 0 To m_n - 1
+            If Not m_bin(i) Then c = c + 1
+        Next
+        NonBinCount = c
+    End Property
+
+    ' number of notes in the recycling bin (P5-A bin view pool)
+    Public Property Get BinCount() As Long
+        Dim i As Long, c As Long
+        For i = 0 To m_n - 1
+            If m_bin(i) Then c = c + 1
+        Next
+        BinCount = c
+    End Property
+
+    ' pinned notes inside the visible pool (badge statistics)
+    Public Function CountPinned() As Long
+        Dim i As Long, c As Long
+        For i = 0 To m_n - 1
+            If Not m_bin(i) And m_pin(i) Then c = c + 1
+        Next
+        CountPinned = c
+    End Function
+
+    ' safe notes inside the visible pool (badge statistics)
+    Public Function CountSafe() As Long
+        Dim i As Long, c As Long
+        For i = 0 To m_n - 1
+            If Not m_bin(i) And m_safe(i) Then c = c + 1
+        Next
+        CountSafe = c
+    End Function
+
+    ' gateway SetNotePinned passthrough ("1"/"0"/"ERR:...")
+    Public Function SetPinned(ByVal id As String, ByVal val As Boolean) As String
+        On Error GoTo fail
+        SetPinned = BeSetNotePinned(id, val)
+        Exit Function
+fail:
+        SetPinned = "ERR:" & Err.Description
+    End Function
+
+    Public Function NoteId(ByVal i As Long) As String
+        NoteId = m_id(i)
+    End Function
+
+    Public Function NoteBin(ByVal i As Long) As Boolean
+        NoteBin = m_bin(i)
+    End Function
+
+    Public Function NoteTitle(ByVal i As Long) As String
+        NoteTitle = m_title(i)
+    End Function
+
+    Public Function NotePrev(ByVal i As Long) As String
+        NotePrev = m_prev(i)
+    End Function
+
+    Public Function NotePin(ByVal i As Long) As Boolean
+        NotePin = m_pin(i)
+    End Function
+
+    Public Function NoteSafe(ByVal i As Long) As Boolean
+        NoteSafe = m_safe(i)
+    End Function
+
+    ' safe guid of row i ("" = not encrypted) - P5-B
+    Public Function NoteSafeId(ByVal i As Long) As String
+        NoteSafeId = m_safeId(i)
+    End Function
+
+    Public Function NoteBg(ByVal i As Long) As Long
+        NoteBg = m_bg(i)
+    End Function
+
+    Public Function NoteTags(ByVal i As Long) As String
+        NoteTags = m_tags(i)
+    End Function
+
+    ' document index of visible row v
+    Public Function VisDoc(ByVal v As Long) As Long
+        VisDoc = m_visIdx(v)
+    End Function
+
+    ' raw HTML of a document index (gates; P3 editor will use the gateway too)
+    Public Function DocHtml(ByVal i As Long) As String
+        On Error GoTo fail
+        DocHtml = BeNoteHtml(i)
+        Exit Function
+fail:
+        DocHtml = ""
+    End Function
+
+    Public Function AllTag(ByVal j As Long) As String
+        AllTag = m_tagList(j)
+    End Function
+
+    ' ------------------------------------------------------------------ open
+
+    ' Re-reads all notes from the open gateway (after AddNew etc).
+    ' P5-B safe rows: title/preview come from the DECRYPTED content when the
+    ' safe is open, else from the previous load (carry-over by id) or the
+    ' locked placeholder - VB _safeNoteTitles semantics. SafeCloseAll drops
+    ' the carry-over once (VB clears its title cache on lock).
+    Public Function LoadAll() As Boolean
+        On Error GoTo fail
+        Dim i As Long
+        Dim meta As String, html As String, t As String
+        Dim t0 As Long
+
+        ' snapshot the previous rows for the safe-title carry-over
+        Dim oldN As Long
+        Dim oldId() As String, oldTitle() As String
+        oldN = m_n
+        If oldN > 0 Then
+            ReDim oldId(0 To oldN - 1)
+            ReDim oldTitle(0 To oldN - 1)
+            For i = 0 To oldN - 1
+                oldId(i) = m_id(i)
+                oldTitle(i) = m_title(i)
+            Next
+        End If
+
+        m_n = CLng(BeNoteCount())
+        If m_n < 0 Then m_n = 0
+        ReDim m_id(0 To m_n)          ' one spare slot keeps UBound valid at n=0
+        ReDim m_title(0 To m_n)
+        ReDim m_prev(0 To m_n)
+        ReDim m_pin(0 To m_n)
+        ReDim m_safe(0 To m_n)
+        ReDim m_safeId(0 To m_n)
+        ReDim m_bin(0 To m_n)
+        ReDim m_bg(0 To m_n)
+        ReDim m_tags(0 To m_n)
+        ReDim m_visIdx(0 To m_n)
+
+        t0 = GetTickCountR()
+        For i = 0 To m_n - 1
+            meta = BeNoteMeta(i)
+            ParseMeta i, meta
+        Next
+        MetaMs = GetTickCountR() - t0
+
+        t0 = GetTickCountR()
+        For i = 0 To m_n - 1
+            If Len(m_safeId(i)) > 0 Then
+                LoadSafeRow i, oldN, oldId, oldTitle
+            Else
+                html = BeNoteHtml(i)
+                t = HtmlToText(html)
+                m_title(i) = Left$(t, 60)
+                If Len(t) > 60 Then m_prev(i) = Mid$(t, 61, 90)
+            End If
+        Next
+        HtmlMs = GetTickCountR() - t0
+
+        AggregateTags
+        m_visN = 0
+        m_dropSafeTitleCache = False
+        m_epoch = m_epoch + 1
+        LoadAll = True
+        Exit Function
+fail:
+        m_lastErr = "LoadAll err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' title/preview of a safe-protected row (VB BuildNoteItem safe branch):
+    ' open safe -> decrypt + cache; locked -> carry-over title or
+    ' placeholder title, no preview line
+    Private Sub LoadSafeRow(ByVal i As Long, ByVal oldN As Long, ByRef oldId() As String, ByRef oldTitle() As String)
+        On Error GoTo locked
+        If BeIsSafeOpen(m_safeId(i)) = True Then
+            Dim plain As String
+            plain = BeDecryptNoteContent(m_id(i))
+            If Left$(plain, 4) <> "ERR:" Then
+                Dim t As String
+                t = HtmlToText(plain)
+                m_title(i) = Left$(t, 60)
+                If Len(t) > 60 Then
+                    m_prev(i) = Mid$(t, 61, 90)
+                Else
+                    m_prev(i) = ""
+                End If
+                Exit Sub
+            End If
+        End If
+locked:
+        Dim cached As String
+        If Not m_dropSafeTitleCache Then cached = OldTitleOf(oldN, oldId, oldTitle, m_id(i))
+        If Len(cached) > 0 Then
+            m_title(i) = cached
+        Else
+            m_title(i) = SSafeLockedTitle()
+        End If
+        m_prev(i) = ""
+    End Sub
+
+    ' linear id lookup in the pre-LoadAll snapshot (96 rows worst case -
+    ' negligible next to the gateway roundtrips)
+    Private Function OldTitleOf(ByVal oldN As Long, ByRef oldId() As String, ByRef oldTitle() As String, ByVal id As String) As String
+        Dim j As Long
+        OldTitleOf = ""
+        If oldN <= 0 Then Exit Function
+        For j = 0 To oldN - 1
+            If StrComp(oldId(j), id, vbTextCompare) = 0 Then
+                OldTitleOf = oldTitle(j)
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' P5-B: SafeCloseAll clears the carried titles once (VB clears
+    ' _safeNoteTitles on lock, so locked rows show the placeholder);
+    ' the state flag lives at the top of the class next to m_lastErr
+
+    ' locked-row placeholder strings (VB BuildNoteItem texts)
+    Private Function SSafeLockedTitle() As String   ' "an-quan-xiang-bi-ji-(yi-suo-ding)"
+        SSafeLockedTitle = ChrW$(&H5B89&) & ChrW$(&H5168&) & ChrW$(&H7BB1&) & _
+            ChrW$(&H7B14&) & ChrW$(&H8BB0&) & ChrW$(&HFF08&) & ChrW$(&H5DF2&) & _
+            ChrW$(&H9501&) & ChrW$(&H5B9A&) & ChrW$(&HFF09&)
+    End Function
+
+    ' local GetTickCount (kernel32) - milliseconds, wraps at 49 days
+    Private Declare Function GetTickCountR Lib "kernel32" Alias "GetTickCount" () As Long
+
+    Private Sub ParseMeta(ByVal i As Long, ByVal meta As String)
+        Dim f() As String
+        f = Split(meta, "|")
+        If UBound(f) < 10 Then
+            m_id(i) = ""
+            m_bg(i) = -1
+            Exit Sub
+        End If
+        m_id(i) = f(0)
+        m_pin(i) = (f(1) = "1")
+        m_bin(i) = (f(2) = "1")
+        ' f(3) shopping_mode, f(4) note_type - not displayed in P2
+        m_bg(i) = HexToColor(f(5))
+        ' f(6..8) timestamps - not used in P2
+        m_safeId(i) = f(9)
+        m_safe(i) = (Len(f(9)) > 0)
+        m_tags(i) = f(10)
+    End Sub
+
+    ' "#RRGGBB" -> COLORREF; empty/invalid -> -1
+    Private Function HexToColor(ByVal s As String) As Long
+        Dim r As Long, g As Long, b As Long
+        HexToColor = -1
+        If Len(s) <> 7 Then Exit Function
+        If Mid$(s, 1, 1) <> "#" Then Exit Function
+        If Not Hex2(Mid$(s, 2, 2), r) Then Exit Function
+        If Not Hex2(Mid$(s, 4, 2), g) Then Exit Function
+        If Not Hex2(Mid$(s, 6, 2), b) Then Exit Function
+        HexToColor = RGB(r, g, b)
+    End Function
+
+    Private Function Hex2(ByVal h As String, ByRef v As Long) As Boolean
+        Dim d1 As Long, d2 As Long
+        d1 = HexDigit(Left$(h, 1))
+        d2 = HexDigit(Right$(h, 1))
+        If d1 < 0 Or d2 < 0 Then Exit Function
+        v = d1 * 16 + d2
+        Hex2 = True
+    End Function
+
+    Private Function HexDigit(ByVal c As String) As Long
+        Dim p As Long
+        p = InStr("0123456789abcdefABCDEF", c)
+        If p <= 0 Then
+            HexDigit = -1
+        ElseIf p > 16 Then
+            HexDigit = p - 7          ' A-F block (17..22 -> 10..15)
+        Else
+            HexDigit = p - 1          ' 0-9 (1..10 -> 0..9) and a-f (11..16 -> 10..15)
+        End If
+    End Function
+
+    ' ------------------------------------------------------------------ tags
+
+    ' tag separator: US (chr 31) - the gateway joins tags with it (array
+    ' semantics; the char cannot occur in XML text so values with commas
+    ' round-trip losslessly)
+    Public Function TagSep() As String
+        TagSep = ChrW$(31)
+    End Function
+
+    ' splits a stored US-joined tag string into trimmed non-empty parts;
+    ' n receives the count (0 when empty)
+    Public Sub SplitTags(ByVal joined As String, ByRef parts() As String, ByRef n As Long)
+        Dim j As Long, t As String
+        n = 0
+        ReDim parts(0 To 0)
+        If Len(joined) = 0 Then Exit Sub
+        Dim raw() As String
+        raw = Split(joined, TagSep())
+        ReDim parts(0 To UBound(raw))
+        For j = 0 To UBound(raw)
+            t = Trim$(raw(j))
+            If Len(t) > 0 Then
+                parts(n) = t
+                n = n + 1
+            End If
+        Next
+    End Sub
+
+    Private Sub AggregateTags()
+        Dim i As Long, j As Long
+        Dim parts() As String
+        Dim nP As Long
+        ReDim m_tagList(0 To m_n)
+        m_tagN = 0
+        For i = 0 To m_n - 1
+            SplitTags m_tags(i), parts, nP
+            For j = 0 To nP - 1
+                If Not HasTag(parts(j)) Then
+                    m_tagList(m_tagN) = parts(j)
+                    m_tagN = m_tagN + 1
+                End If
+            Next
+        Next
+    End Sub
+
+    Private Function HasTag(ByVal t As String) As Boolean
+        Dim j As Long
+        For j = 0 To m_tagN - 1
+            If StrComp(m_tagList(j), t, vbTextCompare) = 0 Then
+                HasTag = True
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' Does a note's US-joined tag list contain tag (case-insensitive exact)?
+    Public Function TagInNote(ByVal noteTags As String, ByVal tag As String) As Boolean
+        Dim parts() As String, nP As Long, j As Long
+        SplitTags noteTags, parts, nP
+        For j = 0 To nP - 1
+            If StrComp(parts(j), tag, vbTextCompare) = 0 Then
+                TagInNote = True
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' joins trimmed non-empty tag parts back into the US-joined storage form
+    Public Function JoinTags(ByRef parts() As String, ByVal n As Long) As String
+        Dim j As Long
+        Dim s As String
+        For j = 0 To n - 1
+            If j > 0 Then s = s & TagSep()
+            s = s & Trim$(parts(j))
+        Next
+        JoinTags = s
+    End Function
+
+    ' tag count / tag j of note i (array-style access over the stored form)
+    Public Function NoteTagCount(ByVal i As Long) As Long
+        Dim parts() As String, nP As Long
+        SplitTags m_tags(i), parts, nP
+        NoteTagCount = nP
+    End Function
+
+    Public Function NoteTag(ByVal i As Long, ByVal j As Long) As String
+        Dim parts() As String, nP As Long
+        SplitTags m_tags(i), parts, nP
+        If j >= 0 And j < nP Then NoteTag = parts(j)
+    End Function
+
+    ' gateway SetNoteTags + save + reload. usJoined uses TagSep. Returns ""
+    ' on success or "ERR:...".
+    Public Function SetNoteTags(ByVal id As String, ByVal usJoined As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeSetNoteTags(id, usJoined)
+        If StrComp(r, "1", vbBinaryCompare) <> 0 Then
+            m_lastErr = "SetNoteTags: " & r
+            SetNoteTags = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & sv
+            SetNoteTags = sv
+            Exit Function
+        End If
+        LoadAll
+        SetNoteTags = ""
+        Exit Function
+fail:
+        m_lastErr = "SetNoteTags err=" & Err.Number & " " & Err.Description
+        SetNoteTags = "ERR:" & Err.Description
+    End Function
+
+    ' gateway SetNotePinned + save + reload (P5-A UI pin toggle; the raw
+    ' SetPinned passthrough above stays memory-only for probes).
+    ' Returns "" on success or "ERR:...".
+    Public Function SetPinnedSave(ByVal id As String, ByVal val As Boolean) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeSetNotePinned(id, val)
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "SetNotePinned: " & r
+            SetPinnedSave = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & sv
+            SetPinnedSave = sv
+            Exit Function
+        End If
+        LoadAll
+        SetPinnedSave = ""
+        Exit Function
+fail:
+        m_lastErr = "SetPinnedSave err=" & Err.Number & " " & Err.Description
+        SetPinnedSave = "ERR:" & Err.Description
+    End Function
+
+    ' gateway SetNoteRecyclingBin + save + reload (P5-A soft delete /
+    ' restore). The gateway refreshes ModifiedAt only on value change,
+    ' exactly like SetNotePinned. Returns "" on success or "ERR:...".
+    Public Function SetNoteRecycling(ByVal id As String, ByVal inBin As Boolean) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeSetNoteRecyclingBin(id, inBin)
+        If Left$(r, 3) = "OK:" Then
+            ' success per the gateway's OK:<...> convention
+        ElseIf Left$(r, 4) = "ERR:" Then
+            m_lastErr = "SetNoteRecyclingBin: " & r
+            SetNoteRecycling = r
+            Exit Function
+        Else
+            m_lastErr = "SetNoteRecyclingBin: unexpected '" & r & "'"
+            SetNoteRecycling = "ERR:" & r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & sv
+            SetNoteRecycling = sv
+            Exit Function
+        End If
+        LoadAll
+        SetNoteRecycling = ""
+        Exit Function
+fail:
+        m_lastErr = "SetNoteRecycling err=" & Err.Number & " " & Err.Description
+        SetNoteRecycling = "ERR:" & Err.Description
+    End Function
+
+    ' ---------------------------------------------------------------- filter
+
+    ' P5-A recycle-bin view mode: RebuildFilter shows ONLY in-bin notes and
+    ' tag/search filters step aside (the bin entry sits at the END of the
+    ' tag picker; picking it flips this flag in MainForm).
+    Private m_recycleMode As Boolean
+
+    Public Property Get RecycleMode() As Boolean
+        RecycleMode = m_recycleMode
+    End Property
+
+    Public Property Let RecycleMode(ByVal v As Boolean)
+        m_recycleMode = v
+    End Property
+
+    ' Rebuilds the visible list. Normal mode: not in recycling bin AND
+    ' (tag empty or note has it) AND (query empty or query in title/preview,
+    ' case-insensitive). Recycle mode: in-bin notes only, tag/search ignored.
+    ' Returns the visible count.
+    Public Function RebuildFilter(ByVal q As String, ByVal tag As String) As Long
+        Dim i As Long
+        Dim ok As Boolean
+        m_visN = 0
+        If m_recycleMode Then
+            For i = 0 To m_n - 1
+                If m_bin(i) Then
+                    m_visIdx(m_visN) = i
+                    m_visN = m_visN + 1
+                End If
+            Next
+            RebuildFilter = m_visN
+            m_epoch = m_epoch + 1
+            Exit Function
+        End If
+        For i = 0 To m_n - 1
+            If Not m_bin(i) Then
+                ok = True
+                If Len(tag) > 0 Then
+                    If Not TagInNote(m_tags(i), tag) Then ok = False
+                End If
+                If ok And Len(q) > 0 Then
+                    If InStr(1, m_title(i) & " " & m_prev(i), q, vbTextCompare) = 0 Then ok = False
+                End If
+                If ok Then
+                    m_visIdx(m_visN) = i
+                    m_visN = m_visN + 1
+                End If
+            End If
+        Next
+        RebuildFilter = m_visN
+        m_epoch = m_epoch + 1
+    End Function
+
+    ' document index by note id, -1 when absent
+    Public Function FindDocById(ByVal id As String) As Long
+        Dim i As Long
+        FindDocById = -1
+        For i = 0 To m_n - 1
+            If StrComp(m_id(i), id, vbTextCompare) = 0 Then
+                FindDocById = i
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' visible row of a document index, -1 when filtered out
+    Public Function FindVisByDoc(ByVal doc As Long) As Long
+        Dim v As Long
+        FindVisByDoc = -1
+        For v = 0 To m_visN - 1
+            If m_visIdx(v) = doc Then
+                FindVisByDoc = v
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' ------------------------------------------------------------------ edit
+
+    ' Adds a note, saves, reloads. Returns the new id or "ERR:...".
+    Public Function AddNew(ByVal html As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeAddNote(html)
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "AddNote: " & r
+            AddNew = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & sv
+            AddNew = sv
+            Exit Function
+        End If
+        LoadAll
+        AddNew = r
+        Exit Function
+fail:
+        m_lastErr = "AddNew err=" & Err.Number & " " & Err.Description
+        AddNew = "ERR:" & Err.Description
+    End Function
+
+    ' gateway UpdateNoteHtml + save + reload (P3 editor save path).
+    ' RefreshModifiedAt fires on the gateway side exactly like the app's
+    ' own save flow.
+    Public Function UpdateHtml(ByVal id As String, ByVal html As String) As Boolean
+        On Error GoTo fail
+        Dim r As String
+        r = BeUpdateNoteHtml(id, html)
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "UpdateNoteHtml: " & r
+            Exit Function
+        End If
+        r = BeSaveRepository()
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & r
+            Exit Function
+        End If
+        LoadAll
+        UpdateHtml = True
+        Exit Function
+fail:
+        m_lastErr = "UpdateHtml err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' permanent delete + tombstone (RecycleBinViewModel.DeleteNotePermanently
+    ' semantics), save + reload. Used by the editor gates for temp notes.
+    Public Function DeleteNote(ByVal id As String) As Boolean
+        On Error GoTo fail
+        Dim r As String
+        r = BeDeleteNote(id)
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "DeleteNote: " & r
+            Exit Function
+        End If
+        r = BeSaveRepository()
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & r
+            Exit Function
+        End If
+        LoadAll
+        DeleteNote = True
+        Exit Function
+fail:
+        m_lastErr = "DeleteNote err=" & Err.Number & " " & Err.Description
+    End Function
+
+    Public Sub CloseRepo()
+        On Error Resume Next
+        If m_open Then
+            If Not m_pure Is Nothing Then
+                m_pure.CloseRepository
+            End If
+            m_open = False
+        End If
+    End Sub
+
+    ' ------------------------------------------------------------- safes
+    ' P5-B wrappers over the gateway's safe surface. Password verification
+    ' and key decryption happen ENTIRELY inside the gateway (frozen Core
+    ' SafeKeyService); this class only shuttles strings + reloads.
+
+    ' raw ListSafes payload: rows US-joined, fields |-joined
+    ' (id|created|modified|maintained|open|algo)
+    Public Function SafeList() As String
+        On Error GoTo fail
+        SafeList = BeListSafes()
+        Exit Function
+fail:
+        SafeList = "ERR:" & Err.Description
+    End Function
+
+    Public Function SafeCount() As Long
+        Dim s As String
+        s = SafeList()
+        If Left$(s, 4) = "ERR:" Then Exit Function
+        If Len(s) = 0 Then Exit Function
+        SafeCount = UBound(Split(s, TagSep())) + 1
+    End Function
+
+    Public Function SafeIsOpen(ByVal safeId As String) As Boolean
+        On Error GoTo fail
+        SafeIsOpen = BeIsSafeOpen(safeId)
+        Exit Function
+fail:
+    End Function
+
+    Public Function SafeFirstOpenId() As String
+        On Error GoTo fail
+        SafeFirstOpenId = BeFirstOpenSafeId()
+        Exit Function
+fail:
+        SafeFirstOpenId = ""
+    End Function
+
+    ' VB TryOpenSafes: one password against every safe (each is closed
+    ' first). "OK:<n>" / "ERR:wrong_password"; a reload decrypts the row
+    ' titles of the now-open safes.
+    Public Function SafeOpenAll(ByVal pw As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeOpenSafesWithPassword(pw)
+        If Left$(r, 3) = "OK:" Then LoadAll
+        SafeOpenAll = r
+        Exit Function
+fail:
+        SafeOpenAll = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' VB CloseSafe flow: lock everything + reload (locked rows fall back to
+    ' the placeholder; the carried titles are dropped once)
+    Public Function SafeCloseAll() As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeCloseAllSafes()
+        If Left$(r, 3) = "OK:" Then
+            m_dropSafeTitleCache = True
+            LoadAll
+        End If
+        SafeCloseAll = r
+        Exit Function
+fail:
+        SafeCloseAll = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' VB TryCreateSafe: gateway creates + verifies + adds, then save +
+    ' reload. Returns "OK:<safe id>" on success or "ERR:...".
+    Public Function SafeCreate(ByVal pw As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeCreateSafe(pw)
+        If Left$(r, 3) <> "OK:" Then
+            SafeCreate = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            SafeCreate = sv
+            Exit Function
+        End If
+        LoadAll
+        SafeCreate = r
+        Exit Function
+fail:
+        SafeCreate = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' gate/UI cleanup helper: remove a safe from the repository
+    Public Function SafeRemove(ByVal safeId As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeRemoveSafe(safeId)
+        If Left$(r, 3) <> "OK:" Then
+            SafeRemove = r
+            Exit Function
+        End If
+        BeSaveRepository
+        LoadAll
+        SafeRemove = ""
+        Exit Function
+fail:
+        SafeRemove = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' VB ToggleEncryptNoteFromUi up-branch: encrypt the note into an OPEN
+    ' safe (gateway sets SafeId + RefreshModifiedAt), save + reload.
+    Public Function EncryptToSafe(ByVal id As String, ByVal safeId As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeEncryptNoteToSafe(id, safeId)
+        If Left$(r, 3) <> "OK:" Then
+            EncryptToSafe = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            EncryptToSafe = sv
+            Exit Function
+        End If
+        LoadAll
+        EncryptToSafe = ""
+        Exit Function
+fail:
+        EncryptToSafe = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' VB ToggleEncryptNoteFromUi down-branch: decrypt + clear SafeId
+    ' (gateway), save + reload.
+    Public Function DecryptFromSafe(ByVal id As String) As String
+        On Error GoTo fail
+        Dim r As String
+        r = BeDecryptNoteFromSafe(id)
+        If Left$(r, 3) <> "OK:" Then
+            DecryptFromSafe = r
+            Exit Function
+        End If
+        Dim sv As String
+        sv = BeSaveRepository()
+        If Left$(sv, 4) = "ERR:" Then
+            DecryptFromSafe = sv
+            Exit Function
+        End If
+        LoadAll
+        DecryptFromSafe = ""
+        Exit Function
+fail:
+        DecryptFromSafe = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' read-only plain html of a safe note (passthrough: plain text, or
+    ' "ERR:safe_locked" / "ERR:..." when locked or failed)
+    Public Function DecryptContent(ByVal id As String) As String
+        On Error GoTo fail
+        DecryptContent = BeDecryptNoteContent(id)
+        Exit Function
+fail:
+        DecryptContent = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' P5-B import backup: close the gateway session, overwrite the WORK copy
+    ' with the backup file, reopen + reload. The caller passes the work copy
+    ' path; the original repository under D:\Documents is never a target.
+    Public Function RestoreFromBackup(ByVal srcPath As String, ByVal workPath As String) As Boolean
+        On Error GoTo fail
+        CloseRepo
+        If Len(Dir$(workPath, vbNormal)) > 0 Then Kill workPath
+        FileCopy srcPath, workPath
+        RestoreFromBackup = OpenExisting(workPath)
+        Exit Function
+fail:
+        m_lastErr = "RestoreFromBackup err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' ------------------------------------------------------------- sync io
+
+    ' gateway SaveRepository passthrough (the sync flow persists pending
+    ' edits before reading the file bytes)
+    Public Function SaveNow() As Boolean
+        On Error GoTo fail
+        If Not m_open Then Exit Function
+        Dim r As String
+        r = BeSaveRepository()
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "SaveRepository: " & r
+            Exit Function
+        End If
+        SaveNow = True
+        Exit Function
+fail:
+        m_lastErr = "SaveNow err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' gateway MergeRepositoryXml: merges the open repository with the cloud
+    ' xml (b64) and REPLACES the session with the merged repository.
+    ' Returns "OK:<eqLocal>|<eqCloud>|<mergedB64>" or "ERR:...".
+    Public Function MergeWithCloud(ByVal cloudXmlB64 As String) As String
+        On Error GoTo fail
+        MergeWithCloud = BeMergeRepositoryXml(cloudXmlB64)
+        Exit Function
+fail:
+        MergeWithCloud = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' opens the file as-is (NO copy - the sync flow rewrote it in place)
+    Public Function OpenExisting(ByVal path As String) As Boolean
+        On Error GoTo fail
+        If m_pure Is Nothing Then Set m_pure = New TbPureGw
+        Dim t0 As Long
+        t0 = GetTickCountR()
+        Dim r As String
+        r = m_pure.OpenRepository(path)
+        OpenMs = GetTickCountR() - t0
+        If Left$(r, 4) = "ERR:" Then
+            m_lastErr = "OpenRepository: " & r
+            Exit Function
+        End If
+        m_open = True
+        OpenExisting = LoadAll()
+        Exit Function
+fail:
+        m_lastErr = "OpenExisting err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' close + reopen the (externally rewritten) work file + reload
+    Public Function ReloadSession(ByVal path As String) As Boolean
+        CloseRepo
+        ReloadSession = OpenExisting(path)
+    End Function
+
+    ' ------------------------------------------------------------ html->text
+
+    ' Strips tags, decodes the common entities, collapses whitespace.
+    Public Function HtmlToText(ByVal h As String) As String
+        Dim L As Long, i As Long, p As Long
+        Dim out As String
+        Dim inTag As Boolean
+        Dim ch As String
+
+        L = Len(h)
+        If L = 0 Then Exit Function
+        out = Space$(L)
+        p = 0
+        inTag = False
+        For i = 1 To L
+            ch = Mid$(h, i, 1)
+            If inTag Then
+                If ch = ">" Then inTag = False
+            Else
+                If ch = "<" Then
+                    inTag = True
+                Else
+                    p = p + 1
+                    Mid$(out, p, 1) = ch
+                End If
+            End If
+        Next
+        out = Left$(out, p)
+
+        If InStr(out, "&") > 0 Then out = DecodeEntities(out)
+
+        out = Replace(out, vbCrLf, " ")
+        out = Replace(out, vbCr, " ")
+        out = Replace(out, vbLf, " ")
+        out = Replace(out, vbTab, " ")
+        out = Replace(out, ChrW$(&HA0&), " ")
+        Do While InStr(out, "  ") > 0
+            out = Replace(out, "  ", " ")
+        Loop
+        HtmlToText = Trim$(out)
+    End Function
+
+    Private Function DecodeEntities(ByVal s As String) As String
+        Dim p As Long, e As Long
+        Dim num As String
+        Dim v As Long
+        s = Replace(s, "&lt;", "<")
+        s = Replace(s, "&gt;", ">")
+        s = Replace(s, "&quot;", """")
+        s = Replace(s, "&apos;", "'")
+        s = Replace(s, "&nbsp;", " ")
+        ' numeric forms: &#123; and &#x1A;
+        p = InStr(s, "&#")
+        Do While p > 0
+            e = InStr(p + 2, s, ";")
+            If e = 0 Then Exit Do
+            num = Mid$(s, p + 2, e - p - 2)
+            v = -1
+            If Len(num) > 0 Then
+                If LCase$(Left$(num, 1)) = "x" Then
+                    v = CLng(Val("&H" & Mid$(num, 2) & "&"))
+                Else
+                    If IsNumericDigits(num) Then v = CLng(num)
+                End If
+            End If
+            If v >= 1 And v <= &HFFFF& Then
+                s = Left$(s, p - 1) & ChrW$(v) & Mid$(s, e + 1)
+                p = p + 1
+            Else
+                p = e + 1
+            End If
+            p = InStr(p, s, "&#")
+        Loop
+        ' named ampersand LAST (standard decoding order)
+        s = Replace(s, "&amp;", "&")
+        DecodeEntities = s
+    End Function
+
+    Private Function IsNumericDigits(ByVal s As String) As Boolean
+        Dim i As Long
+        If Len(s) = 0 Then Exit Function
+        For i = 1 To Len(s)
+            If InStr("0123456789", Mid$(s, i, 1)) = 0 Then Exit Function
+        Next
+        IsNumericDigits = True
+    End Function
+
+End Class

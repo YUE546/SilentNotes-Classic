@@ -1,0 +1,154 @@
+Option Explicit
+
+[Description("Repository conflict dialog: merge / keep local / keep cloud / cancel, modal")]
+[FormDesignerId("6D2B9E47-1C4A-4E8D-B3F6-9A2C5D8E7B13")]
+[PredeclaredId]
+Class MergeDlg
+
+    ' after the modal returns: "merge" | "local" | "cloud" | "" (cancel)
+    Public Choice As String
+    ' gate automation: non-empty = auto-pick that choice on first activate
+    Public GateChoice As String
+
+    Private m_once As Boolean
+    Private m_ownerHwnd As Long
+
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 384      ' client, physical px
+    Private Const DlgH As Long = 180
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    Public Sub Preload(ByVal ownerHwnd As Long)
+        Choice = ""
+        m_ownerHwnd = ownerHwnd
+    End Sub
+
+    Private Sub Form_Load()
+        Me.Caption = STitle()
+        lblMsg.Caption = SMsg()
+        cmdMerge.Caption = SMergeBtn()
+        cmdLocal.Caption = SLocalBtn()
+        cmdCloud.Caption = SCCloudBtn()
+        cmdCancel.Caption = SCancelBtn()
+        m_once = False
+        SnapCenter
+        lblMsg.Move 12, 16, 360, 44
+        cmdMerge.Move 16, 84, 172, 30
+        cmdLocal.Move 196, 84, 172, 30
+        cmdCloud.Move 16, 124, 172, 30
+        cmdCancel.Move 196, 124, 172, 30
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    Private Sub Form_Activate()
+        If m_once Then Exit Sub
+        m_once = True
+        If Len(GateChoice) > 0 Then
+            Dim g As String
+            g = GateChoice
+            GateChoice = ""
+            Select Case LCase$(g)
+                Case "merge": cmdMerge_Click
+                Case "local": cmdLocal_Click
+                Case "cloud": cmdCloud_Click
+                Case Else: cmdCancel_Click
+            End Select
+        End If
+    End Sub
+
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 27 Then
+            KeyCode = 0
+            cmdCancel_Click
+        End If
+    End Sub
+
+    Private Sub cmdMerge_Click()
+        Choice = "merge"
+        Me.Hide
+    End Sub
+
+    Private Sub cmdLocal_Click()
+        Choice = "local"
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCloud_Click()
+        Choice = "cloud"
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCancel_Click()
+        Choice = ""
+        Me.Hide
+    End Sub
+
+    ' ---------------------------------------------------- captions (ChrW$)
+
+    Private Function STitle() As String      ' 选择同步方式
+        STitle = ChrW$(&H9009&) & ChrW$(&H62E9&) & ChrW$(&H540C&) & ChrW$(&H6B65&) & _
+            ChrW$(&H65B9&) & ChrW$(&H5F0F&)
+    End Function
+
+    Private Function SMsg() As String        ' 本地与云端是不同的仓库，请选择处理方式：
+        SMsg = ChrW$(&H672C&) & ChrW$(&H5730&) & ChrW$(&H4E0E&) & ChrW$(&H4E91&) & _
+            ChrW$(&H7AEF&) & ChrW$(&H662F&) & ChrW$(&H4E0D&) & ChrW$(&H540C&) & ChrW$(&H7684&) & _
+            ChrW$(&H4ED3&) & ChrW$(&H5E93&) & ChrW$(&HFF0C&) & ChrW$(&H8BF7&) & ChrW$(&H9009&) & _
+            ChrW$(&H62E9&) & ChrW$(&H5904&) & ChrW$(&H7406&) & ChrW$(&H65B9&) & ChrW$(&H5F0F&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SMergeBtn() As String   ' 合并两个仓库
+        SMergeBtn = ChrW$(&H5408&) & ChrW$(&H5E76&) & ChrW$(&H4E24&) & ChrW$(&H4E2A&) & _
+            ChrW$(&H4ED3&) & ChrW$(&H5E93&)
+    End Function
+
+    Private Function SLocalBtn() As String   ' 使用本地仓库
+        SLocalBtn = ChrW$(&H4F7F&) & ChrW$(&H7528&) & ChrW$(&H672C&) & ChrW$(&H5730&) & _
+            ChrW$(&H4ED3&) & ChrW$(&H5E93&)
+    End Function
+
+    Private Function SCCloudBtn() As String  ' 使用云端仓库
+        SCCloudBtn = ChrW$(&H4F7F&) & ChrW$(&H7528&) & ChrW$(&H4E91&) & ChrW$(&H7AEF&) & _
+            ChrW$(&H4ED3&) & ChrW$(&H5E93&)
+    End Function
+
+    Private Function SCancelBtn() As String  ' 取消
+        SCancelBtn = ChrW$(&H53D6&) & ChrW$(&H6D88&)
+    End Function
+End Class

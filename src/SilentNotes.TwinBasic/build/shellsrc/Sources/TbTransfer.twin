@@ -1,0 +1,328 @@
+Option Explicit
+
+' TbTransfer - transfer-code repository encryption (P4 integration round).
+' Mirrors SynchronizationStoryStepBase.EncryptRepository of the frozen source:
+'   Cryptor("SilentNotes")   <-- plural package name, unlike notes ("SilentNote")
+'   PBKDF2-SHA1 (salt 16B) cost LOW = 1500 (transfer codes are strong passwords)
+'   AES-256-GCM, 16B nonce, tag appended to the cipher
+'   compression "gzip": the plaintext (repository XML bytes) is gzipped BEFORE
+'   encryption and gunzipped AFTER decryption (Cryptor.CompressUtils placement).
+' Byte-level interop proven against the net40 Core Cryptor both directions
+' (p3\syncprobe\transfer_probe.ps1, ALL PASS 2026-10-25).
+'
+' Chilkat.Gzip trap (probe-proven): the IDispatch surface exposes the VB6-style
+' CompressMemory/UncompressMemory, NOT the .NET-style CompressBytes names.
+
+Class TbTransfer
+
+    Private Const PackageRepo As String = "SilentNotes"
+    Private Const AlgorithmName As String = "aes_gcm"
+    Private Const KdfName As String = "pbkdf2"
+    Private Const CostLow As String = "1500"
+    Private Const CodeLength As Long = 16
+    ' unmixable alphabet (Workers\UnmixableAlphabet.cs): 56 chars, no 0/1/l/I/J/O
+    Private Const Alpha As String = "23456789ABCDEFGHKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+    Private m_Crypto As TbCrypto
+    Private m_Gz As Object
+    Private m_Ck As TbChilkat            ' per-operation EnterCtx (pit 23)
+    Private m_B64 As TbBase64
+    Private m_HP As TbHeaderPacker
+    Private m_U8 As TbUtf8
+    Private m_LastErr As String
+
+    Public Property Get LastErr() As String
+        LastErr = m_LastErr
+    End Property
+
+    Public Function Init(crypto As TbCrypto, chilkat As TbChilkat, ByRef errText As String) As Boolean
+        Set m_Crypto = crypto
+        Set m_Ck = chilkat
+        Set m_B64 = New TbBase64
+        Set m_HP = New TbHeaderPacker
+        Set m_U8 = New TbUtf8
+        Init = chilkat.GetChilkat("Chilkat.Gzip.1", m_Gz, errText)
+    End Function
+
+    ' ------------------------------------------------------------------ gzip
+
+    Public Function GzipBytes(data() As Byte, ByRef out() As Byte) As Boolean
+        On Error GoTo fail
+        If Not m_Ck.EnterCtx() Then GoTo fail
+        Dim v As Variant
+        v = m_Gz.CompressMemory(data)
+        If Not IsArray(v) Then GoTo fail
+        Dim ba() As Byte
+        ba = v
+        out = ba
+        GzipBytes = True
+        m_Ck.ExitCtx
+        Exit Function
+    fail:
+        m_Ck.ExitCtx
+        m_LastErr = "gzip compress failed (le=" & Err.Number & ")"
+    End Function
+
+    Public Function GunzipBytes(data() As Byte, ByRef out() As Byte) As Boolean
+        On Error GoTo fail
+        If Not m_Ck.EnterCtx() Then GoTo fail
+        Dim v As Variant
+        v = m_Gz.UncompressMemory(data)
+        If Not IsArray(v) Then GoTo fail
+        If m_Gz.LastMethodSuccess = 0 Then
+            m_LastErr = "gunzip failed (not gzip data?)"
+            m_Ck.ExitCtx
+            Exit Function
+        End If
+        Dim ba() As Byte
+        ba = v
+        out = ba
+        GunzipBytes = True
+        m_Ck.ExitCtx
+        Exit Function
+    fail:
+        m_Ck.ExitCtx
+        m_LastErr = "gunzip failed (le=" & Err.Number & ")"
+    End Function
+
+    ' --------------------------------------------------------------- encrypt
+
+    ' repository xml bytes -> packed encrypted bytes (gzip + gcm + header)
+    Public Function EncryptRepo(xmlBytes() As Byte, transferCode As String, ByRef packed() As Byte) As Boolean
+        On Error GoTo fail
+        m_LastErr = ""
+        If Len(transferCode) < 5 Then
+            m_LastErr = "transfer code too short"
+            Exit Function
+        End If
+
+        Dim gz() As Byte
+        If Not GzipBytes(xmlBytes, gz) Then Exit Function
+
+        If Not m_Ck.EnterCtx() Then
+            m_LastErr = "EnterCtx failed le=" & CStr(m_Ck.LastActivateError)
+            Exit Function
+        End If
+        Dim crypt As Object
+        Set crypt = m_Crypto.Crypt
+
+        Dim nonce() As Byte, salt() As Byte
+        nonce = m_Crypto.RandomBytesN(16)
+        salt = m_Crypto.RandomBytesN(16)
+
+        Dim keyHex As String
+        keyHex = crypt.Pbkdf2(transferCode, "utf-8", "sha1", m_Crypto.BytesToHex(salt), CLng(CostLow), 256, "hex")
+
+        crypt.CryptAlgorithm = "aes"
+        crypt.CipherMode = "gcm"
+        crypt.KeyLength = 256
+        crypt.SetEncodedIV m_Crypto.BytesToHex(nonce), "hex"
+        crypt.SetEncodedKey keyHex, "hex"
+
+        Dim enc As Variant
+        enc = crypt.EncryptBytes(gz)
+        If Not IsArray(enc) Then GoTo encryptFail
+        If crypt.LastMethodSuccess = 0 Then GoTo encryptFail
+
+        Dim tagHex As String
+        tagHex = crypt.GetEncodedAuthTag("hex")
+        Dim tag() As Byte
+        tag = m_Crypto.HexToBytes(tagHex)
+        If ArrLen(tag) <> 16 Then
+            m_Ck.ExitCtx
+            m_LastErr = "GetEncodedAuthTag returned " & ArrLen(tag) & " bytes"
+            Exit Function
+        End If
+
+        Dim full() As Byte
+        full = ConcatBytes(enc, tag)
+        m_Ck.ExitCtx
+        packed = m_HP.Pack(PackageRepo, 2, AlgorithmName, nonce, KdfName, salt, CostLow, "gzip", full)
+        EncryptRepo = True
+        Exit Function
+    encryptFail:
+        m_Ck.ExitCtx
+        m_LastErr = "EncryptBytes failed; LastMethodSuccess=" & crypt.LastMethodSuccess
+        Exit Function
+    fail:
+        m_Ck.ExitCtx
+        m_LastErr = "EncryptRepo le=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' --------------------------------------------------------------- decrypt
+
+    ' packed bytes -> repository xml bytes. Wrong transfer code fails with
+    ' LastErr = "wrong_transfer_code" (GCM auth failure).
+    Public Function DecryptRepo(packedBytes() As Byte, transferCode As String, ByRef xmlBytes() As Byte) As Boolean
+        On Error GoTo fail
+        m_LastErr = ""
+
+        Dim header As TbCryptoHeader
+        Dim cipherFull() As Byte
+        If Not m_HP.Unpack(packedBytes, PackageRepo, header, cipherFull, m_LastErr) Then
+            m_LastErr = "bad_cipher_format: " & m_LastErr
+            Exit Function
+        End If
+        If StrComp(header.AlgorithmName, AlgorithmName, vbTextCompare) <> 0 Then
+            m_LastErr = "unsupported_algorithm:" & header.AlgorithmName
+            Exit Function
+        End If
+        If ArrLen(cipherFull) <= 16 Then
+            m_LastErr = "bad_cipher_format: cipher too short"
+            Exit Function
+        End If
+
+        Dim clen As Long
+        clen = ArrLen(cipherFull) - 16
+        Dim cipherOnly() As Byte
+        ReDim cipherOnly(0 To clen - 1)
+        Dim i As Long
+        For i = 0 To clen - 1
+            cipherOnly(i) = cipherFull(i)
+        Next
+
+        Dim crypt As Object
+        Set crypt = m_Crypto.Crypt
+        Dim salt() As Byte
+        salt = header.Salt
+        If Not m_Ck.EnterCtx() Then
+            m_LastErr = "EnterCtx failed le=" & CStr(m_Ck.LastActivateError)
+            Exit Function
+        End If
+        Dim keyHex As String
+        keyHex = crypt.Pbkdf2(transferCode, "utf-8", "sha1", m_Crypto.BytesToHex(salt), CLng(header.Cost), 256, "hex")
+
+        crypt.CryptAlgorithm = "aes"
+        crypt.CipherMode = "gcm"
+        crypt.KeyLength = 256
+        crypt.SetEncodedIV m_Crypto.BytesToHex(header.Nonce), "hex"
+        crypt.SetEncodedKey keyHex, "hex"
+
+        Dim tag() As Byte
+        ReDim tag(0 To 15)
+        For i = 0 To 15
+            tag(i) = cipherFull(clen + i)
+        Next
+        crypt.SetEncodedAuthTag m_Crypto.BytesToHex(tag), "hex"
+
+        Dim plain As Variant
+        plain = crypt.DecryptBytes(cipherOnly)
+        If Not IsArray(plain) Then GoTo wrongCode
+        If crypt.LastMethodSuccess = 0 Then GoTo wrongCode
+        m_Ck.ExitCtx                       ' decrypt done (gunzip self-wraps)
+        Dim gzOut() As Byte
+        gzOut = plain
+
+        If StrComp(header.Compression, "gzip", vbTextCompare) = 0 Then
+            If Not GunzipBytes(gzOut, xmlBytes) Then Exit Function
+        Else
+            xmlBytes = gzOut
+        End If
+        DecryptRepo = True
+        Exit Function
+    wrongCode:
+        m_Ck.ExitCtx
+        m_LastErr = "wrong_transfer_code"
+        Exit Function
+    fail:
+        m_Ck.ExitCtx
+        m_LastErr = "DecryptRepo le=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' "SilentNotes..." header prefix -> the blob is an encrypted repository
+    Public Function LooksEncrypted(data() As Byte) As Boolean
+        Dim nb() As Byte
+        nb = m_U8.Encode(PackageRepo)
+        LooksEncrypted = ContainsAt(data, nb, 0)
+    End Function
+
+    ' ----------------------------------------------------------- code format
+
+    ' new 16-char code from the unmixable alphabet (TransferCode.GenerateCode)
+    Public Function GenerateCode() As String
+        Dim s As String
+        Dim n As Long
+        n = 0
+        Do While n < CodeLength
+            Dim raw() As Byte
+            raw = m_Crypto.RandomBytesN(24)
+            Dim b64 As String
+            b64 = m_B64.Encode(raw)
+            Dim i As Long
+            For i = 1 To Len(b64)
+                If n >= CodeLength Then Exit For
+                If InAlphabet(Mid$(b64, i, 1)) Then
+                    s = s & Mid$(b64, i, 1)
+                    n = n + 1
+                End If
+            Next
+        Loop
+        GenerateCode = s
+    End Function
+
+    Private Function InAlphabet(ByVal ch As String) As Boolean
+        Dim i As Long
+        For i = 1 To Len(Alpha)
+            If StrComp(Mid$(Alpha, i, 1), ch, vbBinaryCompare) = 0 Then
+                InAlphabet = True
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' strips spaces and dashes; "" when the input is not a valid 16-char code
+    Public Function SanitizeCode(ByVal userInput As String) As String
+        Dim s As String
+        s = Replace(userInput, " ", "")
+        s = Replace(s, "-", "")
+        If Len(s) <> CodeLength Then Exit Function
+        Dim i As Long
+        For i = 1 To Len(s)
+            If Not InAlphabet(Mid$(s, i, 1)) Then Exit Function
+        Next
+        SanitizeCode = s
+    End Function
+
+    ' "XXXX XXXX XXXX XXXX" (TransferCode.FormatTransferCodeForDisplay)
+    Public Function FormatCodeForDisplay(ByVal code As String) As String
+        If Len(code) < CodeLength Then Exit Function
+        FormatCodeForDisplay = Mid$(code, 1, 4) & " " & Mid$(code, 5, 4) & " " & _
+            Mid$(code, 9, 4) & " " & Mid$(code, 13, 4)
+    End Function
+
+    ' -------------------------------------------------------------- helpers
+
+    Private Function ContainsAt(data() As Byte, needle() As Byte, ByVal at As Long) As Boolean
+        Dim i As Long
+        If at + ArrLen(needle) > ArrLen(data) Then Exit Function
+        For i = 0 To ArrLen(needle) - 1
+            If data(at + i) <> needle(i) Then Exit Function
+        Next
+        ContainsAt = True
+    End Function
+
+    Private Function ConcatBytes(a As Variant, b() As Byte) As Byte()
+        Dim la As Long, lb As Long
+        la = UBound(a) + 1
+        lb = ArrLen(b)
+        Dim out() As Byte
+        ReDim out(0 To la + lb - 1)
+        Dim i As Long
+        For i = 0 To la - 1
+            out(i) = a(i)
+        Next
+        For i = 0 To lb - 1
+            out(la + i) = b(i)
+        Next
+        ConcatBytes = out
+    End Function
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

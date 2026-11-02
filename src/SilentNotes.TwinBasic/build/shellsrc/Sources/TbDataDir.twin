@@ -1,0 +1,52 @@
+Option Explicit
+
+' TbDataDir - effective data directory resolver.
+' Replicates SilentNotes.WindowsVb/WindowsDataDirectoryService semantics:
+' the single source of truth is the VALUE "DataDirectory" under
+' HKCU\Software\SilentNotes (a value, not a subkey). When missing/empty,
+' fall back (real shell: %APPDATA%\SilentNotes; tB shell: exe directory).
+
+Class TbDataDir
+
+    Private Const RegPath As String = "HKCU\Software\SilentNotes\DataDirectory"
+
+    ' Reads the registry value; empty string when absent or unreadable.
+    Public Function ReadFromRegistry() As String
+        On Error Resume Next
+        Dim v As Variant
+        Err.Clear
+        v = CreateObject("WScript.Shell").RegRead(RegPath)
+        If Err.Number <> 0 Then
+            ReadFromRegistry = ""
+            Exit Function
+        End If
+        If IsEmpty(v) Or IsNull(v) Then
+            ReadFromRegistry = ""
+        Else
+            ReadFromRegistry = CStr(v)
+        End If
+    End Function
+
+    ' Effective directory: registry value when non-empty, otherwise exe directory.
+    Public Function GetEffectiveDirectory() As String
+        Dim v As String
+        v = ReadFromRegistry()
+        If Len(v) > 0 Then
+            GetEffectiveDirectory = v
+        Else
+            GetEffectiveDirectory = App.Path
+        End If
+    End Function
+
+    ' Writes the registry VALUE (same value name/location the .NET shells
+    ' read). Takes effect after a restart - the caller confirms first.
+    ' Returns True when the write reported no error.
+    Public Function WriteToRegistry(ByVal dirPath As String) As Boolean
+        On Error GoTo fail
+        CreateObject("WScript.Shell").RegWrite RegPath, dirPath, "REG_SZ"
+        WriteToRegistry = True
+        Exit Function
+fail:
+    End Function
+
+End Class

@@ -1,0 +1,35 @@
+Option Explicit
+
+' TbCryptoHeader - unpacked encryption header (port of SilentNotes CryptoHeader).
+' VB6/TLB classes cannot carry Public arrays, so the byte arrays travel as
+' Variants holding Byte().
+
+Class TbCryptoHeader
+
+    Public PackageName As String
+    Public Revision As Long
+    Public AlgorithmName As String
+    Public KdfName As String
+    Public Cost As String
+    Public Compression As String
+
+    Private m_Nonce As Variant
+    Private m_Salt As Variant
+
+    Public Property Get Nonce() As Variant
+        Nonce = m_Nonce
+    End Property
+
+    Public Property Let Nonce(v As Variant)
+        m_Nonce = v
+    End Property
+
+    Public Property Get Salt() As Variant
+        Salt = m_Salt
+    End Property
+
+    Public Property Let Salt(v As Variant)
+        m_Salt = v
+    End Property
+
+End Class

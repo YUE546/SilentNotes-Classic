@@ -1,0 +1,744 @@
+Option Explicit
+
+' TbPureGw - drop-in gateway shim over the pure tB model stack (route B
+' integration): the same method surface as SilentNotes.ComGateway.Gateway
+' for the TbRepo wrapper, implemented with TbRepoModel (typed repository +
+' writer), TbSafeCore (safe key service, Chilkat-backed) and TbMergeModel
+' (merger). No .NET. State = the model globals (single UI thread).
+'
+' Fidelity: untouched repositories replay verbatim (Serialize raw mode);
+' mutated ones are rebuilt in the Core XmlSerializer dialect (phase 2/3A
+' differential conclusion). The safes container rebuilds only when touched
+' (TbRepoModel.SafesTouched), otherwise raw replay keeps byte parity.
+
+Class TbPureGw
+
+    Private Const PkgSafe As String = "SilentSafe"
+    Private Const PkgNote As String = "SilentNote"
+    Private Const ChilkatDir As String = "D:\vibe coding\silentnotes\src\SilentNotes.TwinBasic\chilkat-new-win32\chilkatax-win32"
+
+    Private m_path As String
+    Private m_open As Boolean
+    Private m_ck As TbChilkat
+    Private m_crypto As TbCrypto
+    Private m_safe As TbSafeCore
+    Private m_safeReady As Boolean
+    Private m_b64 As TbBase64
+    Private m_u8 As TbUtf8
+
+    ' debug trace (route B integration; removed after the round)
+    Public Sub DLog(ByVal msg As String)
+        On Error Resume Next
+        Dim ffn As Integer
+        ffn = FreeFile
+        Open "D:\vibe coding\silentnotes\src\SilentNotes.TwinBasic\temp\pure_gw_debug.log" For Append As #ffn
+        Print #ffn, Format$(Now, "hhnnss") & " " & msg
+        Close #ffn
+    End Sub
+
+    Private Sub EnsureSafeSvc()
+        On Error GoTo fail
+        If m_safeReady Then Exit Sub
+        If m_ck Is Nothing Then
+            ' no attached instances (AttachCrypto) - self-initialize
+            Set m_ck = New TbChilkat
+            If Not m_ck.Init(ChilkatDir & "\chilkat.manifest", ChilkatDir) Then
+                Err.Raise 1816, "TbPureGw", "chilkat actx init failed"
+            End If
+        End If
+        If m_crypto Is Nothing Then Set m_crypto = New TbCrypto
+        Dim et As String
+        If Not m_crypto.Init(m_ck, et) Then
+            Err.Raise 1816, "TbPureGw", "crypto init: " & et
+        End If
+        If m_safe Is Nothing Then Set m_safe = New TbSafeCore
+        If Not m_safe.Init(m_crypto, et) Then
+            Err.Raise 1816, "TbPureGw", "safe init: " & et
+        End If
+        m_safeReady = True
+        Exit Sub
+fail:
+        Err.Raise 1816, "TbPureGw", "safe svc init err=" & Err.Number & " " & Err.Description
+    End Sub
+
+    ' share the shell's Chilkat/crypto pair (avoids a second activation
+    ' context; call after SyncEnsureInfra, before the first safe operation)
+    Public Sub AttachCrypto(ck As TbChilkat, crypto As TbCrypto)
+        Set m_ck = ck
+        Set m_crypto = crypto
+        If Not m_safeReady Then
+            If m_safe Is Nothing Then Set m_safe = New TbSafeCore
+            Dim et As String
+            If m_safe.Init(m_crypto, et) Then m_safeReady = True
+        End If
+    End Sub
+
+    ' ------------------------------------------------------------- session
+
+    Public Function OpenRepository(ByVal path As String) As String
+        On Error GoTo fail
+        Dim inB() As Byte
+        Dim ffn As Integer
+        Dim n As Long
+        Dim hasBom As Boolean
+        Dim decOff As Long
+        ffn = FreeFile
+        Open path For Binary Access Read As #ffn
+        n = LOF(ffn)
+        ReDim inB(0 To n - 1)
+        Get #ffn, , inB
+        Close #ffn
+        hasBom = False
+        decOff = 0
+        If n >= 3 Then
+            If inB(0) = &HEF And inB(1) = &HBB And inB(2) = &HBF Then
+                hasBom = True
+                decOff = 3
+            End If
+        End If
+        Dim body() As Byte
+        ReDim body(0 To n - 1 - decOff)
+        Dim i As Long
+        For i = 0 To UBound(body)
+            body(i) = inB(decOff + i)
+        Next
+        m_path = path
+        If m_u8 Is Nothing Then Set m_u8 = New TbUtf8
+        If m_b64 Is Nothing Then Set m_b64 = New TbBase64
+        TbRepoModel.ResetModel
+        DLog "OpenRepository path=" & path
+        TbRepoModel.ModelLoadFromString m_u8.Decode(body)
+        m_open = True
+        OpenRepository = "OK"
+        Exit Function
+fail:
+        OpenRepository = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    Public Sub CloseRepository()
+        If Not m_safe Is Nothing Then m_safe.CloseAllSafes
+        m_open = False
+    End Sub
+
+    ' write the current model state to the work file (BOM + UTF-8, byte
+    ' parity with the original clients' layout via Serialize's dialect)
+    Private Function PureSave() As Boolean
+        Dim s As String
+        s = TbRepoModel.Serialize()
+        Dim enc() As Byte
+        enc = m_u8.Encode(s)
+        Dim full() As Byte
+        ReDim full(0 To 2 + UBound(enc))
+        full(0) = &HEF
+        full(1) = &HBB
+        full(2) = &HBF
+        Dim i As Long
+        For i = 0 To UBound(enc)
+            full(3 + i) = enc(i)
+        Next
+        If Len(Dir$(m_path, vbNormal)) > 0 Then Kill m_path
+        Dim ffn As Integer
+        ffn = FreeFile
+        Open m_path For Binary Access Write As #ffn
+        Put #ffn, , full
+        Close #ffn
+        PureSave = True
+    End Function
+
+    ' ------------------------------------------------------------- reads
+
+    Public Function NoteCount() As Long
+        NoteCount = TbRepoModel.n_Count
+    End Function
+
+    ' the 11-field pipe format TbRepo.ParseMeta expects
+    Public Function NoteMeta(ByVal i As Long) As String
+        Dim isoC As String, isoM As String, isoMeta As String
+        isoC = KeyIso(TbRepoModel.n_CreatedKey(i))
+        isoM = KeyIso(TbRepoModel.n_ModKey(i))
+        If TbRepoModel.n_HasMeta(i) Then isoMeta = KeyIso(TbRepoModel.n_MetaKey(i))
+        Dim tg As String
+        tg = TagsJoined(i)
+        NoteMeta = TbRepoModel.n_Id(i) & "|" & _
+            IIf(TbRepoModel.n_Pin(i), "1", "0") & "|" & _
+            IIf(TbRepoModel.n_InBin(i), "1", "0") & "|" & _
+            IIf(TbRepoModel.n_Shop(i), "1", "0") & "|" & _
+            CStr(TbRepoModel.n_Type(i)) & "|" & _
+            TbRepoModel.n_Bg(i) & "|" & _
+            isoC & "|" & isoM & "|" & isoMeta & "|" & _
+            TbRepoModel.n_SafeId(i) & "|" & tg
+    End Function
+
+    Public Function NoteHtml(ByVal i As Long) As String
+        NoteHtml = TbRepoModel.n_Html(i)
+    End Function
+
+    Private Function KeyIso(ByRef key As String) As String
+        If Len(key) = 0 Then Exit Function
+        KeyIso = TbRepoModel.FormatTicksIso(TbRepoModel.DateKeyToTicks(key))
+    End Function
+
+    ' US-joined tags of model note i (array semantics, TbRepo.TagSep)
+    Private Function TagsJoined(ByVal i As Long) As String
+        Dim k As Long
+        Dim s As String
+        For k = 0 To TbRepoModel.n_TagCount(i) - 1
+            If Len(s) > 0 Then s = s & ChrW$(31)
+            s = s & TbRepoModel.n_Tags(k, i)
+        Next
+        TagsJoined = s
+    End Function
+
+    ' ------------------------------------------------------------- crud
+
+    Public Function AddNote(ByVal html As String) As String
+        On Error GoTo fail
+        Dim stage As String
+        stage = "guid"
+        Dim id As String
+        id = TbRepoModel.NewGuidText()
+        stage = "op"
+        TbRepoModel.OpAddNote id, html, TbRepoModel.UtcNowTicks()
+        DLog "AddNote id=" & id & " n_Count=" & TbRepoModel.n_Count & " orig=" & TbRepoModel.n_OriginalCount
+        AddNote = id
+        Exit Function
+fail:
+        DLog "AddNote FAIL stage=" & stage & " err=" & Err.Number & " " & Err.Description
+        AddNote = "ERR:stage=" & stage & " err=" & Err.Number & " " & Err.Description
+    End Function
+
+    Public Function UpdateNoteHtml(ByVal id As String, ByVal html As String) As String
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        DLog "UpdateNoteHtml id=" & id & " idx=" & idx & " n_Count=" & TbRepoModel.n_Count
+        If idx < 0 Then
+            UpdateNoteHtml = "ERR:note not found"
+            Exit Function
+        End If
+        If TbRepoModel.n_HasSafe(idx) Then
+            ' locked -> refuse (VB stores nothing); open -> transparent
+            ' re-encrypt (VB SaveSelectedNote semantics)
+            If Not m_safe.IsOpen(TbRepoModel.n_SafeId(idx)) Then
+                UpdateNoteHtml = "ERR:safe_locked"
+                Exit Function
+            End If
+            Dim packed As String
+            packed = EncryptPlainToSafe(TbRepoModel.n_SafeId(idx), html)
+            If Left$(packed, 4) = "ERR:" Then
+                UpdateNoteHtml = packed
+                Exit Function
+            End If
+            TbRepoModel.n_Html(idx) = packed
+            TbRepoModel.n_ModKey(idx) = TbRepoModel.TicksToDateKey(TbRepoModel.UtcNowTicks())
+            ' direct field mutation on a SER_RAW subtree -> must re-emit from typed fields
+            TbRepoModel.n_SerMode(idx) = TbRepoModel.SER_REBUILD
+            UpdateNoteHtml = "1"
+            Exit Function
+        End If
+        TbRepoModel.OpUpdateHtml idx, html, TbRepoModel.UtcNowTicks()
+        UpdateNoteHtml = "1"
+    End Function
+
+    Public Function DeleteNote(ByVal id As String) As String
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            DeleteNote = "ERR:note not found"
+            Exit Function
+        End If
+        TbRepoModel.OpHardDelete idx, TbRepoModel.UtcNowTicks()
+        DeleteNote = "1"
+    End Function
+
+    Public Function SetNotePinned(ByVal id As String, ByVal pinned As Boolean) As String
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            SetNotePinned = "ERR:note not found"
+            Exit Function
+        End If
+        TbRepoModel.OpSetPinned idx, pinned, TbRepoModel.UtcNowTicks()
+        SetNotePinned = "1"
+    End Function
+
+    Public Function SetNoteTags(ByVal id As String, ByVal usJoined As String) As String
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            SetNoteTags = "ERR:note not found"
+            Exit Function
+        End If
+        TbRepoModel.OpSetTags idx, usJoined, TbRepoModel.UtcNowTicks()
+        SetNoteTags = "1"
+    End Function
+
+    Public Function SetNoteRecyclingBin(ByVal id As String, ByVal inBin As Boolean) As String
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            SetNoteRecyclingBin = "ERR:note not found"
+            Exit Function
+        End If
+        TbRepoModel.OpSetRecyclingBin idx, inBin, TbRepoModel.UtcNowTicks()
+        SetNoteRecyclingBin = "OK:1"
+    End Function
+
+    Public Function SaveRepository() As String
+        On Error GoTo fail
+        Dim stage As String
+        stage = "serialize"
+        Dim s As String
+        s = TbRepoModel.Serialize()
+        stage = "encode"
+        Dim enc() As Byte
+        enc = m_u8.Encode(s)
+        stage = "write"
+        Dim full() As Byte
+        ReDim full(0 To UBound(enc) + 3)
+        full(0) = &HEF
+        full(1) = &HBB
+        full(2) = &HBF
+        Dim i As Long
+        For i = 0 To UBound(enc)
+            full(3 + i) = enc(i)
+        Next
+        If Len(Dir$(m_path, vbNormal)) > 0 Then Kill m_path
+        Dim ffn As Integer
+        ffn = FreeFile
+        Open m_path For Binary Access Write As #ffn
+        Put #ffn, , full
+        Close #ffn
+        SaveRepository = "1"
+        Exit Function
+fail:
+        SaveRepository = "ERR:stage=" & stage & " err=" & Err.Number & " " & Err.Description
+    End Function
+
+    ' ------------------------------------------------------------- safes
+
+    ' key blob of model safe i, extracted from the verbatim subtree
+    Private Function SafeKeyBlob(ByVal i As Long) As String
+        Dim p As Long, e As Long
+        p = InStr(1, TbRepoModel.s_Raw(i), "<key>", vbBinaryCompare)
+        If p <= 0 Then Exit Function
+        p = p + 5
+        e = InStr(p, TbRepoModel.s_Raw(i), "</key>", vbBinaryCompare)
+        If e <= p Then Exit Function
+        SafeKeyBlob = Mid$(TbRepoModel.s_Raw(i), p, e - p)
+    End Function
+
+    Private Function SafeIdxById(ByVal safeId As String) As Long
+        Dim i As Long
+        SafeIdxById = -1
+        For i = 0 To TbRepoModel.s_Count - 1
+            If StrComp(TbRepoModel.s_Id(i), safeId, vbTextCompare) = 0 Then
+                SafeIdxById = i
+                Exit Function
+            End If
+        Next
+    End Function
+
+    Public Function IsSafeOpen(ByVal safeId As String) As String
+        EnsureSafeSvc
+        IsSafeOpen = IIf(m_safe.IsOpen(safeId), "1", "0")
+    End Function
+
+    Public Function FirstOpenSafeId() As String
+        EnsureSafeSvc
+        Dim i As Long
+        For i = 0 To TbRepoModel.s_Count - 1
+            If m_safe.IsOpen(TbRepoModel.s_Id(i)) Then
+                FirstOpenSafeId = TbRepoModel.s_Id(i)
+                Exit Function
+            End If
+        Next
+    End Function
+
+    ' rows US-joined, fields |-joined (id|created|modified|maintained|open|algo)
+    Public Function ListSafes() As String
+        On Error GoTo fail
+        EnsureSafeSvc
+        Dim i As Long
+        Dim s As String
+        For i = 0 To TbRepoModel.s_Count - 1
+            If Len(s) > 0 Then s = s & ChrW$(31)
+            s = s & TbRepoModel.s_Id(i) & "|" & _
+                KeyIso(TbRepoModel.s_CreatedKey(i)) & "|" & _
+                KeyIso(TbRepoModel.s_ModKey(i)) & "|" & _
+                IIf(TbRepoModel.s_HasMaint(i), KeyIso(TbRepoModel.s_MaintKey(i)), "") & "|" & _
+                IIf(m_safe.IsOpen(TbRepoModel.s_Id(i)), "1", "0") & "|" & _
+                SafeAlgoOf(i)
+        Next
+        ListSafes = s
+        Exit Function
+fail:
+        ListSafes = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' "aes_gcm+pbkdf2+25000" from the key blob's rev2 header (SilentSafe
+    ' v=2$alg$nonce$kdf$salt$cost$compression)
+    Private Function SafeAlgoOf(ByVal i As Long) As String
+        Dim blob As String
+        blob = SafeKeyBlob(i)
+        Dim dec As String
+        dec = BlobToText(blob)
+        Dim parts() As String
+        parts = Split(dec, "$")
+        If UBound(parts) < 5 Then
+            SafeAlgoOf = "unknown"
+            Exit Function
+        End If
+        SafeAlgoOf = parts(1) & "+" & parts(3) & "+" & parts(5)
+    End Function
+
+    ' base64 blob -> header text head (the rev2 header is plain ASCII up to
+    ' the last '$' of the seven fields; decoding the whole blob is fine)
+    Private Function BlobToText(ByVal b64 As String) As String
+        Dim v As Variant
+        v = m_b64.Decode(b64)
+        If Not IsArray(v) Then Exit Function
+        Dim ba() As Byte
+        ba = v
+        If UBound(ba) > 240 Then ba = CopiedBytes(ba, 240)
+        BlobToText = m_u8.Decode(ba)
+    End Function
+
+    Private Function CopiedBytes(ByRef src() As Byte, ByVal maxN As Long) As Byte()
+        Dim n As Long
+        n = UBound(src) + 1
+        If n > maxN Then n = maxN
+        Dim outB() As Byte
+        ReDim outB(0 To n - 1)
+        Dim i As Long
+        For i = 0 To n - 1
+            outB(i) = src(i)
+        Next
+        CopiedBytes = outB
+    End Function
+
+    ' VB TryOpenSafes: one password against every safe (re-open semantics
+    ' live in TbSafeCore.OpenSafe). "OK:<n>" / "ERR:wrong_password".
+    Public Function OpenSafesWithPassword(ByVal pw As String) As String
+        EnsureSafeSvc
+        Dim i As Long
+        Dim okN As Long
+        Dim needsRe As Boolean
+        Dim et As String
+        For i = 0 To TbRepoModel.s_Count - 1
+            If m_safe.OpenSafe(TbRepoModel.s_Id(i), SafeKeyBlob(i), pw, needsRe, et) Then
+                okN = okN + 1
+            End If
+        Next
+        If okN = 0 Then
+            OpenSafesWithPassword = "ERR:wrong_password"
+        Else
+            OpenSafesWithPassword = "OK:" & CStr(okN)
+        End If
+    End Function
+
+    Public Function CloseAllSafes() As String
+        EnsureSafeSvc
+        m_safe.CloseAllSafes
+        CloseAllSafes = "OK:1"
+    End Function
+
+    ' VB TryCreateSafe: create (Core semantics) + open-verify + add to the
+    ' model safes (touched -> container rebuild). "OK:<id>" / "ERR:...".
+    Public Function CreateSafe(ByVal pw As String) As String
+        EnsureSafeSvc
+        Dim keyB64 As String, keyHex As String, et As String
+        If Not m_safe.CreateSafe(pw, keyB64, keyHex, et) Then
+            CreateSafe = "ERR:" & et
+            Exit Function
+        End If
+        Dim id As String
+        id = TbRepoModel.NewGuidText()
+        Dim nowKey As String
+        nowKey = TbRepoModel.TicksToDateKey(TbRepoModel.UtcNowTicks())
+        Dim n As Long
+        n = TbRepoModel.s_Count
+        ReDim Preserve TbRepoModel.s_Id(0 To n)
+        ReDim Preserve TbRepoModel.s_CreatedKey(0 To n)
+        ReDim Preserve TbRepoModel.s_ModKey(0 To n)
+        ReDim Preserve TbRepoModel.s_HasMaint(0 To n)
+        ReDim Preserve TbRepoModel.s_MaintKey(0 To n)
+        ReDim Preserve TbRepoModel.s_Raw(0 To n)
+        TbRepoModel.s_Id(n) = id
+        TbRepoModel.s_CreatedKey(n) = nowKey
+        TbRepoModel.s_ModKey(n) = nowKey
+        TbRepoModel.s_HasMaint(n) = False
+        TbRepoModel.s_MaintKey(n) = ""
+        TbRepoModel.s_Raw(n) = "<safe id=""" & id & """ created_at=""" & _
+            KeyIso(nowKey) & """ modified_at=""" & KeyIso(nowKey) & """>" & _
+            vbCrLf & "      <key>" & keyB64 & "</key>" & vbCrLf & "    </safe>"
+        TbRepoModel.s_Count = n + 1
+        TbRepoModel.SafesTouched = True
+        ' open-verify (VB TryCreateSafe opens the fresh safe)
+        Dim needsRe As Boolean
+        If Not m_safe.OpenSafe(id, keyB64, pw, needsRe, et) Then
+            CreateSafe = "ERR:" & et
+            Exit Function
+        End If
+        CreateSafe = "OK:" & id
+    End Function
+
+    Public Function RemoveSafe(ByVal safeId As String) As String
+        Dim i As Long
+        i = SafeIdxById(safeId)
+        If i < 0 Then
+            RemoveSafe = "ERR:safe not found"
+            Exit Function
+        End If
+        For i = i To TbRepoModel.s_Count - 2
+            TbRepoModel.s_Id(i) = TbRepoModel.s_Id(i + 1)
+            TbRepoModel.s_CreatedKey(i) = TbRepoModel.s_CreatedKey(i + 1)
+            TbRepoModel.s_ModKey(i) = TbRepoModel.s_ModKey(i + 1)
+            TbRepoModel.s_HasMaint(i) = TbRepoModel.s_HasMaint(i + 1)
+            TbRepoModel.s_MaintKey(i) = TbRepoModel.s_MaintKey(i + 1)
+            TbRepoModel.s_Raw(i) = TbRepoModel.s_Raw(i + 1)
+        Next
+        TbRepoModel.s_Count = TbRepoModel.s_Count - 1
+        TbRepoModel.SafesTouched = True
+        RemoveSafe = "OK:1"
+    End Function
+
+    ' plain html -> the safe's packed content form (base64 of the UTF-8
+    ' plaintext goes through TbSafeCore.EncryptNote)
+    Private Function EncryptPlainToSafe(ByVal safeId As String, ByVal plainHtml As String) As String
+        EnsureSafeSvc
+        If Len(plainHtml) = 0 Then
+            EncryptPlainToSafe = "ERR:empty_content"
+            Exit Function
+        End If
+        Dim keyHex As String
+        keyHex = m_safe.KeyHexOf(safeId)
+        If Len(keyHex) = 0 Then
+            EncryptPlainToSafe = "ERR:safe_locked"
+            Exit Function
+        End If
+        Dim plainB64 As String
+        plainB64 = m_b64.Encode(m_u8.Encode(plainHtml))
+        Dim et As String
+        EncryptPlainToSafe = m_safe.EncryptNote(keyHex, plainB64, et)
+        If Left$(EncryptPlainToSafe, 4) = "ERR:" Then Exit Function
+        If Len(EncryptPlainToSafe) = 0 Then EncryptPlainToSafe = "ERR:encrypt"
+    End Function
+
+    Public Function EncryptNoteToSafe(ByVal id As String, ByVal safeId As String) As String
+        EnsureSafeSvc
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            EncryptNoteToSafe = "ERR:note not found"
+            Exit Function
+        End If
+        If Not m_safe.IsOpen(safeId) Then
+            EncryptNoteToSafe = "ERR:safe_locked"
+            Exit Function
+        End If
+        Dim packed As String
+        packed = EncryptPlainToSafe(safeId, TbRepoModel.n_Html(idx))
+        If Left$(packed, 4) = "ERR:" Then
+            EncryptNoteToSafe = packed
+            Exit Function
+        End If
+        TbRepoModel.n_Html(idx) = packed
+        TbRepoModel.n_HasSafe(idx) = True
+        TbRepoModel.n_SafeId(idx) = safeId
+        TbRepoModel.n_ModKey(idx) = TbRepoModel.TicksToDateKey(TbRepoModel.UtcNowTicks())
+        ' direct field mutation on a SER_RAW subtree -> must re-emit from typed fields
+        TbRepoModel.n_SerMode(idx) = TbRepoModel.SER_REBUILD
+        EncryptNoteToSafe = "OK:1"
+    End Function
+
+    Public Function DecryptNoteFromSafe(ByVal id As String) As String
+        EnsureSafeSvc
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            DecryptNoteFromSafe = "ERR:note not found"
+            Exit Function
+        End If
+        If Not TbRepoModel.n_HasSafe(idx) Then
+            DecryptNoteFromSafe = "OK:1"
+            Exit Function
+        End If
+        Dim plain As String
+        plain = DecryptNoteContent(id)
+        If Left$(plain, 4) = "ERR:" Then
+            DecryptNoteFromSafe = plain
+            Exit Function
+        End If
+        TbRepoModel.n_Html(idx) = plain
+        TbRepoModel.n_HasSafe(idx) = False
+        TbRepoModel.n_SafeId(idx) = ""
+        TbRepoModel.n_ModKey(idx) = TbRepoModel.TicksToDateKey(TbRepoModel.UtcNowTicks())
+        ' direct field mutation on a SER_RAW subtree -> must re-emit from typed fields
+        TbRepoModel.n_SerMode(idx) = TbRepoModel.SER_REBUILD
+        DecryptNoteFromSafe = "OK:1"
+    End Function
+
+    ' read-only plain html of a safe note ("ERR:safe_locked" when locked)
+    Public Function DecryptNoteContent(ByVal id As String) As String
+        EnsureSafeSvc
+        Dim idx As Long
+        idx = TbRepoModel.FindNoteById(id)
+        If idx < 0 Then
+            DecryptNoteContent = "ERR:note not found"
+            Exit Function
+        End If
+        If Not TbRepoModel.n_HasSafe(idx) Then
+            DecryptNoteContent = TbRepoModel.n_Html(idx)
+            Exit Function
+        End If
+        If Not m_safe.IsOpen(TbRepoModel.n_SafeId(idx)) Then
+            DecryptNoteContent = "ERR:safe_locked"
+            Exit Function
+        End If
+        Dim keyHex As String
+        keyHex = m_safe.KeyHexOf(TbRepoModel.n_SafeId(idx))
+        Dim plainB64 As String, et As String
+        If Not m_safe.DecryptNote(keyHex, TbRepoModel.n_Html(idx), plainB64, et) Then
+            DecryptNoteContent = "ERR:" & et
+            Exit Function
+        End If
+        Dim v As Variant
+        v = m_b64.Decode(plainB64)
+        If Not IsArray(v) Then
+            DecryptNoteContent = "ERR:plain not base64"
+            Exit Function
+        End If
+        Dim ba() As Byte
+        ba = v
+        DecryptNoteContent = m_u8.Decode(ba)
+    End Function
+
+    ' ------------------------------------------------------------- merge
+
+    ' gateway contract: "OK:<eqLocal>|<eqCloud>|<mergedB64>" - the session
+    ' becomes the merged repository (same as the gateway's own semantics).
+    ' Sequence = the routeb_model driver's verified merge path: capture
+    ' local string -> EnsureBuffers -> reparse local -> ExtractInto(True) ->
+    ' parse cloud -> ExtractInto(False) -> MergeReps -> rebuild merged
+    ' output in the Core dialect -> ModelLoadFromString (session continues
+    ' from the merged state).
+    Public Function MergeRepositoryXml(ByVal cloudXmlB64 As String) As String
+        On Error GoTo fail
+        Dim cur As String
+        cur = TbRepoModel.Serialize()
+        Dim fpLocal As LongLong
+        fpLocal = TbFingerprint.Fingerprint()
+        TbMergeModel.EnsureBuffers
+        Dim et As String
+        If Not TbXmlLite.ParseString(cur, et) Then Err.Raise 1810, "TbPureGw", "reparse local: " & et
+        TbMergeModel.ExtractInto True
+        Dim cloudText As String
+        cloudText = BytesToText(BytesOfB64(cloudXmlB64))
+        If Not TbXmlLite.ParseString(cloudText, et) Then Err.Raise 1811, "TbPureGw", "parse cloud: " & et
+        TbMergeModel.ExtractInto False
+        TbMergeModel.MergeReps
+        Dim merged As String
+        merged = BuildMergedOutput()
+        TbRepoModel.ModelLoadFromString cloudText
+        Dim fpCloud As LongLong
+        fpCloud = TbFingerprint.Fingerprint()
+        TbRepoModel.ModelLoadFromString merged
+        Dim fpMerged As LongLong
+        fpMerged = TbFingerprint.Fingerprint()
+        MergeRepositoryXml = "OK:" & IIf(fpMerged = fpLocal, "1", "0") & "|" & _
+            IIf(fpMerged = fpCloud, "1", "0") & "|" & _
+            m_b64.Encode(m_u8.Encode(merged))
+        Exit Function
+fail:
+        MergeRepositoryXml = "ERR:" & Err.Number & " " & Err.Description
+    End Function
+
+    ' port of the routeb_model driver's BuildMergedOutput (Core dialect)
+    Private Const XML_DECL As String = "<?xml version=""1.0"" encoding=""utf-8""?>"
+    Private Const ROOT_OPEN_PRE As String = "<silentnotes xmlns:xsd=""http://www.w3.org/2001/XMLSchema"" xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"" id="""
+
+    Private Function BuildMergedOutput() As String
+        Dim buf As String
+        Dim w As Long
+        Dim i As Long
+        Dim est As Long
+        est = TbMergeModel.OutputEstimate() + 1024
+        buf = Space$(est)
+        w = 1
+        AppendSeg buf, w, XML_DECL
+        AppendSeg buf, w, vbCrLf
+        AppendSeg buf, w, ROOT_OPEN_PRE
+        AppendSeg buf, w, TbMergeModel.OutRootId
+        AppendSeg buf, w, """ revision=""9"" order_modified_at="""
+        AppendSeg buf, w, TbMergeModel.OutOrderRaw
+        AppendSeg buf, w, """>"
+        AppendSeg buf, w, vbCrLf
+        ContainerOut buf, w, "notes", TbMergeModel.OutNCount, True
+        ContainerOut buf, w, "deleted_notes", TbMergeModel.OutDCount, False
+        ContainerOut buf, w, "safes", TbMergeModel.OutSCount, False
+        AppendSeg buf, w, "</silentnotes>"
+        If w - 1 > Len(buf) Then Err.Raise 1812, "TbPureGw", "merge output overflow"
+        BuildMergedOutput = Left$(buf, w - 1)
+    End Function
+
+    Private Sub ContainerOut(ByRef buf As String, ByRef w As Long, ByRef nm As String, ByVal cnt As Long, ByVal isNotes As Boolean)
+        Dim i As Long
+        If cnt = 0 Then
+            AppendSeg buf, w, "  <" & nm & " />" & vbCrLf
+            Exit Sub
+        End If
+        AppendSeg buf, w, "  <" & nm & ">" & vbCrLf
+        For i = 0 To cnt - 1
+            AppendSeg buf, w, "    "
+            If isNotes Then
+                AppendSeg buf, w, TbMergeModel.OutNoteRaw(i)
+            Else
+                If nm = "safes" Then
+                    AppendSeg buf, w, TbMergeModel.OutSafeRaw(i)
+                Else
+                    AppendSeg buf, w, TbMergeModel.OutDelRaw(i)
+                End If
+            End If
+            AppendSeg buf, w, vbCrLf
+        Next
+        AppendSeg buf, w, "  </" & nm & ">" & vbCrLf
+    End Sub
+
+    Private Sub AppendSeg(ByRef buf As String, ByRef w As Long, ByVal s As String)
+        Dim l As Long
+        l = Len(s)
+        If l = 0 Then Exit Sub
+        If w + l - 1 > Len(buf) Then Err.Raise 1813, "TbPureGw", "output buffer overflow"
+        Mid$(buf, w, l) = s
+        w = w + l
+    End Sub
+
+    ' ------------------------------------------------------------ io helpers
+
+    Private Function BytesOfB64(ByVal s As String) As Byte()
+        Dim v As Variant
+        v = m_b64.Decode(s)
+        If Not IsArray(v) Then Err.Raise 1817, "TbPureGw", "payload not base64"
+        BytesOfB64 = v
+    End Function
+
+    Private Function BytesToText(ByRef b() As Byte) As String
+        Dim off As Long
+        off = 0
+        If UBound(b) >= 2 Then
+            If b(0) = &HEF And b(1) = &HBB And b(2) = &HBF Then off = 3
+        End If
+        If UBound(b) < off Then
+            BytesToText = ""
+            Exit Function
+        End If
+        Dim body() As Byte
+        ReDim body(0 To UBound(b) - off)
+        Dim i As Long
+        For i = 0 To UBound(body)
+            body(i) = b(off + i)
+        Next
+        BytesToText = m_u8.Decode(body)
+    End Function
+
+End Class

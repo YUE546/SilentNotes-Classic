@@ -1,0 +1,191 @@
+Option Explicit
+
+[Description("Tag dialog: retro dual-list shuttle, native ListBox/CommandButton, modal, owner-centered")]
+[FormDesignerId("7E4C1A02-93B5-4F6D-8A21-C0D51B9F2B18")]
+[PredeclaredId]
+Class TagDlg
+
+    ' set by MainForm before Show 1; read back after the modal returns
+    Public Confirmed As Boolean
+    ' result: lstCur items joined by US (ChrW$(31) = TbRepo.TagSep)
+    Public UsJoined As String
+
+    Private m_ownerHwnd As Long
+    Private m_noteTitle As String
+
+    ' PHYSICAL-pixel sizing: the tbform Width/Height numbers are honored
+    ' as pixels by the runtime, so any twips-style value would blow the
+    ' window up to many thousands of pixels (the "full-screen white"
+    ' regression). AdjustWindowRectEx + SetWindowPos pin the true size
+    ' and center the dialog on the owner, same recipe as MainForm.
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 424      ' client, physical px
+    Private Const DlgH As Long = 280
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    ' arrays must be ByRef (tB forbids ByVal arrays). Fills lstAll with the
+    ' aggregate tags minus the note's own (those start in lstCur), lstCur
+    ' with the note's tags. m_ownerHwnd/m_noteTitle are stored BEFORE the
+    ' first control access - that access fires Form_Load, which reads them.
+    Public Sub Preload(ByRef allTags() As String, ByVal nAll As Long, ByRef curTags() As String, ByVal nCur As Long, ByVal ownerHwnd As Long, ByVal noteTitle As String)
+        Confirmed = False
+        UsJoined = ""
+        m_ownerHwnd = ownerHwnd
+        m_noteTitle = noteTitle
+        lstAll.Clear
+        lstCur.Clear
+        Dim j As Long, k As Long
+        Dim dup As Boolean
+        For j = 0 To nAll - 1
+            dup = False
+            For k = 0 To nCur - 1
+                If StrComp(allTags(j), curTags(k), vbTextCompare) = 0 Then
+                    dup = True
+                    Exit For
+                End If
+            Next
+            If Not dup Then lstAll.AddItem allTags(j)
+        Next
+        For j = 0 To nCur - 1
+            lstCur.AddItem curTags(j)
+        Next
+    End Sub
+
+    Private Sub Form_Load()
+        Dim cap As String
+        cap = STagTitle()
+        If Len(m_noteTitle) > 0 Then cap = cap & " - " & m_noteTitle
+        Me.Caption = cap
+        lblAll.Caption = SAllLbl()
+        lblCur.Caption = SCurLbl()
+        cmdOK.Caption = SOkBtn()
+        cmdCancel.Caption = SCancelBtn()
+        SnapCenter
+        ' tbform control geometry is DPI-scaled by the runtime (x1.25 here),
+        ' which overflows the pinned 424x280 client - layout every control
+        ' in physical pixels instead, same as MainForm's LayoutAll
+        lblAll.Move 12, 16, 184, 20
+        lstAll.Move 12, 40, 184, 200
+        lblCur.Move 228, 16, 184, 20
+        lstCur.Move 228, 40, 184, 200
+        cmdAdd.Move 200, 110, 24, 28
+        cmdRemove.Move 200, 150, 24, 28
+        cmdOK.Move 228, 244, 88, 28
+        cmdCancel.Move 324, 244, 88, 28
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    ' Default/Cancel button properties are dropped by the minimal tbform
+    ' blocks, so Enter/Esc route explicitly (KeyPreview=true)
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 13 Then
+            KeyCode = 0
+            cmdOK_Click
+        ElseIf KeyCode = 27 Then
+            KeyCode = 0
+            cmdCancel_Click
+        End If
+    End Sub
+
+    ' shuttle: move the selected item across, no duplicates possible
+    ' (lstAll starts disjoint from lstCur)
+    Private Sub cmdAdd_Click()
+        Dim i As Long
+        i = lstAll.ListIndex
+        If i >= 0 Then
+            lstCur.AddItem lstAll.List(i)
+            lstAll.RemoveItem i
+        End If
+    End Sub
+
+    Private Sub cmdRemove_Click()
+        Dim i As Long
+        i = lstCur.ListIndex
+        If i >= 0 Then
+            lstAll.AddItem lstCur.List(i)
+            lstCur.RemoveItem i
+        End If
+    End Sub
+
+    ' double-click = shuttle shortcut (same handlers as the arrow buttons)
+    Private Sub lstAll_DblClick()
+        cmdAdd_Click
+    End Sub
+
+    Private Sub lstCur_DblClick()
+        cmdRemove_Click
+    End Sub
+
+    Private Sub cmdOK_Click()
+        Dim s As String
+        Dim j As Long
+        For j = 0 To lstCur.ListCount - 1
+            If Len(s) > 0 Then s = s & ChrW$(31)
+            s = s & Trim$(lstCur.List(j))
+        Next
+        UsJoined = s
+        Confirmed = True
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCancel_Click()
+        Confirmed = False
+        Me.Hide
+    End Sub
+
+    Private Function STagTitle() As String     ' "标签"
+        STagTitle = ChrW$(&H6807&) & ChrW$(&H7B7E&)
+    End Function
+
+    Private Function SAllLbl() As String       ' "全部标签"
+        SAllLbl = ChrW$(&H5168&) & ChrW$(&H90E8&) & ChrW$(&H6807&) & ChrW$(&H7B7E&)
+    End Function
+
+    Private Function SCurLbl() As String       ' "当前标签"
+        SCurLbl = ChrW$(&H5F53&) & ChrW$(&H524D&) & ChrW$(&H6807&) & ChrW$(&H7B7E&)
+    End Function
+
+    Private Function SOkBtn() As String        ' "确定"
+        SOkBtn = ChrW$(&H786E&) & ChrW$(&H5B9A&)
+    End Function
+
+    Private Function SCancelBtn() As String    ' "取消"
+        SCancelBtn = ChrW$(&H53D6&) & ChrW$(&H6D88&)
+    End Function
+End Class

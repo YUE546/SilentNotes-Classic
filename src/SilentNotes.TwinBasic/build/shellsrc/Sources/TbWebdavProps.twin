@@ -1,0 +1,87 @@
+Option Explicit
+
+' TbWebdavProps - result of a TbWebdav.Propfind call.
+' Exists=False when the server answered 404 (the request itself succeeded).
+' Child names/hrefs of a Depth-1 collection listing are held in internal
+' arrays exposed through NumChildren/ChildName/ChildHref (VB6-class rule:
+' no public array members, expose via indexed accessors instead).
+
+Class TbWebdavProps
+
+    Private m_Exists As Boolean
+    Private m_IsDir As Boolean
+    Private m_Size As Double
+    Private m_LastModified As String
+    Private m_Href As String
+    Private m_NumChildren As Long
+    Private m_ChildNames() As String
+    Private m_ChildHrefs() As String
+
+    Public Property Get Exists() As Boolean
+        Exists = m_Exists
+    End Property
+
+    Public Property Let Exists(v As Boolean)
+        m_Exists = v
+    End Property
+
+    Public Property Get IsDir() As Boolean
+        IsDir = m_IsDir
+    End Property
+
+    Public Property Let IsDir(v As Boolean)
+        m_IsDir = v
+    End Property
+
+    ' File size in bytes (Double so >2GB files survive; integral value).
+    Public Property Get Size() As Double
+        Size = m_Size
+    End Property
+
+    Public Property Let Size(v As Double)
+        m_Size = v
+    End Property
+
+    Public Property Get LastModified() As String
+        LastModified = m_LastModified
+    End Property
+
+    Public Property Let LastModified(v As String)
+        m_LastModified = v
+    End Property
+
+    Public Property Get Href() As String
+        Href = m_Href
+    End Property
+
+    Public Property Let Href(v As String)
+        m_Href = v
+    End Property
+
+    Public Property Get NumChildren() As Long
+        NumChildren = m_NumChildren
+    End Property
+
+    ' Children of a collection (Depth-1 listing): entries after the first
+    ' <response> (which is the requested resource itself).
+    Public Sub AddChild(name As String, href As String)
+        ReDim Preserve m_ChildNames(0 To m_NumChildren)
+        ReDim Preserve m_ChildHrefs(0 To m_NumChildren)
+        m_ChildNames(m_NumChildren) = name
+        m_ChildHrefs(m_NumChildren) = href
+        m_NumChildren = m_NumChildren + 1
+    End Sub
+
+    Public Function ChildName(index As Long) As String
+        If (index >= 0) And (index < m_NumChildren) Then
+            ChildName = m_ChildNames(index)
+        End If
+    End Function
+
+    Public Function ChildHref(index As Long) As String
+        If (index >= 0) And (index < m_NumChildren) Then
+            ChildHref = m_ChildHrefs(index)
+        End If
+    End Function
+
+End Class

@@ -1,0 +1,623 @@
+Option Explicit
+
+' TbClean - HTML compatibility inspector + paste sanitizer for the MSHTML
+' editor (P3).
+'
+' PROVENANCE (honest inventory, also quoted in the P3 report): the workspace
+' sources only carry a 3-substring "CanEditWithoutConversion" check
+' (src\SilentNotes.WindowsVb\Workers\HtmlCompatibilityInspector.vb and
+' src\SilentNotes.WindowsWinForms\Workers\HtmlCompatibilityInspector.cs);
+' a 16-rule table does NOT exist anywhere on disk (Blazor wwwroot is empty
+' in this snapshot, legacy-net472-decompiled has no inspector). So the 16
+' rules below are REBUILT from MSHTML editing practice + the paste garbage
+' Word/Office actually emits (o:p, MsoNormal classes, xml islands, on*
+' handlers, script:/file: URLs). The CLEANER is a classic tag-scanner
+' sanitizer, the VB6-era idiom - no regex, no IE9+ DOM.
+
+Class TbClean
+
+    ' ----------------------------------------------------------- rule table
+
+    ' 1-based rule ids; RuleCheck(i, html) = True when html satisfies rule i.
+    ' 1  no <script> elements
+    ' 2  no <iframe> elements
+    ' 3  no <object>/<embed> elements
+    ' 4  no <style> elements (styling = style attributes + host sheet)
+    ' 5  no head-level tags in content (meta/link/base)
+    ' 6  no form controls (form/input/button/select/textarea)
+    ' 7  no on* inline event handlers
+    ' 8  no script URLs (javascript:/vbscript:)
+    ' 9  no Office namespaced tags (o:/w:/st1:/v:)
+    ' 10 no Mso* Office classes
+    ' 11 no XML islands / processing instructions
+    ' 12 no HTML comments
+    ' 13 tags within the editor whitelist (unknown tags unwrapped)
+    ' 14 attributes within the editor whitelist (unknown attrs dropped)
+    ' 15 img src restricted to http(s)/data (no file://)
+    ' 16 no legacy layout elements (applet/frameset/frame/noframes)
+
+    Public Property Get RuleCount() As Long
+        RuleCount = 16
+    End Property
+
+    Public Function RuleName(ByVal i As Long) As String
+        Select Case i
+            Case 1: RuleName = "R01 no script elements"
+            Case 2: RuleName = "R02 no iframe elements"
+            Case 3: RuleName = "R03 no object/embed elements"
+            Case 4: RuleName = "R04 no style elements"
+            Case 5: RuleName = "R05 no head-level tags"
+            Case 6: RuleName = "R06 no form controls"
+            Case 7: RuleName = "R07 no on* handlers"
+            Case 8: RuleName = "R08 no script URLs"
+            Case 9: RuleName = "R09 no Office ns tags"
+            Case 10: RuleName = "R10 no Mso classes"
+            Case 11: RuleName = "R11 no xml islands/PIs"
+            Case 12: RuleName = "R12 no comments"
+            Case 13: RuleName = "R13 tag whitelist"
+            Case 14: RuleName = "R14 attr whitelist"
+            Case 15: RuleName = "R15 img src scheme"
+            Case 16: RuleName = "R16 no legacy layout elems"
+        End Select
+    End Function
+
+    ' compliance check: True when html satisfies rule i
+    Public Function RuleCheck(ByVal i As Long, ByVal html As String) As Boolean
+        Select Case i
+            Case 1
+                RuleCheck = Not HasTagOpen(html, "script")
+            Case 2
+                RuleCheck = Not HasTagOpen(html, "iframe")
+            Case 3
+                RuleCheck = (Not HasTagOpen(html, "object")) And (Not HasTagOpen(html, "embed"))
+            Case 4
+                RuleCheck = Not HasTagOpen(html, "style")
+            Case 5
+                RuleCheck = (Not HasTagOpen(html, "meta")) And (Not HasTagOpen(html, "base")) And (Not HasTagOpen(html, "link"))
+            Case 6
+                RuleCheck = (Not HasTagOpen(html, "form")) And (Not HasTagOpen(html, "input")) And (Not HasTagOpen(html, "button")) And (Not HasTagOpen(html, "select")) And (Not HasTagOpen(html, "textarea"))
+            Case 7
+                RuleCheck = (Len(ScanFirst(html, 4)) = 0)     ' on* handler
+            Case 8
+                RuleCheck = (Len(ScanFirst(html, 3)) = 0)     ' script: URL
+            Case 9
+                RuleCheck = (InStr(1, html, "<o:", vbTextCompare) = 0) _
+                    And (InStr(1, html, "<w:", vbTextCompare) = 0) _
+                    And (InStr(1, html, "<st1:", vbTextCompare) = 0) _
+                    And (InStr(1, html, "<v:", vbTextCompare) = 0)
+            Case 10
+                RuleCheck = (InStr(1, html, "Mso", vbBinaryCompare) = 0)
+            Case 11
+                RuleCheck = (InStr(1, html, "<?xml", vbTextCompare) = 0) And (Not HasTagOpen(html, "xml"))
+            Case 12
+                RuleCheck = (InStr(1, html, "<!--", vbBinaryCompare) = 0)
+            Case 13
+                RuleCheck = (Len(ScanFirst(html, 1)) = 0)     ' tag whitelist
+            Case 14
+                RuleCheck = (Len(ScanFirst(html, 5)) = 0)     ' attr whitelist
+            Case 15
+                RuleCheck = (Len(ScanFirst(html, 6)) = 0)     ' img src scheme
+            Case 16
+                RuleCheck = (Not HasTagOpen(html, "applet")) And (Not HasTagOpen(html, "frameset")) _
+                    And (Not HasTagOpen(html, "frame")) And (Not HasTagOpen(html, "noframes"))
+            Case Else
+                RuleCheck = False
+        End Select
+    End Function
+
+    ' -------------------------------------------------------------- scanner
+
+    ' "<name" opener probe with a word-boundary check (so "<li" never
+    ' matches "<link" and "<b" never matches "<blockquote")
+    Private Function HasTagOpen(ByVal html As String, ByVal name As String) As Boolean
+        Dim p As Long, L As Long, ch As String
+        L = Len(name)
+        p = InStr(1, html, "<" & name, vbTextCompare)
+        Do While p > 0
+            ch = Mid$(html, p + 1 + L, 1)
+            If ch = "" Then
+                HasTagOpen = True
+                Exit Function
+            End If
+            Select Case ch
+                Case " ", ">", "/", vbTab, vbCr, vbLf
+                    HasTagOpen = True
+                    Exit Function
+            End Select
+            p = InStr(p + 1, html, "<" & name, vbTextCompare)
+        Loop
+    End Function
+
+    ' shared tag/attr walker. mode:
+    '   1 = first tag name NOT on the editor whitelist ("" = none)
+    '   3 = first script: / vbscript: URL in href/src
+    '   4 = first on* event handler attribute
+    '   5 = first attribute name NOT on the whitelist ("" = none)
+    '   6 = first <img> src that is neither http(s):// nor data:
+    Private Function ScanFirst(ByVal html As String, ByVal mode As Long) As String
+        Dim L As Long, i As Long, p As Long
+        Dim ch As String
+        L = Len(html)
+        i = 1
+        m_scanHit = ""
+        Do While i <= L
+            ch = Mid$(html, i, 1)
+            If ch = "<" Then
+                If StrComp(Mid$(html, i, 4), "<!--", vbBinaryCompare) = 0 Then
+                    p = InStr(i + 4, html, "-->", vbBinaryCompare)
+                    If p = 0 Then Exit Do
+                    i = p + 3
+                ElseIf StrComp(Mid$(html, i, 2), "<!", vbBinaryCompare) = 0 _
+                    Or StrComp(Mid$(html, i, 2), "<?", vbBinaryCompare) = 0 Then
+                    p = InStr(i + 2, html, ">", vbBinaryCompare)
+                    If p = 0 Then Exit Do
+                    i = p + 1
+                Else
+                    i = ScanOneTag(html, i, mode)
+                    If Len(m_scanHit) > 0 Then Exit Do
+                End If
+            Else
+                i = i + 1
+            End If
+        Loop
+        ScanFirst = m_scanHit
+    End Function
+
+    Private m_scanHit As String
+
+    ' Scans one tag starting at html[i] = "<". Returns the index just past
+    ' the closing ">", or i (position unchanged) when the mode's probe
+    ' matched - in which case m_scanHit carries the finding.
+    Private Function ScanOneTag(ByVal html As String, ByVal iStart As Long, ByVal mode As Long) As Long
+        Dim L As Long, i As Long
+        Dim ch As String
+        Dim name As String
+        Dim closing As Boolean
+        Dim p As Long
+
+        L = Len(html)
+        i = iStart + 1
+        m_scanHit = ""
+        If i > L Then ScanOneTag = iStart: Exit Function
+        If Mid$(html, i, 1) = "/" Then
+            closing = True
+            i = i + 1
+        End If
+
+        ' tag name
+        name = ""
+        Do While i <= L
+            ch = Mid$(html, i, 1)
+            If (ch >= "a" And ch <= "z") Or (ch >= "A" And ch <= "Z") Or (ch >= "0" And ch <= "9") _
+                Or ch = ":" Or ch = "-" Or ch = "_" Then
+                name = name & ch
+                i = i + 1
+            Else
+                Exit Do
+            End If
+        Loop
+        If Len(name) = 0 Then
+            ScanOneTag = iStart
+            Exit Function
+        End If
+
+        If mode = 1 Then
+            If Not closing Then
+                If Not TagAllowed(name) Then
+                    m_scanHit = LCase$(name)
+                    ScanOneTag = iStart
+                    Exit Function
+                End If
+            End If
+        End If
+
+        ' attributes (skip for closing tags)
+        Dim attr As String, val As String, q As String
+        If Not closing Then
+            Do While i <= L
+                ch = Mid$(html, i, 1)
+                If ch = ">" Then
+                    Exit Do
+                ElseIf ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Then
+                    i = i + 1
+                Else
+                    ' attribute name
+                    attr = ""
+                    Do While i <= L
+                        ch = Mid$(html, i, 1)
+                        If ch = "=" Or ch = " " Or ch = ">" Or ch = vbTab Or ch = vbCr Or ch = vbLf Then Exit Do
+                        attr = attr & ch
+                        i = i + 1
+                    Loop
+                    val = ""
+                    If ch = "=" Then
+                        i = i + 1
+                        If Mid$(html, i, 1) = """" Then
+                            q = """"
+                            i = i + 1
+                            p = InStr(i, html, """", vbBinaryCompare)
+                            If p = 0 Then
+                                val = Mid$(html, i)
+                                i = L + 1
+                            Else
+                                val = Mid$(html, i, p - i)
+                                i = p + 1
+                            End If
+                        ElseIf Mid$(html, i, 1) = "'" Then
+                            q = "'"
+                            i = i + 1
+                            p = InStr(i, html, "'", vbBinaryCompare)
+                            If p = 0 Then
+                                val = Mid$(html, i)
+                                i = L + 1
+                            Else
+                                val = Mid$(html, i, p - i)
+                                i = p + 1
+                            End If
+                        Else
+                            Do While i <= L
+                                ch = Mid$(html, i, 1)
+                                If ch = " " Or ch = ">" Then Exit Do
+                                val = val & ch
+                                i = i + 1
+                            Loop
+                        End If
+                    End If
+
+                    If Len(attr) > 0 Then
+                        Select Case mode
+                            Case 3
+                                If StrComp(attr, "href", vbTextCompare) = 0 _
+                                    Or StrComp(attr, "src", vbTextCompare) = 0 Then
+                                    If StrComp(Left$(val, 11), "javascript:", vbTextCompare) = 0 _
+                                        Or StrComp(Left$(val, 10), "vbscript:", vbTextCompare) = 0 Then
+                                        m_scanHit = LCase$(attr) & ":script-url"
+                                        ScanOneTag = iStart
+                                        Exit Function
+                                    End If
+                                End If
+                            Case 4
+                                If Len(attr) > 2 Then
+                                    If StrComp(Left$(attr, 2), "on", vbTextCompare) = 0 Then
+                                        m_scanHit = LCase$(attr)
+                                        ScanOneTag = iStart
+                                        Exit Function
+                                    End If
+                                End If
+                            Case 5
+                                If Not AttrAllowed(attr) Then
+                                    m_scanHit = LCase$(attr)
+                                    ScanOneTag = iStart
+                                    Exit Function
+                                End If
+                            Case 6
+                                If StrComp(name, "img", vbTextCompare) = 0 _
+                                    And StrComp(attr, "src", vbTextCompare) = 0 Then
+                                    If StrComp(Left$(val, 7), "http://", vbTextCompare) <> 0 _
+                                        And StrComp(Left$(val, 8), "https://", vbTextCompare) <> 0 _
+                                        And StrComp(Left$(val, 5), "data:", vbTextCompare) <> 0 _
+                                        And Len(val) > 0 Then
+                                        m_scanHit = "img:src=" & Left$(val, 24)
+                                        ScanOneTag = iStart
+                                        Exit Function
+                                    End If
+                                End If
+                        End Select
+                    End If
+                End If
+            Loop
+        End If
+
+        ' skip to the tag end
+        Do While i <= L
+            If Mid$(html, i, 1) = ">" Then
+                ScanOneTag = i + 1
+                Exit Function
+            End If
+            i = i + 1
+        Loop
+        ScanOneTag = L + 1
+    End Function
+
+    Private Function TagAllowed(ByVal name As String) As Boolean
+        Select Case LCase$(name)
+            Case "p", "br", "b", "i", "u", "s", "strike", "h1", "h2", "h3", _
+                 "ul", "ol", "li", "blockquote", "pre", "code", "hr", "a", _
+                 "img", "table", "thead", "tbody", "tfoot", "tr", "td", "th", _
+                 "div", "span", "font", "strong", "em", "sub", "sup", _
+                 "center", "small"
+                TagAllowed = True
+        End Select
+    End Function
+
+    Private Function AttrAllowed(ByVal name As String) As Boolean
+        Select Case LCase$(name)
+            Case "href", "src", "style", "class", "colspan", "rowspan", _
+                 "target", "id", "alt", "title", "start", "type", "checked", _
+                 "dir", "name", "align", "width", "height", "border", _
+                 "cellpadding", "cellspacing", "valign", "bgcolor", _
+                 "color", "face", "size"
+                AttrAllowed = True
+        End Select
+    End Function
+
+    ' ------------------------------------------------------------- sanitizer
+
+    ' Applies ALL 16 rules in one pass: drops script/style/iframe/object/
+    ' embed WITH their content, unwraps non-whitelisted tags (content kept),
+    ' filters attributes (whitelist + on* + script: URLs + img src scheme),
+    ' strips Mso* class tokens, removes comments/PIs/doctypes, lowercases
+    ' tag and attribute names. Output is never longer than the input.
+    Public Function Clean(ByVal html As String) As String
+        Dim L As Long, i As Long, p As Long, q As Long
+        Dim ch As String
+        Dim out As String, op As Long
+        Dim name As String
+        Dim closing As Boolean
+
+        L = Len(html)
+        If L = 0 Then Exit Function
+        out = Space$(L + 64)
+        op = 0
+        i = 1
+        Dim dropTag As String
+        dropTag = ""
+
+        Do While i <= L
+            If Len(dropTag) > 0 Then
+                ' inside a content-dropped element: skip to its close tag
+                p = InStr(i, html, "</" & dropTag, vbTextCompare)
+                If p = 0 Then
+                    i = L + 1
+                Else
+                    q = InStr(p, html, ">", vbBinaryCompare)
+                    If q = 0 Then
+                        i = L + 1
+                    Else
+                        i = q + 1
+                        dropTag = ""
+                    End If
+                End If
+            ElseIf Mid$(html, i, 1) = "<" Then
+                If StrComp(Mid$(html, i, 4), "<!--", vbBinaryCompare) = 0 Then
+                    p = InStr(i + 4, html, "-->", vbBinaryCompare)
+                    If p = 0 Then i = L + 1 Else i = p + 3
+                ElseIf StrComp(Mid$(html, i, 2), "<!", vbBinaryCompare) = 0 _
+                    Or StrComp(Mid$(html, i, 2), "<?", vbBinaryCompare) = 0 Then
+                    p = InStr(i + 2, html, ">", vbBinaryCompare)
+                    If p = 0 Then i = L + 1 Else i = p + 1
+                Else
+                    i = CleanOneTag(html, i, out, op, dropTag)
+                End If
+            Else
+                op = op + 1
+                Mid$(out, op, 1) = Mid$(html, i, 1)
+                i = i + 1
+            End If
+        Loop
+        Clean = Left$(out, op)
+    End Function
+
+    ' rewrites one tag (or drops it); appends text/keep parts to out(op)
+    Private Function CleanOneTag(ByVal html As String, ByVal iStart As Long, ByRef out As String, ByRef op As Long, ByRef dropTag As String) As Long
+        Dim L As Long, i As Long, p As Long
+        Dim name As String, ch As String
+        Dim closing As Boolean
+
+        L = Len(html)
+        i = iStart + 1
+        If Mid$(html, i, 1) = "/" Then
+            closing = True
+            i = i + 1
+        End If
+        name = ""
+        Do While i <= L
+            ch = Mid$(html, i, 1)
+            If (ch >= "a" And ch <= "z") Or (ch >= "A" And ch <= "Z") Or (ch >= "0" And ch <= "9") _
+                Or ch = ":" Or ch = "-" Or ch = "_" Then
+                name = name & ch
+                i = i + 1
+            Else
+                Exit Do
+            End If
+        Loop
+        If Len(name) = 0 Then
+            ' stray "<" - emit as text
+            op = op + 1
+            Mid$(out, op, 1) = "<"
+            CleanOneTag = iStart + 1
+            Exit Function
+        End If
+        Dim lname As String
+        lname = LCase$(name)
+
+        If closing Then
+            If TagAllowed(lname) Then
+                op = op + 1
+                Mid$(out, op, 1) = "<"
+                Mid$(out, op + 1, Len(lname) + 2) = "/" & lname & ">"
+                op = op + Len(lname) + 2
+            End If
+            ' skip to tag end
+            Do While i <= L
+                If Mid$(html, i, 1) = ">" Then
+                    CleanOneTag = i + 1
+                    Exit Function
+                End If
+                i = i + 1
+            Loop
+            CleanOneTag = L + 1
+            Exit Function
+        End If
+
+        ' content-dropped containers
+        Select Case lname
+            Case "script", "style", "iframe", "object", "embed", "xml"
+                dropTag = lname
+                CleanOneTag = iStart
+                Exit Function
+        End Select
+
+        If Not TagAllowed(lname) Then
+            ' unwrap: drop the tag, keep the content
+            CleanOneTag = SkipTagEnd(html, i)
+            Exit Function
+        End If
+
+        ' rebuild the tag with only clean attributes
+        Dim attrs As String
+        attrs = CollectCleanAttrs(html, i, lname)
+        op = op + 1
+        Mid$(out, op, 1) = "<"
+        Mid$(out, op + 1, Len(lname)) = lname
+        op = op + Len(lname)
+        If Len(attrs) > 0 Then
+            Mid$(out, op + 1, Len(attrs)) = attrs
+            op = op + Len(attrs)
+        End If
+        Mid$(out, op + 1, 1) = ">"
+        op = op + 1
+        CleanOneTag = SkipTagEnd(html, i)
+    End Function
+
+    Private Function SkipTagEnd(ByVal html As String, ByVal i As Long) As Long
+        Dim L As Long
+        L = Len(html)
+        Do While i <= L
+            If Mid$(html, i, 1) = ">" Then
+                SkipTagEnd = i + 1
+                Exit Function
+            End If
+            i = i + 1
+        Loop
+        SkipTagEnd = L + 1
+    End Function
+
+    ' walks the attributes of the tag whose name ended just before i,
+    ' returning a cleaned " name=""value""..." string (leading space, may be
+    ' empty). Also performs the img src scheme rule and Mso class stripping.
+    Private Function CollectCleanAttrs(ByVal html As String, ByVal iStart As Long, ByVal lname As String) As String
+        Dim L As Long, i As Long, p As Long
+        Dim ch As String
+        Dim attr As String, val As String, q As String
+        Dim res As String
+        Dim valClean As String
+        Dim keepAttr As Boolean
+
+        L = Len(html)
+        i = iStart
+        res = ""
+        Do While i <= L
+            ch = Mid$(html, i, 1)
+            If ch = ">" Then
+                Exit Do
+            ElseIf ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Then
+                i = i + 1
+            Else
+                attr = ""
+                Do While i <= L
+                    ch = Mid$(html, i, 1)
+                    If ch = "=" Or ch = " " Or ch = ">" Or ch = vbTab Or ch = vbCr Or ch = vbLf Then Exit Do
+                    attr = attr & ch
+                    i = i + 1
+                Loop
+                val = ""
+                If ch = "=" Then
+                    i = i + 1
+                    If Mid$(html, i, 1) = """" Then
+                        q = """"
+                        i = i + 1
+                        p = InStr(i, html, """", vbBinaryCompare)
+                        If p = 0 Then
+                            val = Mid$(html, i): i = L + 1
+                        Else
+                            val = Mid$(html, i, p - i): i = p + 1
+                        End If
+                    ElseIf Mid$(html, i, 1) = "'" Then
+                        q = "'"
+                        i = i + 1
+                        p = InStr(i, html, "'", vbBinaryCompare)
+                        If p = 0 Then
+                            val = Mid$(html, i): i = L + 1
+                        Else
+                            val = Mid$(html, i, p - i): i = p + 1
+                        End If
+                    Else
+                        Do While i <= L
+                            ch = Mid$(html, i, 1)
+                            If ch = " " Or ch = ">" Then Exit Do
+                            val = val & ch
+                            i = i + 1
+                        Loop
+                        q = ""
+                    End If
+                Else
+                    q = ""
+                End If
+
+                If Len(attr) > 0 Then
+                    keepAttr = AttrAllowed(attr)
+                    If keepAttr Then
+                        If Len(attr) > 2 Then
+                            If StrComp(Left$(attr, 2), "on", vbTextCompare) = 0 Then keepAttr = False
+                        End If
+                    End If
+                    If keepAttr Then
+                        If StrComp(Left$(val, 11), "javascript:", vbTextCompare) = 0 _
+                            Or StrComp(Left$(val, 10), "vbscript:", vbTextCompare) = 0 Then
+                            keepAttr = False
+                        End If
+                    End If
+                    If keepAttr And StrComp(lname, "img", vbTextCompare) = 0 _
+                        And StrComp(attr, "src", vbTextCompare) = 0 Then
+                        If StrComp(Left$(val, 7), "http://", vbTextCompare) <> 0 _
+                            And StrComp(Left$(val, 8), "https://", vbTextCompare) <> 0 _
+                            And StrComp(Left$(val, 5), "data:", vbTextCompare) <> 0 Then
+                            keepAttr = False
+                        End If
+                    End If
+                    If keepAttr And StrComp(attr, "class", vbTextCompare) = 0 Then
+                        valClean = StripMsoClasses(val)
+                        If Len(valClean) = 0 Then
+                            keepAttr = False
+                        Else
+                            val = valClean
+                            q = """"
+                        End If
+                    End If
+                    If keepAttr And q = "'" Then
+                        val = Replace(val, """", "&quot;")
+                        q = """"
+                    End If
+                    If keepAttr Then
+                        res = res & " " & LCase$(attr)
+                        If Len(val) > 0 Then
+                            res = res & "=" & q & val & q
+                        End If
+                    End If
+                End If
+            End If
+        Loop
+        CollectCleanAttrs = res
+    End Function
+
+    ' drops Mso*/Office class tokens; returns remaining classes joined
+    Private Function StripMsoClasses(ByVal v As String) As String
+        Dim parts() As String
+        Dim i As Long, res As String, t As String
+        parts = Split(v, " ")
+        res = ""
+        For i = 0 To UBound(parts)
+            t = Trim$(parts(i))
+            If Len(t) > 0 Then
+                If InStr(1, t, "Mso", vbBinaryCompare) = 0 _
+                    And InStr(1, t, "ms-", vbBinaryCompare) = 0 Then
+                    If Len(res) > 0 Then res = res & " "
+                    res = res & t
+                End If
+            End If
+        Next
+        StripMsoClasses = res
+    End Function
+
+End Class

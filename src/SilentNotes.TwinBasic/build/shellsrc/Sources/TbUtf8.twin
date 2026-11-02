@@ -1,0 +1,116 @@
+Option Explicit
+
+' TbUtf8 - hand-written UTF-8 codec (byte array <-> String), VB9-compatible.
+' Used by TbIni / TbLog / TbHeaderPacker / TbCrypto so no codepage-dependent
+' API (StrConv/Print#) ever touches file bytes.
+' Decoding: strict 1-4 byte sequences; invalid bytes are skipped (never crash).
+' Encoding: BMP chars -> 1-3 bytes; astral chars via surrogate pairs -> 4-byte
+' sequences (standard UTF-8, byte-compatible with .NET); lone surrogates fall
+' back to 3 bytes (never occurs in repo data).
+
+Class TbUtf8
+
+    Public Function Decode(b() As Byte) As String
+        Dim out As String
+        Dim i As Long, n As Long
+        n = UBound(b)
+        i = 0
+        Do While i <= n
+            Dim c As Long
+            c = b(i)
+            If c < &H80 Then
+                out = out & ChrW$(c)
+                i = i + 1
+            ElseIf (c And &HE0) = &HC0 And (i + 1) <= n Then
+                out = out & ChrW$(((c And &H1F&) * 64&) Or (b(i + 1) And &H3F&))
+                i = i + 2
+            ElseIf (c And &HF0) = &HE0 And (i + 2) <= n Then
+                out = out & ChrW$(((c And &HF&) * 4096&) Or ((b(i + 1) And &H3F&) * 64&) Or (b(i + 2) And &H3F&))
+                i = i + 3
+            ElseIf (c And &HF8) = &HF0 And (i + 3) <= n Then
+                Dim code As Long
+                code = ((c And &H7&) * 262144) Or ((b(i + 1) And &H3F&) * 4096&) _
+                     Or ((b(i + 2) And &H3F&) * 64&) Or (b(i + 3) And &H3F&)
+                code = code - 65536
+                out = out & ChrW$(&HD800& Or (code \ 1024&)) & ChrW$(&HDC00& Or (code And 1023&))
+                i = i + 4
+            Else
+                i = i + 1 ' invalid byte, skip
+            End If
+        Loop
+        Decode = out
+    End Function
+
+    Public Function Encode(s As String) As Byte()
+        Dim out() As Byte
+        Dim n As Long, i As Long, code As Long, lo As Long, cp As Long
+        Dim maxLen As Long
+        maxLen = Len(s) * 4 + 4    ' worst case: every char astral (4 bytes)
+        ReDim out(0 To maxLen - 1)
+        i = 1
+        Do While i <= Len(s)
+            code = AscW(Mid$(s, i, 1))
+            If code < 0 Then code = code + 65536
+            If code < &H80 Then
+                out(n) = CByte(code)
+                n = n + 1
+                i = i + 1
+            ElseIf code < &H800 Then
+                out(n) = CByte(&HC0 Or (code \ 64&))
+                out(n + 1) = CByte(&H80 Or (code And 63&))
+                n = n + 2
+                i = i + 1
+            ElseIf code >= &HD800& And code <= &HDBFF& Then
+                ' high surrogate: pair with the next char -> 4-byte astral
+                ' sequence (standard UTF-8, matches .NET output byte-for-byte)
+                Dim paired As Boolean
+                paired = False
+                If i < Len(s) Then
+                    lo = AscW(Mid$(s, i + 1, 1))
+                    If lo < 0 Then lo = lo + 65536
+                    If lo >= &HDC00& And lo <= &HDFFF& Then
+                        cp = (code - &HD800&) * 1024& + (lo - &HDC00&) + 65536
+                        out(n) = CByte(&HF0 Or (cp \ 262144))
+                        out(n + 1) = CByte(&H80 Or ((cp \ 4096&) And 63&))
+                        out(n + 2) = CByte(&H80 Or ((cp \ 64&) And 63&))
+                        out(n + 3) = CByte(&H80 Or (cp And 63&))
+                        n = n + 4
+                        paired = True
+                    End If
+                End If
+                If paired Then
+                    i = i + 2
+                Else
+                    ' lone surrogate: 3-byte fallback (invalid UTF-8; the repo
+                    ' format never produces this - would surface as a diff)
+                    out(n) = CByte(&HE0 Or (code \ 4096&))
+                    out(n + 1) = CByte(&H80 Or ((code \ 64&) And 63&))
+                    out(n + 2) = CByte(&H80 Or (code And 63&))
+                    n = n + 3
+                    i = i + 1
+                End If
+            ElseIf code >= &HDC00& And code <= &HDFFF& Then
+                ' lone low surrogate: 3-byte fallback (same rationale)
+                out(n) = CByte(&HE0 Or (code \ 4096&))
+                out(n + 1) = CByte(&H80 Or ((code \ 64&) And 63&))
+                out(n + 2) = CByte(&H80 Or (code And 63&))
+                n = n + 3
+                i = i + 1
+            Else
+                out(n) = CByte(&HE0 Or (code \ 4096&))
+                out(n + 1) = CByte(&H80 Or ((code \ 64&) And 63&))
+                out(n + 2) = CByte(&H80 Or (code And 63&))
+                n = n + 3
+                i = i + 1
+            End If
+        Loop
+        If n = 0 Then
+            ' callers only encode non-empty payloads (headers/logs/ini); make the
+            ' contract explicit instead of returning a placeholder byte
+            Err.Raise 5, "TbUtf8.Encode", "cannot encode an empty string"
+        End If
+        ReDim Preserve out(0 To n - 1)
+        Encode = out
+    End Function
+
+End Class

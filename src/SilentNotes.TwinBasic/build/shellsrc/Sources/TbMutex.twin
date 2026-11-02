@@ -1,0 +1,157 @@
+Option Explicit
+
+' TbMutex - single instance + cross-edition mutual exclusion for the tB shell.
+' Verbatim replication of the names and logic from
+'   src\SilentNotes.WindowsVb\Program.vb  (identical in WinForms C# Program.cs):
+'     MutexName    = "Global\SilentNotes_WinForms_SingleInstance"  (own, shared with C# WinForms)
+'     WpfMutexName = "Global\SilentNotes_WPF_SingleInstance"       (refuse to start when present)
+'   .NET: _mutex = new Mutex(true, MutexName, out isNew)
+'         -> isNew==False        : activate existing window, return False
+'         -> Mutex.OpenExisting(WpfMutexName) succeeds : refuse (MessageBox)
+'   Here: CreateMutexW + ERROR_ALREADY_EXISTS(183) / OpenMutexW(SYNCHRONIZE).
+' Activation = SetForegroundWindow + ShowWindow(SW_RESTORE) on another window
+' of the same app (original enumerates by process name; here FindWindow by
+' known caption + self-handle exclusion - same best-effort semantics).
+
+Class TbMutex
+
+    Private Declare Function CreateMutexW Lib "kernel32" (ByVal lpMutexAttributes As Long, ByVal bInitialOwner As Long, ByVal lpName As Long) As Long
+    Private Declare Function OpenMutexW Lib "kernel32" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal lpName As Long) As Long
+    Private Declare Function ReleaseMutex Lib "kernel32" (ByVal hMutex As Long) As Long
+    Private Declare Function CloseHandle Lib "kernel32" (ByVal hObject As Long) As Long
+    Private Declare Function SetForegroundWindow Lib "user32" (ByVal hWnd As Long) As Long
+    Private Declare Function ShowWindow Lib "user32" (ByVal hWnd As Long, ByVal nCmdShow As Long) As Long
+    Private Declare Function FindWindowW Lib "user32" (ByVal lpClassName As Long, ByVal lpWindowName As Long) As Long
+
+    ' branch codes out of CheckInstance
+    ' (tB TB5250: constants in a class cannot be Public -> all Private here;
+    '  the two mutex names are exposed via Public Property Get for Form1)
+    Private Const BR_OK As Long = 0          ' may continue as the new instance
+    Private Const BR_OWN_EXISTS As Long = 1  ' another WinForms/VB/tB instance holds the own mutex
+    Private Const BR_WPF_RUNNING As Long = 2 ' WPF edition is running -> refuse
+    Private Const BR_ERROR As Long = 3
+
+    Private Const OwnMutexNameValue As String = "Global\SilentNotes_WinForms_SingleInstance"
+    Private Const WpfMutexNameValue As String = "Global\SilentNotes_WPF_SingleInstance"
+    Private Const SW_RESTORE As Long = 9
+
+    Public Property Get OwnMutexName() As String
+        OwnMutexName = OwnMutexNameValue
+    End Property
+
+    Public Property Get WpfMutexName() As String
+        WpfMutexName = WpfMutexNameValue
+    End Property
+
+    Private m_Handle As Long
+    Private m_Owned As Boolean
+
+    ' Replicates EnsureSingleInstance(). Returns True = this process may continue.
+    ' keepHandle=False closes every opened handle before returning (probe mode);
+    ' keepHandle=True keeps the own mutex for the process lifetime (release via
+    ' ReleaseAtExit, mirroring the .NET finally block).
+    Public Function CheckInstance(ByRef outBranch As Long, ByRef detail As String, ByVal keepHandle As Boolean) As Boolean
+        On Error Resume Next
+        Dim h As Long, le As Long
+        Err.Clear
+        h = CreateMutexW(0, 1, StrPtr(OwnMutexNameValue))
+        le = Err.LastDllError
+        If h = 0 Then
+            outBranch = BR_ERROR
+            detail = "CreateMutexW failed h=0 le=" & le
+            CheckInstance = False
+            Exit Function
+        End If
+        If le = 183 Then ' ERROR_ALREADY_EXISTS
+            outBranch = BR_OWN_EXISTS
+            detail = "own mutex already exists (le=183, " & OwnMutexNameValue & ")"
+            Dim act As String
+            act = ActivateExistingInstance()
+            If Len(act) > 0 Then detail = detail & "; " & act
+            If Not keepHandle Then
+                CloseHandle h
+            Else
+                m_Handle = h
+                m_Owned = False ' we do NOT own it
+            End If
+            CheckInstance = False
+            Exit Function
+        End If
+
+        ' new instance -> does the WPF edition hold its mutex?
+        Dim hw As Long
+        Dim note As String
+        Err.Clear
+        hw = OpenMutexW(&H100000, 0, StrPtr(WpfMutexNameValue)) ' SYNCHRONIZE
+        If hw <> 0 Then
+            CloseHandle hw
+            outBranch = BR_WPF_RUNNING
+            detail = "WPF mutex present (" & WpfMutexNameValue & ") -> refuse, same data directory"
+            If Not keepHandle Then
+                CloseHandle h
+            Else
+                m_Handle = h
+                m_Owned = True
+            End If
+            CheckInstance = False
+            Exit Function
+        End If
+        If Err.LastDllError <> 0 And Err.LastDllError <> 2 Then
+            ' other open failure (e.g. permissions) -> original .NET code swallows
+            ' everything except "not found" and continues; we only report it
+            note = "; OpenMutexW(WPF) le=" & Err.LastDllError & " (treated as not running)"
+        End If
+
+        outBranch = BR_OK
+        detail = "new instance, own mutex held (" & OwnMutexNameValue & ")" & note
+        m_Handle = h
+        m_Owned = True
+        If Not keepHandle Then
+            CloseHandle h
+            m_Handle = 0
+            m_Owned = False
+        End If
+        CheckInstance = True
+    End Function
+
+    ' Mirrors the .NET finally block: ReleaseMutex + Dispose.
+    Public Sub ReleaseAtExit()
+        On Error Resume Next
+        If m_Handle <> 0 Then
+            If m_Owned Then ReleaseMutex m_Handle
+            CloseHandle m_Handle
+            m_Handle = 0
+            m_Owned = False
+        End If
+    End Sub
+
+    ' Test-side helper: creates the WPF-name mutex so a probe instance can play
+    ' the role of a running WPF edition. Returns handle (0 = failed).
+    Public Function SimulateWpfRunning() As Long
+        On Error Resume Next
+        SimulateWpfRunning = CreateMutexW(0, 1, StrPtr(WpfMutexNameValue))
+    End Function
+
+    ' Closes the sim handle created above.
+    Public Sub CloseSimHandle(ByVal h As Long)
+        On Error Resume Next
+        If h <> 0 Then CloseHandle h
+    End Sub
+
+    ' Best-effort activation of another instance's window (original semantics:
+    ' another process, same exe name, main window -> SetForegroundWindow+SW_RESTORE;
+    ' failures swallowed).
+    Private Function ActivateExistingInstance() As String
+        On Error Resume Next
+        Dim hWnd As Long
+        hWnd = FindWindowW(0, StrPtr("SilentNotes"))
+        If hWnd <> 0 Then
+            SetForegroundWindow hWnd
+            ShowWindow hWnd, SW_RESTORE
+            ActivateExistingInstance = "activation attempted on hwnd=0x" & Hex$(hWnd)
+        Else
+            ActivateExistingInstance = "no other window found (activation skipped)"
+        End If
+    End Function
+
+End Class

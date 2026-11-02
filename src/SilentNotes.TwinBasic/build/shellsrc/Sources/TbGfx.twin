@@ -1,0 +1,920 @@
+Option Explicit
+
+' TbGfx - GDI drawing helpers for the P2 shell.
+' P1 lesson: bare Module blocks are not accepted in .twin source files
+' (TB5079), so everything lives in this class; the form holds one instance.
+' UDT-parameter declares (RECTG etc.) are kept inside this class on purpose
+' so the form class only sees primitive-parameter helpers.
+'
+' Fonts: "Segoe UI" 9pt (12px cell, normal + bold) and 8pt (11px cell).
+' On systems without Segoe UI (XP) GDI maps the face automatically
+' (Tahoma) - accepted per spec.
+' All drawing goes into the form's persistent AutoRedraw DC; the form
+' calls Refresh after a full redraw pass. Icons are GDI primitives only
+' (triangles / lock / moon / lines) - no icon fonts, no emoji (XP red line).
+
+Class TbGfx
+
+    Private Const FW_NORMAL = 400
+    Private Const FW_BOLD = 700
+    Private Const DEFAULT_CHARSET = 1
+    Private Const CLEARTYPE_QUALITY = 5
+    Private Const PS_SOLID = 0
+    Private Const NULL_PEN_STOCK = 8
+    Private Const NULL_BRUSH_STOCK = 5
+    Private Const SRCCOPY = &HCC0020
+    Private Const FACE_NAME As String = "Segoe UI"
+    Private Const FACE_NAME_LIST As String = "SimSun"   ' note list rows (SongTi)
+
+    Private Type RECTG
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Type SIZETG
+        cx As Long
+        cy As Long
+    End Type
+
+    Private Type POINTL
+        px As Long
+        py As Long
+    End Type
+
+    Private Type TRIVERTEX
+        x As Long
+        y As Long
+        Red As Integer
+        Green As Integer
+        Blue As Integer
+        Alpha As Integer
+    End Type
+
+    Private Type GRADIENT_RECT
+        UpperLeft As Long
+        LowerRight As Long
+    End Type
+
+    Private Type TMEType
+        cbSize As Long
+        dwFlags As Long
+        hwndTrack As Long
+        dwHoverTime As Long
+    End Type
+
+    Private Type GdiplusStartupInput
+        GdiplusVersion As Long
+        DebugEventCallback As Long
+        SuppressBackgroundThread As Long
+        SuppressExternalCodecs As Long
+    End Type
+
+    Private Type CLSIDT
+        Data1 As Long
+        Data2 As Integer
+        Data3 As Integer
+        Data4(0 To 7) As Byte
+    End Type
+
+    Private Type BITMAPINFOHEADERG
+        biSize As Long
+        biWidth As Long
+        biHeight As Long
+        biPlanes As Integer
+        biBitCount As Integer
+        biCompression As Long
+        biSizeImage As Long
+        biXPelsPerMeter As Long
+        biYPelsPerMeter As Long
+        biClrUsed As Long
+        biClrImportant As Long
+    End Type
+
+    Private Type BITMAPINFOG
+        bmiHeader As BITMAPINFOHEADERG
+        bmiColors(0 To 3) As Long
+    End Type
+
+    Private Declare Function CreateFontW Lib "gdi32" (ByVal h As Long, ByVal w As Long, ByVal esc As Long, ByVal orient As Long, ByVal weight As Long, ByVal ital As Long, ByVal under As Long, ByVal strike As Long, ByVal charset As Long, ByVal outprec As Long, ByVal clipprec As Long, ByVal quality As Long, ByVal pitchfam As Long, ByVal face As Long) As Long
+    Private Declare Function DeleteObject Lib "gdi32" (ByVal obj As Long) As Long
+    Private Declare Function SelectObject Lib "gdi32" (ByVal hdc As Long, ByVal obj As Long) As Long
+    Private Declare Function GetStockObject Lib "gdi32" (ByVal idx As Long) As Long
+    Private Declare Function SetBkMode Lib "gdi32" (ByVal hdc As Long, ByVal mode As Long) As Long
+    Private Declare Function SetTextColor Lib "gdi32" (ByVal hdc As Long, ByVal cr As Long) As Long
+    Private Declare Function TextOutW Lib "gdi32" (ByVal hdc As Long, ByVal x As Long, ByVal y As Long, ByVal s As Long, ByVal c As Long) As Long
+    Private Declare Function GetTabbedTextExtentW Lib "user32" (ByVal hdc As Long, ByVal s As Long, ByVal c As Long, ByVal nTabs As Long, ByVal tabs As Long) As Long
+    ' one-call fit count for the ellipsis clip (replaces the O(n^2)
+    ' char-by-char shrink loop - 10 wheel notches measured 3250ms before)
+    Private Declare Function GetTextExtentExPointW Lib "gdi32" (ByVal hdc As Long, ByVal s As Long, ByVal c As Long, ByVal nMaxExtent As Long, ByRef nFit As Long, ByRef dx As Long, ByRef sz As SIZETG) As Long
+    Private Declare Function CreateSolidBrush Lib "gdi32" (ByVal cr As Long) As Long
+    ' FillRect/FrameRect are USER32 exports (not gdi32) - wrong Lib made the
+    ' runtime name lookup fail with "Automation error -353703418"
+    Private Declare Function FillRect Lib "user32" (ByVal hdc As Long, ByRef rc As RECTG, ByVal hbr As Long) As Long
+    Private Declare Function FrameRect Lib "user32" (ByVal hdc As Long, ByRef rc As RECTG, ByVal hbr As Long) As Long
+    Private Declare Function CreatePen Lib "gdi32" (ByVal style As Long, ByVal w As Long, ByVal cr As Long) As Long
+    Private Declare Function MoveToEx Lib "gdi32" (ByVal hdc As Long, ByVal x As Long, ByVal y As Long, ByVal prev As Long) As Long
+    Private Declare Function LineTo Lib "gdi32" (ByVal hdc As Long, ByVal x As Long, ByVal y As Long) As Long
+    Private Declare Function Ellipse Lib "gdi32" (ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long) As Long
+    Private Declare Function Arc Lib "gdi32" (ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal x3 As Long, ByVal y3 As Long, ByVal x4 As Long, ByVal y4 As Long) As Long
+    Private Declare Function Polygon Lib "gdi32" (ByVal hdc As Long, ByRef pts As POINTL, ByVal n As Long) As Long
+    Private Declare Function RoundRect Lib "gdi32" (ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal w As Long, ByVal h As Long) As Long
+    Private Declare Function SaveDC Lib "gdi32" (ByVal hdc As Long) As Long
+    Private Declare Function RestoreDC Lib "gdi32" (ByVal hdc As Long, ByVal saved As Long) As Long
+    Private Declare Function IntersectClipRect Lib "gdi32" (ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long) As Long
+    Private Declare Function BitBlt Lib "gdi32" (ByVal hDst As Long, ByVal dx As Long, ByVal dy As Long, ByVal w As Long, ByVal h As Long, ByVal hSrc As Long, ByVal sx As Long, ByVal sy As Long, ByVal rop As Long) As Long
+    Private Declare Function CreateCompatibleDC Lib "gdi32" (ByVal hdc As Long) As Long
+    Private Declare Function CreateCompatibleBitmap Lib "gdi32" (ByVal hdc As Long, ByVal w As Long, ByVal h As Long) As Long
+    Private Declare Function DeleteDC Lib "gdi32" (ByVal hdc As Long) As Long
+    Private Declare Function CreateDIBSection Lib "gdi32" (ByVal hdc As Long, ByRef bmi As BITMAPINFOG, ByVal usage As Long, ByRef bitsPtr As Long, ByVal hSection As Long, ByVal offset As Long) As Long
+    Private Declare Function GradientFill Lib "msimg32" (ByVal hdc As Long, ByRef vert As TRIVERTEX, ByVal nVert As Long, ByRef mesh As GRADIENT_RECT, ByVal nMesh As Long, ByVal ulMode As Long) As Long
+    Private Declare Sub CopyMem Lib "kernel32" Alias "RtlMoveMemory" (ByRef dest As Long, ByVal src As Long, ByVal cb As Long)
+    Private Declare Sub PokeB Lib "kernel32" Alias "RtlMoveMemory" (ByVal dest As Long, ByRef src As Byte, ByVal cb As Long)
+
+    Private Declare Function GetWindowRect Lib "user32" (ByVal hWnd As Long, ByRef rc As RECTG) As Long
+    Private Declare Function GetClientRect Lib "user32" (ByVal hWnd As Long, ByRef rc As RECTG) As Long
+    Private Declare Function ClientToScreen Lib "user32" (ByVal hWnd As Long, ByRef pt As POINTL) As Long
+    Private Declare Function MapWindowPoints Lib "user32" (ByVal hWndFrom As Long, ByVal hWndTo As Long, ByRef pt As POINTL, ByVal n As Long) As Long
+    Private Declare Function SendMessageW Lib "user32" (ByVal hWnd As Long, ByVal uMsg As Long, ByVal wParam As Long, ByVal lParam As Long) As Long
+    ' PrintWindow (user32 exports it WITHOUT a W suffix - declaring
+    ' "PrintWindowW" fails the runtime name lookup with Automation error
+    ' -353703418, same signature as the FillRect/FrameRect pitfall)
+    Private Declare Function PrintWindow Lib "user32" (ByVal hWnd As Long, ByVal hdc As Long, ByVal flags As Long) As Long
+    Private Declare Function ScreenToClient Lib "user32" (ByVal hWnd As Long, ByRef pt As POINTL) As Long
+    Private Declare Function TrackMouseEvent Lib "user32" (ByRef tme As TMEType) As Long
+    Private Declare Function GetDC Lib "user32" (ByVal hWnd As Long) As Long
+    Private Declare Function ReleaseDC Lib "user32" (ByVal hWnd As Long, ByVal hdc As Long) As Long
+
+    Private Declare Function GdiplusStartup Lib "gdiplus" (ByRef token As Long, ByRef inp As GdiplusStartupInput, ByVal outp As Long) As Long
+    Private Declare Function GdiplusShutdown Lib "gdiplus" (ByVal token As Long) As Long
+    Private Declare Function GdipCreateBitmapFromHBITMAP Lib "gdiplus" (ByVal hbm As Long, ByVal hpal As Long, ByRef img As Long) As Long
+    Private Declare Function GdipSaveImageToFile Lib "gdiplus" (ByVal img As Long, ByVal filename As Long, ByRef clsid As CLSIDT, ByVal encParams As Long) As Long
+    Private Declare Function GdipDisposeImage Lib "gdiplus" (ByVal img As Long) As Long
+
+    Private m_hFontUI As Long
+    Private m_hFontUIB As Long
+    Private m_hFontSmall As Long
+    Private m_hFontList As Long
+    Private m_hFontListB As Long
+
+    ' backbuffer (flicker fix): every frame is composed here and blitted to
+    ' the screen once - no partial overdraw flashes
+    Private m_memDC As Long
+    Private m_memBmp As Long
+    Private m_memOld As Long
+    Private m_memW As Long
+    Private m_memH As Long
+
+    ' full-list content cache (perf rework): the WHOLE visible list rendered
+    ' once into its own bitmap (85 items x 60px); scrolling/hover/selection
+    ' only BitBlt slices of it. Rebuilt only when data/theme changes - the
+    ' form re-renders single rows in place for selection/hover.
+    Private m_listDC As Long
+    Private m_listBmp As Long
+    Private m_listOld As Long
+    Private m_listW As Long
+    Private m_listH As Long
+
+    ' GDI object caches: CreateSolidBrush/CreatePen + DeleteObject per draw
+    ' call was a measured wheel-lag source (~45 token colors + note colors
+    ' are created once and reused; FillRect/FrameRect take HBRUSH directly)
+    Private m_brC(0 To 511) As Long
+    Private m_brH(0 To 511) As Long
+    Private m_brN As Long
+    Private m_penC(0 To 255) As Long
+    Private m_penH(0 To 255) As Long
+    Private m_penN As Long
+
+    ' ------------------------------------------------------------------ fonts
+
+    Public Sub Init()
+        Free
+        m_hFontUI = MakeFont(12, FW_NORMAL)
+        m_hFontUIB = MakeFont(12, FW_BOLD)
+        m_hFontSmall = MakeFont(11, FW_NORMAL)
+        m_hFontList = MakeFontFace(12, FW_NORMAL, FACE_NAME_LIST)
+        m_hFontListB = MakeFontFace(12, FW_BOLD, FACE_NAME_LIST)
+    End Sub
+
+    Public Sub Free()
+        FreeBackbuffer
+        FreeListCache
+        FreeBrushCache
+        If m_hFontUI <> 0 Then DeleteObject m_hFontUI
+        If m_hFontUIB <> 0 Then DeleteObject m_hFontUIB
+        If m_hFontSmall <> 0 Then DeleteObject m_hFontSmall
+        If m_hFontList <> 0 Then DeleteObject m_hFontList
+        If m_hFontListB <> 0 Then DeleteObject m_hFontListB
+        m_hFontUI = 0
+        m_hFontUIB = 0
+        m_hFontSmall = 0
+        m_hFontList = 0
+        m_hFontListB = 0
+    End Sub
+
+    ' (re)creates the backbuffer for a client size; reallocates on resize
+    Public Sub InitBackbuffer(ByVal srcHdc As Long, ByVal w As Long, ByVal h As Long)
+        If m_memDC <> 0 And w = m_memW And h = m_memH Then Exit Sub
+        FreeBackbuffer
+        If w <= 0 Or h <= 0 Then Exit Sub
+        m_memDC = CreateCompatibleDC(srcHdc)
+        m_memBmp = CreateCompatibleBitmap(srcHdc, w, h)
+        If m_memDC <> 0 And m_memBmp <> 0 Then
+            m_memOld = SelectObject(m_memDC, m_memBmp)
+            m_memW = w
+            m_memH = h
+        Else
+            FreeBackbuffer
+        End If
+    End Sub
+
+    Public Sub FreeBackbuffer()
+        If m_memDC <> 0 Then
+            If m_memOld <> 0 Then SelectObject m_memDC, m_memOld
+            If m_memBmp <> 0 Then DeleteObject m_memBmp
+            DeleteDC m_memDC
+        End If
+        m_memDC = 0
+        m_memBmp = 0
+        m_memOld = 0
+        m_memW = 0
+        m_memH = 0
+    End Sub
+
+    Public Function MemHdc() As Long
+        MemHdc = m_memDC
+    End Function
+
+    Public Function MemReady() As Boolean
+        MemReady = (m_memDC <> 0)
+    End Function
+
+    Public Function MemW() As Long
+        MemW = m_memW
+    End Function
+
+    Public Function MemH() As Long
+        MemH = m_memH
+    End Function
+
+    ' single blit backbuffer -> screen DC
+    Public Function BltBackbuffer(ByVal dstHdc As Long, ByVal w As Long, ByVal h As Long) As Boolean
+        If m_memDC = 0 Then Exit Function
+        BltBackbuffer = (BitBlt(dstHdc, 0, 0, w, h, m_memDC, 0, 0, SRCCOPY) <> 0)
+    End Function
+
+    ' ------------------------------------------------------- list cache
+
+    ' (re)creates the list content bitmap; same-size calls are no-ops
+    Public Function InitListCache(ByVal srcHdc As Long, ByVal w As Long, ByVal h As Long) As Boolean
+        If m_listDC <> 0 And w = m_listW And h = m_listH Then
+            InitListCache = True
+            Exit Function
+        End If
+        FreeListCache
+        If w <= 0 Or h <= 0 Then Exit Function
+        m_listDC = CreateCompatibleDC(srcHdc)
+        m_listBmp = CreateCompatibleBitmap(srcHdc, w, h)
+        If m_listDC <> 0 And m_listBmp <> 0 Then
+            m_listOld = SelectObject(m_listDC, m_listBmp)
+            m_listW = w
+            m_listH = h
+            InitListCache = True
+        Else
+            FreeListCache
+        End If
+    End Function
+
+    Public Sub FreeListCache()
+        If m_listDC <> 0 Then
+            If m_listOld <> 0 Then SelectObject m_listDC, m_listOld
+            If m_listBmp <> 0 Then DeleteObject m_listBmp
+            DeleteDC m_listDC
+        End If
+        m_listDC = 0
+        m_listBmp = 0
+        m_listOld = 0
+        m_listW = 0
+        m_listH = 0
+    End Sub
+
+    Public Function ListHdc() As Long
+        ListHdc = m_listDC
+    End Function
+
+    Public Function ListReady() As Boolean
+        ListReady = (m_listDC <> 0)
+    End Function
+
+    Public Function ListW() As Long
+        ListW = m_listW
+    End Function
+
+    Public Function ListH() As Long
+        ListH = m_listH
+    End Function
+
+    ' one blit wrapper for the strip fast paths (list slice cache -> target)
+    Public Sub BltRegion(ByVal dstHdc As Long, ByVal dx As Long, ByVal dy As Long, ByVal w As Long, ByVal h As Long, ByVal srcHdc As Long, ByVal sx As Long, ByVal sy As Long)
+        If w <= 0 Or h <= 0 Then Exit Sub
+        BitBlt dstHdc, dx, dy, w, h, srcHdc, sx, sy, SRCCOPY
+    End Sub
+
+    ' ------------------------------------------------------ object caches
+
+    Private Function CachedBrush(ByVal cr As Long) As Long
+        Dim i As Long
+        For i = 0 To m_brN - 1
+            If m_brC(i) = cr Then
+                CachedBrush = m_brH(i)
+                Exit Function
+            End If
+        Next
+        If m_brN <= 511 Then
+            m_brC(m_brN) = cr
+            m_brH(m_brN) = CreateSolidBrush(cr)
+            m_brN = m_brN + 1
+            CachedBrush = m_brH(m_brN - 1)
+        Else
+            ' table full: recycle slot 0 (never hit in practice, ~130 colors)
+            DeleteObject m_brH(0)
+            m_brC(0) = cr
+            m_brH(0) = CreateSolidBrush(cr)
+            CachedBrush = m_brH(0)
+        End If
+    End Function
+
+    Private Function CachedPen(ByVal cr As Long) As Long
+        Dim i As Long
+        For i = 0 To m_penN - 1
+            If m_penC(i) = cr Then
+                CachedPen = m_penH(i)
+                Exit Function
+            End If
+        Next
+        If m_penN <= 255 Then
+            m_penC(m_penN) = cr
+            m_penH(m_penN) = CreatePen(PS_SOLID, 1, cr)
+            m_penN = m_penN + 1
+            CachedPen = m_penH(m_penN - 1)
+        Else
+            DeleteObject m_penH(0)
+            m_penC(0) = cr
+            m_penH(0) = CreatePen(PS_SOLID, 1, cr)
+            CachedPen = m_penH(0)
+        End If
+    End Function
+
+    Private Sub FreeBrushCache()
+        Dim i As Long
+        For i = 0 To m_brN - 1
+            If m_brH(i) <> 0 Then DeleteObject m_brH(i)
+            m_brH(i) = 0
+        Next
+        m_brN = 0
+        For i = 0 To m_penN - 1
+            If m_penH(i) <> 0 Then DeleteObject m_penH(i)
+            m_penH(i) = 0
+        Next
+        m_penN = 0
+    End Sub
+
+    Private Function MakeFont(ByVal pxH As Long, ByVal weight As Long) As Long
+        MakeFont = MakeFontFace(pxH, weight, FACE_NAME)
+    End Function
+
+    Private Function MakeFontFace(ByVal pxH As Long, ByVal weight As Long, ByVal face As String) As Long
+        MakeFontFace = CreateFontW(-pxH, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, StrPtr(face))
+    End Function
+
+    Public Function FontUI() As Long
+        FontUI = m_hFontUI
+    End Function
+
+    Public Function FontUIB() As Long
+        FontUIB = m_hFontUIB
+    End Function
+
+    Public Function FontSmall() As Long
+        FontSmall = m_hFontSmall
+    End Function
+
+    Public Function FontList() As Long
+        FontList = m_hFontList
+    End Function
+
+    Public Function FontListB() As Long
+        FontListB = m_hFontListB
+    End Function
+
+    ' ------------------------------------------------------------------ rects
+
+    Public Sub FillRc(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal cr As Long)
+        Dim rc As RECTG
+        rc.L = x1
+        rc.T = y1
+        rc.R = x2
+        rc.B = y2
+        FillRect hdc, rc, CachedBrush(cr)
+    End Sub
+
+    Public Sub FrameRc(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal cr As Long)
+        Dim rc As RECTG
+        rc.L = x1
+        rc.T = y1
+        rc.R = x2
+        rc.B = y2
+        FrameRect hdc, rc, CachedBrush(cr)
+    End Sub
+
+    ' 1px bevel: raised = light top/left + dark bottom/right, sunken inverted.
+    Public Sub Bevel(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal crLight As Long, ByVal crDark As Long, ByVal raised As Boolean)
+        Dim cT As Long, cB As Long
+        If raised Then
+            cT = crLight
+            cB = crDark
+        Else
+            cT = crDark
+            cB = crLight
+        End If
+        FillRc hdc, x1, y1, x2, y1 + 1, cT
+        FillRc hdc, x1, y1, x1 + 1, y2, cT
+        FillRc hdc, x2 - 1, y1, x2, y2, cB
+        FillRc hdc, x1, y2 - 1, x2, y2, cB
+    End Sub
+
+    ' 16-bit gradient channel word (0..255 -> 0..65280 wrapped to Integer)
+    Private Function Chan16(ByVal c As Long) As Integer
+        If c > 127 Then
+            Chan16 = CInt(c * 256 - 65536)
+        Else
+            Chan16 = CInt(c * 256)
+        End If
+    End Function
+
+    Private Function LerpC(ByVal ca As Long, ByVal cb As Long, ByVal num As Long, ByVal den As Long) As Long
+        Dim r As Long, g As Long, b As Long
+        r = (ca And &HFF&) + (((cb And &HFF&) - (ca And &HFF&)) * num \ den)
+        g = ((ca \ &H100&) And &HFF&) + ((((cb \ &H100&) And &HFF&) - ((ca \ &H100&) And &HFF&)) * num \ den)
+        b = ((ca \ &H10000) And &HFF&) + ((((cb \ &H10000) And &HFF&) - ((ca \ &H10000) And &HFF&)) * num \ den)
+        LerpC = RGB(r, g, b)
+    End Function
+
+    ' Vertical two-color gradient. Primary path: msimg32 GradientFill
+    ' (XP built-in, no object management). Fallback: up to 64 interpolated
+    ' strips via FillRc.
+    Public Sub GradRect(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal crTop As Long, ByVal crBottom As Long)
+        On Error GoTo banded
+        If x2 <= x1 Or y2 <= y1 Then Exit Sub
+        Dim v(0 To 1) As TRIVERTEX
+        Dim mesh As GRADIENT_RECT
+        v(0).x = x1
+        v(0).y = y1
+        v(0).Red = Chan16(crTop And &HFF&)
+        v(0).Green = Chan16((crTop \ &H100&) And &HFF&)
+        v(0).Blue = Chan16((crTop \ &H10000) And &HFF&)
+        v(0).Alpha = 0
+        v(1).x = x2
+        v(1).y = y2
+        v(1).Red = Chan16(crBottom And &HFF&)
+        v(1).Green = Chan16((crBottom \ &H100&) And &HFF&)
+        v(1).Blue = Chan16((crBottom \ &H10000) And &HFF&)
+        v(1).Alpha = 0
+        mesh.UpperLeft = 0
+        mesh.LowerRight = 1
+        If GradientFill(hdc, v(0), 2, mesh, 1, 1) = 0 Then GoTo banded   ' 1 = GRADIENT_FILL_RECT_V
+        Exit Sub
+banded:
+        On Error Resume Next
+        Dim n As Long, i As Long, yA As Long, yB As Long
+        n = 64
+        If n > y2 - y1 Then n = y2 - y1
+        If n < 1 Then n = 1
+        For i = 0 To n - 1
+            yA = y1 + (y2 - y1) * i \ n
+            yB = y1 + (y2 - y1) * (i + 1) \ n
+            If yB > yA Then FillRc hdc, x1, yA, x2, yB, LerpC(crTop, crBottom, i, n - 1)
+        Next
+    End Sub
+
+    ' ------------------------------------------------------------------- text
+
+    Public Sub TextAt(ByVal hdc As Long, ByVal s As String, ByVal x As Long, ByVal y As Long, ByVal cr As Long, ByVal hFont As Long)
+        SetBkMode hdc, 1          ' TRANSPARENT
+        SetTextColor hdc, cr
+        SelectObject hdc, hFont
+        If Len(s) > 0 Then TextOutW hdc, x, y, StrPtr(s), Len(s)
+    End Sub
+
+    Public Function TextWidth(ByVal hdc As Long, ByVal s As String, ByVal hFont As Long) As Long
+        Dim r As Long
+        SelectObject hdc, hFont
+        If Len(s) = 0 Then Exit Function
+        r = GetTabbedTextExtentW(hdc, StrPtr(s), Len(s), 0, 0)
+        TextWidth = r And &HFFFF&
+    End Function
+
+    ' Single-line text with a manual trailing ellipsis when wider than maxW.
+    ' Perf rework: the old loop chopped one char and re-measured the WHOLE
+    ' string per iteration (O(n^2) GDI calls per list row). One
+    ' GetTextExtentExPointW call returns the fit count directly.
+    Public Sub TextClip(ByVal hdc As Long, ByVal s As String, ByVal x As Long, ByVal y As Long, ByVal maxW As Long, ByVal cr As Long, ByVal hFont As Long)
+        Dim t As String
+        t = s
+        If maxW <= 0 Then Exit Sub
+        If Len(t) = 0 Then Exit Sub
+        If Len(t) > 512 Then t = Left$(t, 512)   ' dx probe buffer bound
+        SelectObject hdc, hFont
+        Dim sz As SIZETG
+        Dim nFit As Long
+        Dim dxArr(0 To 511) As Long
+        If GetTextExtentExPointW(hdc, StrPtr(t), Len(t), maxW, nFit, dxArr(0), sz) = 0 Then Exit Sub
+        If sz.cx <= maxW Then
+            TextAt hdc, t, x, y, cr, hFont
+            Exit Sub
+        End If
+        ' needs the ellipsis: fit chars within maxW - width("...")
+        Dim elli As String
+        elli = ChrW$(&H2026&)
+        Dim szE As SIZETG
+        Dim nFitE As Long
+        If GetTextExtentExPointW(hdc, StrPtr(elli), 1, maxW, nFitE, dxArr(0), szE) = 0 Then Exit Sub
+        nFit = 0
+        GetTextExtentExPointW hdc, StrPtr(t), Len(t), maxW - szE.cx, nFit, dxArr(0), sz
+        If nFit < 0 Then nFit = 0
+        If nFit > Len(t) Then nFit = Len(t)
+        TextAt hdc, Left$(t, nFit) & elli, x, y, cr, hFont
+    End Sub
+
+    Public Sub TextCenter(ByVal hdc As Long, ByVal s As String, ByVal cx As Long, ByVal y As Long, ByVal cr As Long, ByVal hFont As Long)
+        Dim w As Long
+        w = TextWidth(hdc, s, hFont)
+        TextAt hdc, s, cx - w \ 2, y, cr, hFont
+    End Sub
+
+    ' ----------------------------------------------------------------- shapes
+
+    Public Sub DrawCircle(ByVal hdc As Long, ByVal cx As Long, ByVal cy As Long, ByVal r As Long, ByVal crFill As Long)
+        Dim oldBr As Long
+        Dim oldPen As Long
+        oldBr = SelectObject(hdc, CachedBrush(crFill))
+        oldPen = SelectObject(hdc, GetStockObject(NULL_PEN_STOCK))
+        Ellipse hdc, cx - r, cy - r, cx + r + 1, cy + r + 1
+        SelectObject hdc, oldPen
+        SelectObject hdc, oldBr
+    End Sub
+
+    Public Sub DrawCircleOutline(ByVal hdc As Long, ByVal cx As Long, ByVal cy As Long, ByVal r As Long, ByVal cr As Long)
+        Dim oldPen As Long
+        Dim oldBr As Long
+        oldPen = SelectObject(hdc, CachedPen(cr))
+        oldBr = SelectObject(hdc, GetStockObject(NULL_BRUSH_STOCK))
+        Ellipse hdc, cx - r, cy - r, cx + r + 1, cy + r + 1
+        SelectObject hdc, oldBr
+        SelectObject hdc, oldPen
+    End Sub
+
+    Public Sub DrawLine(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal cr As Long)
+        Dim oldPen As Long
+        oldPen = SelectObject(hdc, CachedPen(cr))
+        MoveToEx hdc, x1, y1, 0
+        LineTo hdc, x2, y2
+        SelectObject hdc, oldPen
+    End Sub
+
+    ' Filled triangle pointing up; (cx, yTop) is the apex center.
+    Public Sub DrawTriUp(ByVal hdc As Long, ByVal cx As Long, ByVal yTop As Long, ByVal w As Long, ByVal h As Long, ByVal cr As Long)
+        Dim pts(0 To 2) As POINTL
+        Dim oldBr As Long
+        Dim oldPen As Long
+        pts(0).px = cx
+        pts(0).py = yTop
+        pts(1).px = cx - w \ 2
+        pts(1).py = yTop + h
+        pts(2).px = cx + w \ 2
+        pts(2).py = yTop + h
+        oldBr = SelectObject(hdc, CachedBrush(cr))
+        oldPen = SelectObject(hdc, GetStockObject(NULL_PEN_STOCK))
+        Polygon hdc, pts(0), 3
+        SelectObject hdc, oldPen
+        SelectObject hdc, oldBr
+    End Sub
+
+    ' Filled triangle pointing left/right (tag bar scroll arrows).
+    Public Sub DrawTriLeft(ByVal hdc As Long, ByVal cxRight As Long, ByVal cy As Long, ByVal w As Long, ByVal h As Long, ByVal cr As Long)
+        Dim pts(0 To 2) As POINTL
+        Dim oldBr As Long
+        Dim oldPen As Long
+        pts(0).px = cxRight - w
+        pts(0).py = cy
+        pts(1).px = cxRight
+        pts(1).py = cy - h \ 2
+        pts(2).px = cxRight
+        pts(2).py = cy + h \ 2
+        oldBr = SelectObject(hdc, CachedBrush(cr))
+        oldPen = SelectObject(hdc, GetStockObject(NULL_PEN_STOCK))
+        Polygon hdc, pts(0), 3
+        SelectObject hdc, oldPen
+        SelectObject hdc, oldBr
+    End Sub
+
+    Public Sub DrawTriRight(ByVal hdc As Long, ByVal cxLeft As Long, ByVal cy As Long, ByVal w As Long, ByVal h As Long, ByVal cr As Long)
+        Dim pts(0 To 2) As POINTL
+        Dim oldBr As Long
+        Dim oldPen As Long
+        pts(0).px = cxLeft + w
+        pts(0).py = cy
+        pts(1).px = cxLeft
+        pts(1).py = cy - h \ 2
+        pts(2).px = cxLeft
+        pts(2).py = cy + h \ 2
+        oldBr = SelectObject(hdc, CachedBrush(cr))
+        oldPen = SelectObject(hdc, GetStockObject(NULL_PEN_STOCK))
+        Polygon hdc, pts(0), 3
+        SelectObject hdc, oldPen
+        SelectObject hdc, oldBr
+    End Sub
+
+    ' Small 9x9 padlock (note list safe badge).
+    Public Sub DrawLock(ByVal hdc As Long, ByVal x As Long, ByVal y As Long, ByVal cr As Long)
+        Dim oldPen As Long
+        oldPen = SelectObject(hdc, CachedPen(cr))
+        ' shackle: top half arc, drawn right -> left over the top
+        Arc hdc, x, y, x + 9, y + 8, x + 9, y + 4, x, y + 4
+        SelectObject hdc, oldPen
+        FillRc hdc, x, y + 4, x + 9, y + 9, cr
+    End Sub
+
+    ' Rounded chip (tag bar). crLine < 0 -> no outline.
+    Public Sub ChipRect(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long, ByVal crFill As Long, ByVal crLine As Long)
+        Dim oldBr As Long
+        Dim oldPen As Long
+        oldBr = SelectObject(hdc, CachedBrush(crFill))
+        If crLine >= 0 Then
+            oldPen = SelectObject(hdc, CachedPen(crLine))
+        Else
+            oldPen = SelectObject(hdc, GetStockObject(NULL_PEN_STOCK))
+        End If
+        RoundRect hdc, x1, y1, x2, y2, 14, 14
+        SelectObject hdc, oldPen
+        SelectObject hdc, oldBr
+    End Sub
+
+    ' ---------------------------------------------------------------- clipping
+
+    Public Function ClipBegin(ByVal hdc As Long, ByVal x1 As Long, ByVal y1 As Long, ByVal x2 As Long, ByVal y2 As Long) As Long
+        Dim saved As Long
+        saved = SaveDC(hdc)
+        IntersectClipRect hdc, x1, y1, x2, y2
+        ClipBegin = saved
+    End Function
+
+    Public Sub ClipEnd(ByVal hdc As Long, ByVal saved As Long)
+        RestoreDC hdc, saved
+    End Sub
+
+    ' ------------------------------------------------------------- coordinates
+
+    Public Sub ScreenToClientPx(ByVal hWnd As Long, ByRef x As Long, ByRef y As Long)
+        Dim pt As POINTL
+        pt.px = x
+        pt.py = y
+        ScreenToClient hWnd, pt
+        x = pt.px
+        y = pt.py
+    End Sub
+
+    Public Function TrackLeave(ByVal hWnd As Long) As Boolean
+        Dim tme As TMEType
+        tme.cbSize = 16
+        tme.dwFlags = 2          ' TME_LEAVE
+        tme.hwndTrack = hWnd
+        tme.dwHoverTime = 0
+        TrackLeave = (TrackMouseEvent(tme) <> 0)
+    End Function
+
+    ' -------------------------------------------------------------- screenshot
+
+    ' True when a 25-point grid over the DIB is all one color (blank capture)
+    Private Function OverlayBlank(ByVal bitsPtr As Long, ByVal w As Long, ByVal h As Long) As Boolean
+        On Error GoTo fail
+        If bitsPtr = 0 Then Exit Function
+        Dim mn As Long, mx As Long
+        Dim v As Long
+        Dim gx As Long, gy As Long
+        Dim i As Long
+        mn = -1
+        mx = -1
+        For i = 0 To 24
+            gx = (i Mod 5) * (w \ 5) + 2
+            gy = (i \ 5) * (h \ 5) + 2
+            If gx < 0 Then gx = 0
+            If gy < 0 Then gy = 0
+            If gx >= w Then gx = w - 1
+            If gy >= h Then gy = h - 1
+            CopyMem v, bitsPtr + (gy * w + gx) * 4, 4
+            If mn = -1 Then
+                mn = v
+                mx = v
+            Else
+                If v < mn Then mn = v
+                If v > mx Then mx = v
+            End If
+        Next
+        OverlayBlank = (mn = mx)
+        Exit Function
+fail:
+        OverlayBlank = True
+    End Function
+
+    ' Captures a DC (the form's AutoRedraw persistent DC = exactly the client
+    ' image) into a PNG via GDI+. Uses a 32bpp top-down DIB section; after the
+    ' blit the alpha byte of every pixel is forced to 0xFF because GDI writes
+    ' BGR only and GDI+ would otherwise save a fully transparent (i.e. black
+    ' looking) PNG. The PNG encoder CLSID below is the stable built-in GDI+
+    ' PNG codec. detail returns a probe string for the result log.
+    '
+    ' P3: windowed children (the WebBrowser) do not paint into the form DC.
+    ' overlayHwnd (Internet Explorer_Server) is rendered via WM_PRINT
+    ' (Trident supports it) into a second DIB and composited over the base
+    ' at its client position before the PNG encode. formHwnd is the target
+    ' for the coordinate mapping.
+    Public Function CaptureWindowPng(ByVal srcHdc As Long, ByVal w As Long, ByVal h As Long, ByVal path As String, ByRef detail As String) As Boolean
+        CaptureWindowPng = CaptureWithOverlay(srcHdc, w, h, path, detail, 0, 0)
+    End Function
+
+    Public Function CaptureWithOverlay(ByVal srcHdc As Long, ByVal w As Long, ByVal h As Long, ByVal path As String, ByRef detail As String, ByVal formHwnd As Long, ByVal overlayHwnd As Long) As Boolean
+        On Error GoTo fail
+        Dim hdcMem As Long, hDib As Long, oldBmp As Long
+        Dim bitsPtr As Long
+        Dim bmi As BITMAPINFOG
+        Dim blt As Long
+        Dim pix0 As Long
+        Dim tok As Long, img As Long
+        Dim si As GdiplusStartupInput
+        Dim enc As CLSIDT
+        Dim a255 As Byte
+        Dim p As Long
+
+        detail = "src=" & (w & "x" & h)
+        If w <= 0 Or h <= 0 Then Exit Function
+
+        bmi.bmiHeader.biSize = 40
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h        ' top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0    ' BI_RGB
+        hDib = CreateDIBSection(srcHdc, bmi, 0, bitsPtr, 0, 0)
+        If hDib = 0 Then
+            detail = detail & " dib=FAIL"
+            Exit Function
+        End If
+
+        hdcMem = CreateCompatibleDC(srcHdc)
+        oldBmp = SelectObject(hdcMem, hDib)
+        blt = BitBlt(hdcMem, 0, 0, w, h, srcHdc, 0, 0, SRCCOPY)
+        If bitsPtr <> 0 Then
+            CopyMem pix0, bitsPtr, 4
+            a255 = 255
+            For p = 3 To w * h * 4 - 1 Step 4
+                PokeB bitsPtr + p, a255, 1
+            Next
+        End If
+        SelectObject hdcMem, oldBmp
+        detail = detail & " blt=" & blt & " pix0=0x" & Hex$(pix0)
+
+        ' ---- windowed-child overlay. Trident ignores a plain WM_PRINT for
+        ' its content, so try, in order: PrintWindow(PW_RENDERFULLCONTENT),
+        ' PrintWindow(default), WM_PRINT(PRF_CLIENT), screen BitBlt - and
+        ' accept the first method whose result is not uniform (blank)
+        If overlayHwnd <> 0 And formHwnd <> 0 Then
+            Dim rc As RECTG
+            Dim ow As Long, oh As Long
+            Dim pt As POINTL
+            Dim ovDc As Long, ovBmp As Long, ovOld As Long
+            Dim ovBits As Long
+            Dim q As Long
+            Dim method As String
+            GetClientRect overlayHwnd, rc
+            ow = rc.R - rc.L
+            oh = rc.B - rc.T
+            If ow > 0 And oh > 0 And ow <= w And oh <= h Then
+                ovDc = CreateCompatibleDC(srcHdc)
+                ovBmp = CreateDIBSection(ovDc, bmi, 0, ovBits, 0, 0)
+                If ovDc <> 0 And ovBmp <> 0 Then
+                    ovOld = SelectObject(ovDc, ovBmp)
+
+                    ' A: screen BitBlt of the window's screen rect - the
+                    ' screen holds the true composited pixels (verified by
+                    ' an external capture) and, unlike PrintWindow, carries
+                    ' no DPI-logical letterboxing
+                    Dim rcS As RECTG
+                    Dim sdc As Long
+                    GetWindowRect overlayHwnd, rcS
+                    sdc = GetDC(0)
+                    BitBlt ovDc, 0, 0, ow, oh, sdc, rcS.L, rcS.T, SRCCOPY
+                    ReleaseDC 0, sdc
+                    method = "screenblt"
+                    If OverlayBlank(ovBits, ow, oh) Then
+                        ' B: PrintWindow with PW_RENDERFULLCONTENT
+                        PrintWindow overlayHwnd, ovDc, 2
+                        method = method & "->pw-full"
+                        If OverlayBlank(ovBits, ow, oh) Then
+                            ' C: plain PrintWindow
+                            PrintWindow overlayHwnd, ovDc, 0
+                            method = method & "->pw"
+                            If OverlayBlank(ovBits, ow, oh) Then
+                                ' D: WM_PRINT with PRF_CLIENT|ERASEBKGND
+                                SendMessageW overlayHwnd, &H317, ovDc, 1 Or 8
+                                method = method & "->wmprint"
+                            End If
+                        End If
+                    End If
+
+                    If ovBits <> 0 Then
+                        For q = 3 To ow * oh * 4 - 1 Step 4
+                            PokeB ovBits + q, a255, 1
+                        Next
+                    End If
+                    pt.px = rc.L
+                    pt.py = rc.T
+                    MapWindowPoints overlayHwnd, formHwnd, pt, 1
+                    If pt.px >= 0 And pt.py >= 0 And pt.px + ow <= w And pt.py + oh <= h Then
+                        BitBlt hdcMem, pt.px, pt.py, ow, oh, ovDc, 0, 0, SRCCOPY
+                        detail = detail & " overlay=0x" & Hex$(overlayHwnd) & "@" & pt.px & "," & pt.py & " " & (ow & "x" & oh) & " via=" & method
+                        ' DEBUG: dump the overlay DIB itself
+                        Dim dbgTok As Long, dbgImg As Long
+                        Dim dbgSi As GdiplusStartupInput
+                        Dim dbgEnc As CLSIDT
+                        dbgSi.GdiplusVersion = 1
+                        If GdiplusStartup(dbgTok, dbgSi, 0) = 0 Then
+                            dbgEnc.Data1 = &H557CF406
+                            dbgEnc.Data2 = &H1A04
+                            dbgEnc.Data3 = &H11D3
+                            dbgEnc.Data4(0) = &H9A
+                            dbgEnc.Data4(1) = &H73
+                            dbgEnc.Data4(2) = 0
+                            dbgEnc.Data4(3) = 0
+                            dbgEnc.Data4(4) = &HF8
+                            dbgEnc.Data4(5) = &H1E
+                            dbgEnc.Data4(6) = &HF3
+                            dbgEnc.Data4(7) = &H2E
+                            If GdipCreateBitmapFromHBITMAP(ovBmp, 0, dbgImg) = 0 Then
+                                GdipSaveImageToFile dbgImg, StrPtr(path & ".overlay.png"), dbgEnc, 0
+                                GdipDisposeImage dbgImg
+                            End If
+                            GdiplusShutdown dbgTok
+                        End If
+                    Else
+                        detail = detail & " overlay=SKIP(offclient " & pt.px & "," & pt.py & ")"
+                    End If
+                    SelectObject ovDc, ovOld
+                End If
+                If ovBmp <> 0 Then DeleteObject ovBmp
+                If ovDc <> 0 Then DeleteDC ovDc
+            Else
+                detail = detail & " overlay=SKIP(size " & (ow & "x" & oh) & ")"
+            End If
+        End If
+
+        si.GdiplusVersion = 1
+        If GdiplusStartup(tok, si, 0) <> 0 Then GoTo cleanup
+
+        enc.Data1 = &H557CF406
+        enc.Data2 = &H1A04
+        enc.Data3 = &H11D3
+        enc.Data4(0) = &H9A
+        enc.Data4(1) = &H73
+        enc.Data4(2) = 0
+        enc.Data4(3) = 0
+        enc.Data4(4) = &HF8
+        enc.Data4(5) = &H1E
+        enc.Data4(6) = &HF3
+        enc.Data4(7) = &H2E
+
+        If GdipCreateBitmapFromHBITMAP(hDib, 0, img) = 0 Then
+            If GdipSaveImageToFile(img, StrPtr(path), enc, 0) = 0 Then CaptureWithOverlay = True
+            GdipDisposeImage img
+        Else
+            detail = detail & " gdiplusbmp=FAIL"
+        End If
+        GdiplusShutdown tok
+
+cleanup:
+        If hDib <> 0 Then DeleteObject hDib
+        If hdcMem <> 0 Then DeleteDC hdcMem
+        Exit Function
+fail:
+        Dim errN As Long, errD As String
+        errN = Err.Number
+        errD = Err.Description
+        On Error Resume Next
+        detail = detail & " CAPERR=" & errN & " " & errD
+        If hDib <> 0 Then DeleteObject hDib
+        If hdcMem <> 0 Then DeleteDC hdcMem
+        CaptureWithOverlay = False
+    End Function
+
+End Class

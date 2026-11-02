@@ -1,0 +1,169 @@
+Option Explicit
+
+[Description("Confirm dialog: native Label/CommandButton, modal, owner-centered")]
+[FormDesignerId("7E4C1A02-93B5-4F6D-8A21-C0D51B9F2A07")]
+[PredeclaredId]
+Class ConfirmDlg
+
+    ' set by MainForm before Show 1; read back after the modal returns
+    Public Confirmed As Boolean
+    ' gate automation: "ok"/"cancel" = auto-answer on first activate,
+    ' exercising the real cmdOK/cmdCancel path without a user (the same
+    ' pattern as SyncDlg.GateApply / LinkDlg.GateUrl)
+    Public GateAnswer As String
+
+    Private m_ownerHwnd As Long
+
+    ' PHYSICAL-pixel sizing: the tbform Width/Height numbers are honored
+    ' as pixels by the runtime, so any twips-style value would blow the
+    ' window up to many thousands of pixels. AdjustWindowRectEx +
+    ' SetWindowPos pin the true size and center on the owner, same
+    ' recipe as LinkDlg.
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 360      ' client, physical px
+    Private Const DlgH As Long = 150
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    Public Sub Preload(ByVal title As String, ByVal msg As String, ByVal okText As String, ByVal ownerHwnd As Long)
+        Confirmed = False
+        GateAnswer = ""
+        m_title = title
+        m_msg = msg
+        m_okText = okText
+        m_ownerHwnd = ownerHwnd
+        m_focusDone = False
+        ' touching the controls triggers form loading - Form_Load pushes the
+        ' values into the controls
+    End Sub
+
+    Private m_title As String
+    Private m_msg As String
+    Private m_okText As String
+    Private m_focusDone As Boolean
+
+    Private Sub Form_Load()
+        Me.Caption = m_title
+        lblMsg.Caption = m_msg
+        cmdOK.Caption = m_okText
+        cmdCancel.Caption = SCancelBtn()
+        SnapCenter
+        ' tbform control geometry is DPI-scaled by the runtime (x1.25),
+        ' which overflows the pinned 360x150 client - layout every control
+        ' in physical pixels instead, same as LinkDlg
+        lblMsg.Move 16, 16, 328, 68
+        lblMsg.WordWrap = True             ' 68px = 3 wrapped lines; known
+                                           ' questions fit (longest = 2)
+        cmdOK.Move 176, 104, 88, 28
+        cmdCancel.Move 272, 104, 88, 28
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    ' NO m_once latch here (LinkDlg's pattern) - this dialog opens MORE
+    ' THAN ONCE per run (soft delete + purge), and a latched Activate
+    ' would swallow the GateAnswer auto-answer of the second Show (caught
+    ' live in the first gate round: the purge confirm sat modal forever).
+    ' Instead: every Activate with a non-empty GateAnswer consumes it and
+    ' hides (idempotent across however many Activates fire); the focus
+    ' fallback happens once per Preload.
+    '
+    ' Activate is ALSO the auto-answer's weakness: it only fires when the
+    ' window is actually activated, and any foreground focus fight (user
+    ' working on the box during automation) can leave the modal waiting
+    ' forever. AutoAnswerNow gives the gates a no-Show path that still
+    ' exercises the real button handlers.
+    Public Sub AutoAnswerNow()
+        If Len(GateAnswer) > 0 Then
+            Dim a As String
+            a = GateAnswer
+            GateAnswer = ""
+            If StrComp(a, "ok", vbTextCompare) = 0 Then
+                cmdOK_Click
+            Else
+                cmdCancel_Click
+            End If
+        End If
+    End Sub
+
+    Private Sub Form_Activate()
+        RefreshText
+        AutoAnswerNow
+        If Len(GateAnswer) = 0 And Not m_focusDone Then
+            m_focusDone = True
+            On Error Resume Next
+            cmdOK.SetFocus
+        End If
+    End Sub
+
+    ' re-push the Preload strings: this dialog shows more than once per
+    ' run, and Form_Load only fires for the first Show - without this the
+    ' second dialog displays the previous question
+    Private Sub RefreshText()
+        On Error Resume Next
+        Me.Caption = m_title
+        lblMsg.Caption = m_msg
+        cmdOK.Caption = m_okText
+        cmdCancel.Caption = SCancelBtn()
+    End Sub
+
+    ' Default/Cancel button properties are dropped by the minimal tbform
+    ' blocks, so Enter/Esc route explicitly (KeyPreview=true)
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 13 Then
+            KeyCode = 0
+            cmdOK_Click
+        ElseIf KeyCode = 27 Then
+            KeyCode = 0
+            cmdCancel_Click
+        End If
+    End Sub
+
+    Private Sub cmdOK_Click()
+        Confirmed = True
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCancel_Click()
+        Confirmed = False
+        Me.Hide
+    End Sub
+
+    Private Function SCancelBtn() As String    ' "取消"
+        SCancelBtn = ChrW$(&H53D6&) & ChrW$(&H6D88&)
+    End Function
+End Class

@@ -1,0 +1,479 @@
+Option Explicit
+
+' TbSync - repository synchronization orchestration for the tB shell (P4 core).
+' Input: local repository file + remote WebDAV url (via TbWebdav).
+'
+' Flow (task spec P4; merger/UI stays for the integration round):
+'   1. PROPFIND the remote repository file.
+'   2. Remote missing           -> local is new: backup, upload.      "uploaded"
+'   3. Download remote, compare SHA256 both sides + repository id
+'      (root element <silentnotes id="..."> attribute of the XML file).
+'      - byte-identical          -> nothing to do, heal baseline.    "clean"
+'      - id differs              -> conflict flag, no transfer.      "conflict"
+'      - only remote changed vs. baseline -> backup, replace local.  "downloaded"
+'      - only local changed vs. baseline  -> backup, upload.         "uploaded"
+'      - both changed (or no baseline)    -> conflict flag.          "conflict"
+'
+' Backup semantics per the Windows reference implementation
+' (src\SilentNotes.WindowsWinForms\Services\WindowsSynchronizationService.cs):
+'   - backup only before a mutating transfer (upload or download-replace);
+'   - file "sync_backups\presync_{yyyyMMdd_HHmmss}.silentnotes", plain copy;
+'   - keep at most 5, delete oldest by name (timestamp) order.
+'
+' Baseline (last synchronized state) persists in a TbIni file, one section per
+' remote url, keys local_sha/remote_sha, so a restart keeps skip-clean working.
+'
+' Repository id: parsed from the XML root attribute directly (byte compare of
+' the same file the ComGateway loads). The P1 gateway has no repository-id API
+' (adding one would mean rebuilding/re-registering the P1 DLL - out of scope);
+' the id check here is the byte-level equivalent of IsSameRepositoryStep.
+
+Class TbSync
+
+    Private Const MaxBackupCount As Long = 5
+    Private Const BackupPrefix As String = "presync_"
+    Private Const BackupExt As String = ".silentnotes"
+
+    Private m_Wd As TbWebdav
+    Private m_Crypto As TbCrypto        ' SHA256 fingerprints
+    Private m_U8 As TbUtf8
+    Private m_Ini As TbIni
+    Private m_LocalPath As String
+    Private m_RemoteUrl As String
+    Private m_BackupDir As String
+    Private m_StatePath As String
+
+    ' result of the last Synchronize() call
+    Private m_Result As String          ' uploaded|downloaded|clean|conflict|error
+    Private m_Reason As String
+    Private m_Conflict As Boolean
+    Private m_Detail As String
+    Private m_LocalSha As String
+    Private m_RemoteSha As String
+
+    Public Property Get Result() As String
+        Result = m_Result
+    End Property
+
+    Public Property Get Reason() As String
+        Reason = m_Reason
+    End Property
+
+    Public Property Get Conflict() As Boolean
+        Conflict = m_Conflict
+    End Property
+
+    Public Property Get Detail() As String
+        Detail = m_Detail
+    End Property
+
+    Public Property Get LastLocalSha() As String
+        LastLocalSha = m_LocalSha
+    End Property
+
+    Public Property Get LastRemoteSha() As String
+        LastRemoteSha = m_RemoteSha
+    End Property
+
+    Public Function Init(wd As TbWebdav, crypto As TbCrypto, localRepoPath As String, _
+        remoteUrl As String, backupDir As String, statePath As String) As Boolean
+
+        Set m_Wd = wd
+        Set m_Crypto = crypto
+        Set m_U8 = New TbUtf8
+        Set m_Ini = New TbIni
+        m_LocalPath = localRepoPath
+        m_RemoteUrl = remoteUrl
+        m_BackupDir = backupDir
+        m_StatePath = statePath
+        Init = True
+    End Function
+
+    ' ------------------------------------------------------------ main flow
+
+    Public Function Synchronize() As String
+        m_Result = "error": m_Reason = "": m_Conflict = False: m_Detail = ""
+        m_LocalSha = "": m_RemoteSha = ""
+
+        Dim localBytes() As Byte
+        If Not ReadFileBytes(m_LocalPath, localBytes) Then
+            m_Reason = "local_repo_missing"
+            m_Detail = m_LocalPath
+            Synchronize = m_Result
+            Exit Function
+        End If
+        m_LocalSha = m_Crypto.Sha256Bytes(localBytes)
+
+        ' 1. remote present?
+        Dim props As TbWebdavProps
+        If Not m_Wd.Propfind(m_RemoteUrl, props) Then
+            m_Reason = "transport_error"
+            m_Detail = m_Wd.LastError
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        If Not props.Exists Then
+            ' 2. remote missing -> local wins, upload
+            If Not CreateBackup() Then
+                m_Reason = "backup_failed"
+                m_Detail = m_BackupDir
+                Synchronize = m_Result
+                Exit Function
+            End If
+            If Not m_Wd.PutFile(m_RemoteUrl, localBytes) Then
+                m_Reason = "put_failed"
+                m_Detail = m_Wd.LastError & " status=" & m_Wd.LastStatus
+                Synchronize = m_Result
+                Exit Function
+            End If
+            SetBaseline m_LocalSha, m_LocalSha
+            m_Result = "uploaded"
+            m_Reason = "remote_missing"
+            m_RemoteSha = m_LocalSha
+            m_Detail = "backups=" & CountBackups()
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        ' 3. download remote content (404 after exists = state changed -> treat as missing)
+        Dim remoteBytes() As Byte
+        If Not m_Wd.GetFile(m_RemoteUrl, remoteBytes) Then
+            If m_Wd.LastStatus = 404 Then
+                If Not CreateBackup() Then
+                    m_Reason = "backup_failed"
+                    Synchronize = m_Result
+                    Exit Function
+                End If
+                If Not m_Wd.PutFile(m_RemoteUrl, localBytes) Then
+                    m_Reason = "put_failed"
+                    m_Detail = m_Wd.LastError
+                    Synchronize = m_Result
+                    Exit Function
+                End If
+                SetBaseline m_LocalSha, m_LocalSha
+                m_Result = "uploaded"
+                m_Reason = "remote_missing"
+                m_RemoteSha = m_LocalSha
+                m_Detail = "backups=" & CountBackups()
+                Synchronize = m_Result
+                Exit Function
+            End If
+            m_Reason = "get_failed"
+            m_Detail = m_Wd.LastError & " status=" & m_Wd.LastStatus
+            Synchronize = m_Result
+            Exit Function
+        End If
+        m_RemoteSha = m_Crypto.Sha256Bytes(remoteBytes)
+
+        ' 4. byte-identical -> clean (and heal the baseline)
+        If StrComp(m_LocalSha, m_RemoteSha, vbBinaryCompare) = 0 Then
+            SetBaseline m_LocalSha, m_RemoteSha
+            m_Result = "clean"
+            m_Reason = "identical"
+            m_Detail = "sha=" & m_LocalSha
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        ' 5. repository id comparison (IsSameRepositoryStep equivalent)
+        Dim localId As String, remoteId As String
+        localId = RepoIdOfBytes(localBytes)
+        remoteId = RepoIdOfBytes(remoteBytes)
+        If (Len(localId) > 0) And (Len(remoteId) > 0) Then
+            If StrComp(localId, remoteId, vbTextCompare) <> 0 Then
+                m_Result = "conflict"
+                m_Reason = "id_mismatch"
+                m_Conflict = True
+                m_Detail = "local=" & localId & " remote=" & remoteId
+                Synchronize = m_Result
+                Exit Function
+            End If
+        End If
+
+        ' 6. baseline decides the direction
+        Dim blLocal As String, blRemote As String
+        LoadBaseline blLocal, blRemote
+        If (Len(blLocal) = 0) Or (Len(blRemote) = 0) Then
+            m_Result = "conflict"
+            m_Reason = "no_baseline"
+            m_Conflict = True
+            m_Detail = "differing content on first synchronized encounter"
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        Dim localChanged As Boolean, remoteChanged As Boolean
+        localChanged = (StrComp(m_LocalSha, blLocal, vbBinaryCompare) <> 0)
+        remoteChanged = (StrComp(m_RemoteSha, blRemote, vbBinaryCompare) <> 0)
+
+        If localChanged And remoteChanged Then
+            m_Result = "conflict"
+            m_Reason = "both_changed"
+            m_Conflict = True
+            m_Detail = "local<>baseline and remote<>baseline; merger deferred to integration round"
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        If remoteChanged Then
+            ' remote is newer -> backup, replace local
+            If Not CreateBackup() Then
+                m_Reason = "backup_failed"
+                Synchronize = m_Result
+                Exit Function
+            End If
+            If Not WriteFileBytes(m_LocalPath, remoteBytes) Then
+                m_Reason = "write_local_failed"
+                Synchronize = m_Result
+                Exit Function
+            End If
+            SetBaseline m_RemoteSha, m_RemoteSha
+            m_Result = "downloaded"
+            m_Reason = "remote_newer"
+            m_Detail = "backups=" & CountBackups()
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        If localChanged Then
+            ' local is newer -> backup, upload
+            If Not CreateBackup() Then
+                m_Reason = "backup_failed"
+                Synchronize = m_Result
+                Exit Function
+            End If
+            If Not m_Wd.PutFile(m_RemoteUrl, localBytes) Then
+                m_Reason = "put_failed"
+                m_Detail = m_Wd.LastError
+                Synchronize = m_Result
+                Exit Function
+            End If
+            SetBaseline m_LocalSha, m_LocalSha
+            m_Result = "uploaded"
+            m_Reason = "local_newer"
+            m_Detail = "backups=" & CountBackups()
+            Synchronize = m_Result
+            Exit Function
+        End If
+
+        ' 7. both sides match the baseline yet differ from each other:
+        ' inconsistent state file -> conservative conflict
+        m_Result = "conflict"
+        m_Reason = "state_inconsistent"
+        m_Conflict = True
+        Synchronize = m_Result
+    End Function
+
+    ' ------------------------------------------------------------ backups
+
+    ' Copies the current local repository to sync_backups\presync_<ts>.silentnotes
+    ' and rotates (keep MaxBackupCount, delete oldest by name order).
+    Public Function CreateBackup() As Boolean
+        On Error GoTo fail
+        If Len(Dir$(m_LocalPath, vbNormal)) = 0 Then Exit Function
+        If Not EnsureDir(m_BackupDir) Then Exit Function
+
+        Dim ts As String
+        ts = Format$(Now, "yyyymmdd_hhnnss")
+        Dim target As String
+        target = m_BackupDir & "\" & BackupPrefix & ts & BackupExt
+        FileCopy m_LocalPath, target          ' overwrites (same-second retry)
+
+        RotateBackups
+        CreateBackup = True
+        Exit Function
+    fail:
+    End Function
+
+    Private Sub RotateBackups()
+        On Error Resume Next
+        Dim names() As String, n As Long
+        Dim f As String
+        f = Dir$(m_BackupDir & "\" & BackupPrefix & "*" & BackupExt, vbNormal)
+        Do While Len(f) > 0
+            ReDim Preserve names(0 To n)
+            names(n) = f
+            n = n + 1
+            f = Dir$
+        Loop
+        ' insertion sort ascending (timestamp names sort chronologically)
+        Dim i As Long, j As Long
+        For i = 1 To n - 1
+            Dim key As String
+            key = names(i)
+            j = i - 1
+            Do While (j >= 0) And (StrComp(names(j), key, vbBinaryCompare) > 0)
+                names(j + 1) = names(j)
+                j = j - 1
+            Loop
+            names(j + 1) = key
+        Next
+        Do While n > MaxBackupCount
+            Kill m_BackupDir & "\" & names(0)
+            For i = 0 To n - 2
+                names(i) = names(i + 1)
+            Next
+            n = n - 1
+        Loop
+    End Sub
+
+    Public Function CountBackups() As Long
+        On Error Resume Next
+        Dim n As Long
+        Dim f As String
+        f = Dir$(m_BackupDir & "\" & BackupPrefix & "*" & BackupExt, vbNormal)
+        Do While Len(f) > 0
+            n = n + 1
+            f = Dir$
+        Loop
+        CountBackups = n
+    End Function
+
+    Public Function OldestBackupName() As String
+        On Error Resume Next
+        Dim f As String, best As String
+        f = Dir$(m_BackupDir & "\" & BackupPrefix & "*" & BackupExt, vbNormal)
+        Do While Len(f) > 0
+            If (Len(best) = 0) Or (StrComp(f, best, vbBinaryCompare) < 0) Then best = f
+            f = Dir$
+        Loop
+        OldestBackupName = best
+    End Function
+
+    ' ------------------------------------------------------------ baseline
+
+    Private Sub LoadBaseline(ByRef localSha As String, ByRef remoteSha As String)
+        localSha = "": remoteSha = ""
+        On Error Resume Next
+        If Not m_Ini.Load(m_StatePath) Then Exit Sub
+        localSha = m_Ini.GetValue(m_RemoteUrl, "local_sha", "")
+        remoteSha = m_Ini.GetValue(m_RemoteUrl, "remote_sha", "")
+    End Sub
+
+    Private Sub SetBaseline(localSha As String, remoteSha As String)
+        On Error Resume Next
+        If Not m_Ini.Load(m_StatePath) Then
+            WriteEmptyFile m_StatePath
+            If Not m_Ini.Load(m_StatePath) Then Exit Sub
+        End If
+        m_Ini.SetValue m_RemoteUrl, "local_sha", localSha
+        m_Ini.SetValue m_RemoteUrl, "remote_sha", remoteSha
+        m_Ini.Save m_StatePath
+    End Sub
+
+    ' ------------------------------------------------------------ repo id
+
+    ' Repository id = root element attribute id of the repository XML
+    ' (<silentnotes ... id="guid" ...>). Only the first 1KB is decoded.
+    Public Function RepoIdOfBytes(data() As Byte) As String
+        On Error GoTo fail
+        Dim n As Long
+        n = ArrLen(data)
+        If n <= 0 Then Exit Function
+        If n > 1024 Then n = 1024
+        Dim head() As Byte
+        ReDim head(0 To n - 1)
+        Dim i As Long
+        For i = 0 To n - 1
+            head(i) = data(i)
+        Next
+        Dim s As String
+        s = m_U8.Decode(head)
+
+        Dim p As Long
+        p = InStr(1, s, "id=" & Chr$(34), vbTextCompare)
+        If p <= 0 Then Exit Function
+        Dim vStart As Long, vEnd As Long
+        vStart = p + 4
+        vEnd = InStr(vStart, s, Chr$(34))
+        If vEnd <= vStart Then Exit Function
+        Dim id As String
+        id = Mid$(s, vStart, vEnd - vStart)
+        If InStr(id, "-") <= 0 Then Exit Function     ' guid sanity
+        RepoIdOfBytes = id
+        Exit Function
+    fail:
+    End Function
+
+    ' ------------------------------------------------------------ helpers
+
+    Private Function EnsureDir(path As String) As Boolean
+        On Error GoTo fail
+        If Len(Dir$(path, vbDirectory)) > 0 Then
+            EnsureDir = True
+            Exit Function
+        End If
+        MkDirRecursive path
+        EnsureDir = (Len(Dir$(path, vbDirectory)) > 0)
+        Exit Function
+    fail:
+    End Function
+
+    Private Sub MkDirRecursive(ByVal path As String)
+        On Error Resume Next
+        Dim parent As String
+        parent = ""
+        Dim p As Long
+        p = InStrRev(path, "\")
+        If p > 3 Then
+            parent = Left$(path, p - 1)
+            If Len(Dir$(parent, vbDirectory)) = 0 Then MkDirRecursive parent
+        End If
+        MkDir path
+    End Sub
+
+    Private Function ReadFileBytes(path As String, ByRef data() As Byte) As Boolean
+        On Error GoTo fail
+        Dim f As Integer, n As Long
+        f = FreeFile
+        Open path For Binary Access Read As #f
+        n = LOF(f)
+        If n > 0 Then
+            ReDim data(0 To n - 1)
+            Get #f, , data
+        End If
+        Close #f
+        ReadFileBytes = True
+        Exit Function
+    fail:
+    End Function
+
+    ' Strong-typed Byte() before Put: a raw Variant would write a 12-byte
+    ' array descriptor (P1 trap).
+    Private Function WriteFileBytes(path As String, data() As Byte) As Boolean
+        On Error GoTo fail
+        Dim ba() As Byte
+        ba = data
+        If Len(Dir$(path, vbNormal)) > 0 Then Kill path
+        Dim f As Integer
+        f = FreeFile
+        Open path For Binary Access Write As #f
+        Put #f, , ba
+        Close #f
+        WriteFileBytes = True
+        Exit Function
+    fail:
+    End Function
+
+    Private Sub WriteEmptyFile(path As String)
+        ' writes a header-only ini skeleton (never a truly empty file - empty
+        ' files would exercise the tB Split("") edge case in TbIni.Load)
+        On Error Resume Next
+        If Len(Dir$(path, vbNormal)) > 0 Then Kill path
+        Dim f As Integer
+        f = FreeFile
+        Open path For Binary Access Write As #f
+        Put #f, , m_U8.Encode("; snP4SyncState" & vbCrLf)
+        Close #f
+    End Sub
+
+    Private Function ArrLen(b() As Byte) As Long
+        On Error GoTo emptyArr
+        ArrLen = UBound(b) + 1
+        Exit Function
+    emptyArr:
+        ArrLen = 0
+    End Function
+
+End Class

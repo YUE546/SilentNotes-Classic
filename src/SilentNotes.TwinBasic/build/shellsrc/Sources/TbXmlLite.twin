@@ -1,0 +1,377 @@
+Option Explicit
+
+' TbXmlLite - hand-written parser + serializer for the SilentNotes repository
+' XML dialect (NOT a general XML engine). Coverage: elements, attributes
+' (single/double quoted, colon names like xmlns:xsi), text, comments, PIs,
+' CDATA, self-closing tags, and the five named entities plus numeric refs.
+'
+' Byte-fidelity strategy: parse into TbRepoXml's order-preserving model with
+' RAW values, then serialize by replaying structure + raws. The only thing
+' the serializer "invents" is canonical tag anatomy: '<' name, single-space
+' separated name="value" attributes, ' />' for self-closing, '>' ... '</name>'
+' otherwise. Everything else (indentation, newlines, tabs, entities, quote
+' characters, BOM handling) lives in the data. Date strings are never parsed
+' or reformatted - they ride through as opaque attribute values.
+
+Module TbXmlLite
+
+Private m_S As String
+Private m_Pos As Long
+Private m_OutBuf As String
+Private m_OutPos As Long
+
+' ---------------- parser ----------------
+
+Public Function ParseString(ByRef s As String, ByRef errMsg As String) As Boolean
+    On Error GoTo F
+    TbRepoXml.ResetModel
+    m_S = s
+    m_Pos = 1
+    ParseChildren 0
+    ParseString = True
+    Exit Function
+F:
+    errMsg = "offset " & m_Pos & ": err " & Err.Number & " " & Err.Description
+    ParseString = False
+End Function
+
+' Parses the children of element 'parent' until its end tag (or, for the
+' document node, until end of input). Whitespace-only text between tags is
+' captured verbatim as NKTEXT nodes - that is what carries indentation/CRLF.
+Private Sub ParseChildren(ByVal parent As Long)
+    Dim slen As Long
+    Dim e As Long, e2 As Long, el As Long
+    Dim nm As String
+    slen = Len(m_S)
+    Do
+        If m_Pos > slen Then
+            If parent <> 0 Then
+                Err.Raise 1201, "TbXmlLite", "unexpected EOF inside <" & TbRepoXml.m_Nodes(parent).NName & ">"
+            End If
+            Exit Do
+        End If
+        If Mid$(m_S, m_Pos, 1) = "<" Then
+            If Mid$(m_S, m_Pos, 4) = "<!--" Then
+                e = InStr(m_Pos + 4, m_S, "-->")
+                If e = 0 Then Err.Raise 1202, "TbXmlLite", "unterminated comment"
+                TbRepoXml.m_Nodes(TbRepoXml.AddNode(parent, TbRepoXml.NKRAW)).NText = Mid$(m_S, m_Pos, e + 3 - m_Pos)
+                m_Pos = e + 3
+            ElseIf Mid$(m_S, m_Pos, 9) = "<![CDATA[" Then
+                e = InStr(m_Pos + 9, m_S, "]]>")
+                If e = 0 Then Err.Raise 1203, "TbXmlLite", "unterminated CDATA"
+                TbRepoXml.m_Nodes(TbRepoXml.AddNode(parent, TbRepoXml.NKRAW)).NText = Mid$(m_S, m_Pos, e + 3 - m_Pos)
+                m_Pos = e + 3
+            ElseIf Mid$(m_S, m_Pos, 2) = "<?" Then
+                e = InStr(m_Pos + 2, m_S, "?>")
+                If e = 0 Then Err.Raise 1204, "TbXmlLite", "unterminated processing instruction"
+                TbRepoXml.m_Nodes(TbRepoXml.AddNode(parent, TbRepoXml.NKRAW)).NText = Mid$(m_S, m_Pos, e + 2 - m_Pos)
+                m_Pos = e + 2
+            ElseIf Mid$(m_S, m_Pos, 2) = "</" Then
+                e = InStr(m_Pos, m_S, ">")
+                If e = 0 Then Err.Raise 1205, "TbXmlLite", "unterminated end tag"
+                nm = Mid$(m_S, m_Pos + 2, e - m_Pos - 2)
+                If parent = 0 Then Err.Raise 1206, "TbXmlLite", "close tag </" & nm & "> with no open element"
+                If TbRepoXml.m_Nodes(parent).NName <> nm Then
+                    Err.Raise 1207, "TbXmlLite", "mismatched close: open <" & TbRepoXml.m_Nodes(parent).NName & "> vs </" & nm & ">"
+                End If
+                m_Pos = e + 1
+                Exit Sub
+            Else
+                el = TbRepoXml.AddNode(parent, TbRepoXml.NKELEMENT)
+                ParseStartTag el
+                If Not TbRepoXml.m_Nodes(el).NSelfClose Then ParseChildren el
+            End If
+        Else
+            e2 = InStr(m_Pos, m_S, "<")
+            If e2 = 0 Then e2 = slen + 1
+            TbRepoXml.m_Nodes(TbRepoXml.AddNode(parent, TbRepoXml.NKTEXT)).NText = Mid$(m_S, m_Pos, e2 - m_Pos)
+            m_Pos = e2
+        End If
+    Loop
+End Sub
+
+' m_Pos sits on '<' of a start tag; fills name/attrs/selfclose of 'el',
+' leaves m_Pos just past the closing '>'.
+Private Sub ParseStartTag(ByVal el As Long)
+    Dim slen As Long, p As Long, st As Long, ve As Long
+    Dim ch As String, nm As String, q As String, aVal As String
+    slen = Len(m_S)
+    p = m_Pos + 1
+    ' --- element name: read until whitespace, '/', '>' ---
+    st = p
+    Do While p <= slen
+        ch = Mid$(m_S, p, 1)
+        If ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Or ch = "/" Or ch = ">" Then Exit Do
+        p = p + 1
+    Loop
+    If p > slen Then Err.Raise 1210, "TbXmlLite", "unterminated start tag"
+    If p = st Then Err.Raise 1211, "TbXmlLite", "empty element name at offset " & m_Pos
+    TbRepoXml.m_Nodes(el).NName = Mid$(m_S, st, p - st)
+    ' --- attribute list ---
+    Do
+        Do While p <= slen
+            ch = Mid$(m_S, p, 1)
+            If ch <> " " And ch <> vbTab And ch <> vbCr And ch <> vbLf Then Exit Do
+            p = p + 1
+        Loop
+        If p > slen Then Err.Raise 1212, "TbXmlLite", "unterminated start tag (attributes)"
+        If Mid$(m_S, p, 1) = "/" Then
+            TbRepoXml.m_Nodes(el).NSelfClose = True
+            p = p + 1
+            If Mid$(m_S, p, 1) <> ">" Then Err.Raise 1213, "TbXmlLite", "expected > after /"
+            m_Pos = p + 1
+            Exit Sub
+        End If
+        If Mid$(m_S, p, 1) = ">" Then
+            m_Pos = p + 1
+            Exit Sub
+        End If
+        ' attribute name
+        st = p
+        Do While p <= slen
+            ch = Mid$(m_S, p, 1)
+            If ch = "=" Or ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Or ch = ">" Or ch = "/" Then Exit Do
+            p = p + 1
+        Loop
+        nm = Mid$(m_S, st, p - st)
+        If Len(nm) = 0 Then Err.Raise 1214, "TbXmlLite", "empty attribute name at offset " & p
+        ' skip whitespace, expect '='
+        Do While p <= slen
+            ch = Mid$(m_S, p, 1)
+            If ch <> " " And ch <> vbTab Then Exit Do
+            p = p + 1
+        Loop
+        If Mid$(m_S, p, 1) <> "=" Then Err.Raise 1215, "TbXmlLite", "expected = after attribute '" & nm & "'"
+        p = p + 1
+        Do While p <= slen
+            ch = Mid$(m_S, p, 1)
+            If ch <> " " And ch <> vbTab Then Exit Do
+            p = p + 1
+        Loop
+        q = Mid$(m_S, p, 1)
+        If q <> """" And q <> "'" Then Err.Raise 1216, "TbXmlLite", "expected quote for attribute '" & nm & "'"
+        p = p + 1
+        ve = InStr(p, m_S, q)
+        If ve = 0 Then Err.Raise 1217, "TbXmlLite", "unterminated value for attribute '" & nm & "'"
+        aVal = Mid$(m_S, p, ve - p)
+        TbRepoXml.AddAttr el, nm, aVal, q
+        p = ve + 1
+    Loop
+End Sub
+
+' ---------------- serializer ----------------
+
+' Replay a single node (with its whole subtree) to text, using the same
+' byte-fidelity serializer as SerializeDocument. The merger harvests original
+' <note>/<deleted_note>/<safe> subtrees as raw strings with this.
+' Precondition: a successful ParseString (m_S still holds the source, which
+' is the upper bound for any single subtree's serialized length).
+Public Function NodeToText(ByVal idx As Long) As String
+    m_OutBuf = Space$(Len(m_S) + 16)
+    m_OutPos = 1
+    SerNode idx
+    NodeToText = Left$(m_OutBuf, m_OutPos - 1)
+    m_OutBuf = ""
+End Function
+
+' approxLen = length of the source string; buffer gets 64K slack.
+Public Function SerializeDocument(ByVal approxLen As Long) As String
+    m_OutBuf = Space$(approxLen + 65536)
+    m_OutPos = 1
+    SerChildren 0
+    If m_OutPos > 1 Then
+        SerializeDocument = Left$(m_OutBuf, m_OutPos - 1)
+    Else
+        SerializeDocument = ""
+    End If
+    m_OutBuf = ""
+End Function
+
+Private Sub SerChildren(ByVal idx As Long)
+    Dim c As Long
+    c = TbRepoXml.m_Nodes(idx).NChild1
+    Do While c <> 0
+        SerNode c
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+End Sub
+
+Private Sub SerNode(ByVal idx As Long)
+    Dim i As Long
+    Select Case TbRepoXml.m_Nodes(idx).NKind
+    Case TbRepoXml.NKTEXT, TbRepoXml.NKRAW
+        Out TbRepoXml.m_Nodes(idx).NText
+    Case Else
+        Out "<"
+        Out TbRepoXml.m_Nodes(idx).NName
+        For i = TbRepoXml.m_Nodes(idx).NAttr1 To TbRepoXml.m_Nodes(idx).NAttrN
+            Out " "
+            Out TbRepoXml.m_Attrs(i).AName
+            Out "="
+            Out TbRepoXml.m_Attrs(i).AQuote
+            Out TbRepoXml.m_Attrs(i).AValue
+            Out TbRepoXml.m_Attrs(i).AQuote
+        Next
+        If TbRepoXml.m_Nodes(idx).NSelfClose Then
+            Out " />"
+        Else
+            Out ">"
+            SerChildren idx
+            Out "</"
+            Out TbRepoXml.m_Nodes(idx).NName
+            Out ">"
+        End If
+    End Select
+End Sub
+
+' chunk append via Mid$ statement (no O(n^2) concatenation)
+Private Sub Out(ByRef s As String)
+    Dim l As Long
+    l = Len(s)
+    If l = 0 Then Exit Sub
+    If m_OutPos + l - 1 > Len(m_OutBuf) Then Err.Raise 1301, "TbXmlLite", "serializer buffer overflow"
+    Mid$(m_OutBuf, m_OutPos, l) = s
+    m_OutPos = m_OutPos + l
+End Sub
+
+' ---------------- entity codec ----------------
+
+' Decodes &amp; &lt; &gt; &quot; &apos; and numeric refs; unknown/garbled
+' entities pass through unchanged (defensive, never lossy-crash).
+Public Function Unescape(ByRef s As String) As String
+    If InStr(s, "&") = 0 Then
+        Unescape = s
+        Exit Function
+    End If
+    Dim n As Long, i As Long, rp As Long, sc As Long, cv As Long
+    Dim res As String, ch As String, ent As String
+    n = Len(s)
+    res = Space$(n)
+    i = 1
+    rp = 0
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+        If ch <> "&" Then
+            rp = rp + 1
+            Mid$(res, rp, 1) = ch
+            i = i + 1
+        Else
+            sc = InStr(i + 1, s, ";")
+            If sc = 0 Or sc - i > 11 Then
+                rp = rp + 1
+                Mid$(res, rp, 1) = "&"
+                i = i + 1
+            Else
+                ent = Mid$(s, i + 1, sc - i - 1)
+                Select Case ent
+                Case "amp"
+                    rp = rp + 1
+                    Mid$(res, rp, 1) = "&"
+                Case "lt"
+                    rp = rp + 1
+                    Mid$(res, rp, 1) = "<"
+                Case "gt"
+                    rp = rp + 1
+                    Mid$(res, rp, 1) = ">"
+                Case "quot"
+                    rp = rp + 1
+                    Mid$(res, rp, 1) = """"
+                Case "apos"
+                    rp = rp + 1
+                    Mid$(res, rp, 1) = "'"
+                Case Else
+                    If Left$(ent, 1) = "#" Then
+                        cv = EntityCode(ent)
+                        If cv >= 0 Then
+                            rp = rp + 1
+                            Mid$(res, rp, 1) = ChrW$(cv And &HFFFF&)
+                        Else
+                            Mid$(res, rp + 1, sc - i + 1) = Mid$(s, i, sc - i + 1)
+                            rp = rp + sc - i + 1
+                        End If
+                    Else
+                        Mid$(res, rp + 1, sc - i + 1) = Mid$(s, i, sc - i + 1)
+                        rp = rp + sc - i + 1
+                    End If
+                End Select
+                i = sc + 1
+            End If
+        End If
+    Loop
+    If rp < n Then
+        Unescape = Left$(res, rp)
+    Else
+        Unescape = res
+    End If
+End Function
+
+' ent is like "#65" or "#x41" (no & / ;). Returns -1 on garbage.
+Private Function EntityCode(ByRef ent As String) As Long
+    On Error GoTo F
+    Dim body As String
+    body = Mid$(ent, 2)
+    If Left$(body, 1) = "x" Or Left$(body, 1) = "X" Then
+        EntityCode = CLng("&H" & Mid$(body, 2) & "&")
+    Else
+        EntityCode = CLng(body)
+    End If
+    Exit Function
+F:
+    EntityCode = -1
+End Function
+
+' Text-node canonical escaping (& < >), matching what the repo file uses.
+Public Function EscapeText(ByRef s As String) As String
+    If InStr(s, "&") = 0 And InStr(s, "<") = 0 And InStr(s, ">") = 0 Then
+        EscapeText = s
+        Exit Function
+    End If
+    EscapeText = EscapeCore(s, False)
+End Function
+
+' Attribute canonical escaping (& < ") - ' stays raw, matches the file.
+Public Function EscapeAttr(ByRef s As String) As String
+    If InStr(s, "&") = 0 And InStr(s, "<") = 0 And InStr(s, """") = 0 Then
+        EscapeAttr = s
+        Exit Function
+    End If
+    EscapeAttr = EscapeCore(s, True)
+End Function
+
+Private Function EscapeCore(ByRef s As String, ByVal inAttr As Boolean) As String
+    Dim n As Long, i As Long, rp As Long
+    Dim res As String, ch As String
+    n = Len(s)
+    res = Space$(n * 6 + 8)   ' worst case: every char becomes &quot; (6x)
+    i = 1
+    rp = 0
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+        Select Case ch
+        Case "&"
+            Mid$(res, rp + 1, 5) = "&amp;"
+            rp = rp + 5
+        Case "<"
+            Mid$(res, rp + 1, 4) = "&lt;"
+            rp = rp + 4
+        Case ">"
+            Mid$(res, rp + 1, 4) = "&gt;"
+            rp = rp + 4
+        Case """"
+            If inAttr Then
+                Mid$(res, rp + 1, 6) = "&quot;"
+                rp = rp + 6
+            Else
+                rp = rp + 1
+                Mid$(res, rp, 1) = ch
+            End If
+        Case Else
+            rp = rp + 1
+            Mid$(res, rp, 1) = ch
+        End Select
+        i = i + 1
+    Loop
+    EscapeCore = Left$(res, rp)
+End Function
+
+End Module

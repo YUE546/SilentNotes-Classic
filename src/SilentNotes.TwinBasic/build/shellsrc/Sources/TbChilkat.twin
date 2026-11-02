@@ -1,0 +1,177 @@
+Option Explicit
+
+' TbChilkat - reg-free loader for ChilkatAx-win32 via kernel32 activation
+' contexts (route proven in P0: CreateActCtxW + ActivateActCtx; the
+' Microsoft.Windows.ActCtx COM object is NOT registered on this machine).
+' IMPORTANT: the process must be 32-bit (ChilkatAx-win32.dll).
+' The caller MUST UnlockBundle (trial) before using crypto objects.
+'
+' ACTIVATION POLICY (0xC015000F + TYPE_E_REGISTRYACCESS fix, 2026-10-28):
+' The context is CREATED once in Init. Every Chilkat-USING operation wraps
+' its Chilkat calls in EnterCtx/ExitCtx (refcounted, nesting-safe). Between
+' operations NO context of ours is active.
+'
+' History of the two broken policies:
+'   a) "activate once, keep resident for the session" (original): poisons the
+'      main thread's activation-context stack - a system component (MSHTML/
+'      Trident, user32 internals) that keeps its own context pushed across
+'      our activation pops it LATER while OURS sits on top -> ntdll LIFO
+'      check trips -> STATUS_SXS_INVALID_DEACTIVATION (0xC015000F) fail-fast
+'      (ntdll+0x8fa84), process dies from the message pump with no tB error
+'      dialog and no crash.log entry. Deterministic in the pure-backend safe
+'      gates ~8s after GateRecycleEmpty (plan section 8, pit 23).
+'   b) "transient around CreateObject only": object creation works, but
+'      lazy per-call resolution does not - Crypt2.Pbkdf2 raised
+'      TYPE_E_REGISTRYACCESS (0x8002801C, "Error loading type library/DLL")
+'      when invoked inside the SafeDlg modal while the dialog's own context
+'      was on the stack. Calls need the Chilkat context ACTIVE for the whole
+'      operation, not just at object creation.
+' Per-operation Enter/Exit satisfies both: our stays are SHORT and NESTED
+' inside whatever foreign context may be active when the operation starts,
+' so every pop keeps LIFO order; and every Chilkat call resolves reg-free.
+
+Class TbChilkat
+
+    Private Declare Function CreateActCtxW Lib "kernel32" (ByRef pActctx As ACTCTXW) As Long
+    Private Declare Function ActivateActCtx Lib "kernel32" (ByVal hActCtx As Long, ByRef lpCookie As Long) As Long
+    Private Declare Function DeactivateActCtx Lib "kernel32" (ByVal dwFlags As Long, ByVal lpCookie As Long) As Long
+    Private Declare Function ReleaseActCtx Lib "kernel32" (ByVal hActCtx As Long) As Long
+
+    ' Raw-memory ACTCTXW layout (x86, 32 bytes). String members are passed as
+    ' raw StrPtr values, so no Declare string marshalling can interfere.
+    Private Type ACTCTXW
+        cbSize As Long
+        dwFlags As Long
+        lpSource As Long
+        wProcessorArchitecture As Integer
+        wLangId As Integer
+        lpAssemblyDirectory As Long
+        lpResourceName As Long
+        lpApplicationName As Long
+        hModule As Long
+    End Type
+
+    Private Const ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID As Long = &H4
+
+    Private m_hCtx As Long
+    Private m_ready As Boolean
+    Private m_depth As Long
+    Private m_cookie As Long
+    Private m_lastActLe As Long
+    Private m_lastDeactLe As Long
+
+    Public Property Get IsActive() As Boolean
+        ' true while a Chilkat-using operation is inside EnterCtx/ExitCtx
+        IsActive = (m_depth > 0)
+    End Property
+
+    Public Property Get LastDeactivateError() As Long
+        LastDeactivateError = m_lastDeactLe
+    End Property
+
+    Public Property Get LastActivateError() As Long
+        LastActivateError = m_lastActLe
+    End Property
+
+    ' Creates the activation context (no activation). Idempotent; call once
+    ' before the first EnterCtx/GetChilkat.
+    Public Function Init(manifestPath As String, assemblyDir As String) As Boolean
+        On Error Resume Next
+        If m_ready Then
+            Init = True
+            Exit Function
+        End If
+        Dim ctx As ACTCTXW
+        ctx.cbSize = 32
+        ctx.dwFlags = ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID
+        ctx.lpSource = StrPtr(manifestPath)
+        ctx.lpAssemblyDirectory = StrPtr(assemblyDir)
+
+        Err.Clear
+        m_hCtx = CreateActCtxW(ctx)
+        If m_hCtx = -1 Then
+            Init = False
+            Exit Function
+        End If
+        m_ready = True
+        Init = True
+    End Function
+
+    Public Function LastWin32Error() As Long
+        LastWin32Error = Err.LastDllError
+    End Function
+
+    ' refcounted activation - Enter/Exit pairs NEST (single UI thread; the
+    ' depth guard keeps nested operations from deactivating each other)
+    Public Function EnterCtx() As Boolean
+        If Not m_ready Then
+            EnterCtx = False
+            Exit Function
+        End If
+        If m_depth = 0 Then
+            If ActivateActCtx(m_hCtx, m_cookie) = 0 Then
+                m_lastActLe = Err.LastDllError
+                EnterCtx = False
+                Exit Function
+            End If
+        End If
+        m_depth = m_depth + 1
+        EnterCtx = True
+    End Function
+
+    Public Sub ExitCtx()
+        If m_depth <= 0 Then Exit Sub
+        m_depth = m_depth - 1
+        If m_depth = 0 Then
+            m_lastDeactLe = 0
+            If DeactivateActCtx(0, m_cookie) = 0 Then m_lastDeactLe = Err.LastDllError
+        End If
+    End Sub
+
+    ' convenience: CreateObject with a transient activation around exactly
+    ' the creation call (equivalent to EnterCtx/ExitCtx paired inline)
+    Public Function CreateUnderCtx(progId As String, ByRef obj As Object, ByRef errText As String) As Boolean
+        Set obj = Nothing
+        errText = ""
+        If Not EnterCtx() Then
+            errText = "EnterCtx failed le=" & CStr(m_lastActLe) & " (context not created?)"
+            Exit Function
+        End If
+        On Error Resume Next
+        Err.Clear
+        Set obj = CreateObject(progId)
+        Dim en As Long, ed As String
+        en = Err.Number
+        ed = Err.Description
+        On Error GoTo 0
+        ExitCtx
+        If en <> 0 Then
+            errText = "CreateObject(" & progId & ") failed 0x" & Hex$(en) & ": " & ed
+            Set obj = Nothing
+            Exit Function
+        End If
+        If obj Is Nothing Then
+            errText = "CreateObject(" & progId & ") returned Nothing"
+            Exit Function
+        End If
+        CreateUnderCtx = True
+    End Function
+
+    ' Legacy alias - resolves the ProgID under a transient activation.
+    Public Function GetChilkat(progId As String, ByRef obj As Object, ByRef errText As String) As Boolean
+        GetChilkat = CreateUnderCtx(progId, obj, errText)
+    End Function
+
+    Public Sub Shutdown()
+        On Error Resume Next
+        Do While m_depth > 0
+            ExitCtx
+        Loop
+        m_ready = False
+        If (m_hCtx <> 0) And (m_hCtx <> -1) Then
+            ReleaseActCtx m_hCtx
+            m_hCtx = 0
+        End If
+    End Sub
+
+End Class

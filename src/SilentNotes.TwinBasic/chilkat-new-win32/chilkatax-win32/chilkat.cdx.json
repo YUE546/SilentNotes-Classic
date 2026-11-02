@@ -1,0 +1,93 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:f845a240-1dce-4dc2-aabc-d8dc1453e189",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-09-08T12:10:17Z",
+    "authors": [
+      { "name": "Chilkat Software, Inc.", "email": "support@chilkatsoft.com" }
+    ],
+    "supplier": {
+      "name": "Chilkat Software, Inc.",
+      "url": [ "https://www.chilkatsoft.com" ]
+    },
+    "component": {
+      "type": "library",
+      "bom-ref": "chilkat",
+      "name": "chilkat",
+      "version": "11.6.1",
+      "supplier": {
+        "name": "Chilkat Software, Inc.",
+        "url": [ "https://www.chilkatsoft.com" ]
+      },
+      "description": "Chilkat: a closed-source, cross-platform library providing APIs for secure communications and file formats (HTTP/REST, SSH/SFTP, TLS, email, Zip, JSON/XML, cryptography, and more), distributed as native libraries with bindings for many programming languages.",
+      "licenses": [
+        { "license": { "name": "Chilkat Software License Agreement (proprietary; see license.pdf included in this distribution)" } }
+      ],
+      "externalReferences": [
+        { "type": "website", "url": "https://www.chilkatsoft.com" },
+        { "type": "release-notes", "url": "https://cknotes.com/category/release-notes/" }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "chilkat-pcre2",
+      "name": "pcre2-chilkat-fork",
+      "version": "11.6.1",
+      "supplier": { "name": "Chilkat Software, Inc." },
+      "description": "Chilkat's closed-source fork of the PCRE2 regular expression library, including the sljit-based just-in-time compiler. Extensively modified and independently maintained by Chilkat; changes from the upstream PCRE2 repository are not tracked or merged, and upstream security advisories are independently assessed by Chilkat. The fork is embedded in the Chilkat library and versioned with it.",
+      "licenses": [
+        { "license": { "id": "BSD-3-Clause", "acknowledgement": "declared" } }
+      ],
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "library",
+            "name": "pcre2",
+            "version": "10.45",
+            "supplier": { "name": "PCRE2 Project" },
+            "purl": "pkg:github/PCRE2Project/pcre2@pcre2-10.45",
+            "externalReferences": [
+              { "type": "website", "url": "https://www.pcre.org/" }
+            ]
+          }
+        ],
+        "notes": "Forked from upstream PCRE2 10.45 and independently maintained since. The just-in-time compilation support (sljit) carried the 2-clause BSD licence upstream; the copyright notices for both are reproduced in pcre2-license.pdf in this distribution."
+      }
+    },
+    {
+      "type": "library",
+      "bom-ref": "chilkat-js",
+      "name": "chilkat-js",
+      "version": "11.6.1",
+      "supplier": { "name": "Chilkat Software, Inc." },
+      "description": "The Chilkat Js JavaScript engine: a closed-source fork of the QuickJS JavaScript engine, extensively modified and independently maintained by Chilkat; changes from the upstream QuickJS repository are not tracked or merged, and upstream security advisories are independently assessed by Chilkat. The fork is embedded in the Chilkat library and versioned with it.",
+      "licenses": [
+        { "license": { "id": "MIT", "acknowledgement": "declared" } }
+      ],
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "library",
+            "name": "quickjs-ng",
+            "version": "v0.12.0",
+            "supplier": { "name": "The quickjs-ng maintainers" },
+            "purl": "pkg:github/quickjs-ng/quickjs@v0.12.0",
+            "externalReferences": [
+              { "type": "website", "url": "https://github.com/quickjs-ng/quickjs" }
+            ]
+          }
+        ],
+        "notes": "Forked from quickjs-ng v0.12.0, itself derived from the original QuickJS project by Fabrice Bellard. The reproduced copyright notices (see quickjs-license.pdf in this distribution) cover both the original QuickJS authors and the quickjs-ng maintainers."
+      }
+    }
+  ],
+  "dependencies": [
+    { "ref": "chilkat", "dependsOn": [ "chilkat-pcre2", "chilkat-js" ] },
+    { "ref": "chilkat-pcre2", "dependsOn": [] },
+    { "ref": "chilkat-js", "dependsOn": [] }
+  ]
+}

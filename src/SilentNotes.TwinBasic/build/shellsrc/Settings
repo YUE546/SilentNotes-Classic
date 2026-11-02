@@ -1,0 +1,56 @@
+{
+	"configuration.inherits": "Defaults",
+	"project.appTitle": "SilentNotesTbP3",
+	"project.buildPath": "${SourcePath}\\Build\\${ProjectName}_${Architecture}.${FileExtension}",
+	"project.buildType": "Standard EXE",
+	"project.description": "P3 MSHTML editor: SHDocVw WebBrowser ActiveX + execCommand formatting + paste cleaning + theme CSS",
+	"project.exportPathIsV2": true,
+	"project.iconForm": "MainForm",
+	"project.id": "{7E4C1A02-93B5-4F6D-8A21-C0D51B9F0005}",
+	"project.name": "SilentNotesTbP3",
+	"project.optionExplicit": true,
+	"project.references": [
+		{
+			"hasBeenSplit": true,
+			"id": "{F50B82D0-DCAB-43FE-9631-11959D4A4728}",
+			"isCompilerPackage": true,
+			"licence": "MIT",
+			"name": "[COMPILER PACKAGE] WinNativeForms Package",
+			"path32": "/Packages/WindowsControlsPackage",
+			"path64": "/Packages/WindowsControlsPackage",
+			"publishedDate": "09-FEB-2022",
+			"publishedTime": "15:48:54",
+			"publisher": "TWINBASIC-COMPILER",
+			"symbolId": "WindowsControlsPackage",
+			"versionBuild": 0,
+			"versionMajor": 0,
+			"versionMinor": 0,
+			"versionRevision": 31
+		},
+		{
+			"id": "{00020430-0000-0000-C000-000000000046}",
+			"lcid": 0,
+			"name": "OLE Automation",
+			"path32": "C:\\Windows\\SysWow64\\stdole2.tlb",
+			"path64": "C:\\Windows\\System32\\stdole2.tlb",
+			"versionMajor": 2,
+			"versionMinor": 0
+		},
+		{
+			"id": "{EAB22AC0-30C1-11CF-A7EB-0000C05BAE0B}",
+			"lcid": 0,
+			"name": "Microsoft Internet Controls",
+			"path32": "C:\\Windows\\SysWow64\\ieframe.dll",
+			"path64": "C:\\Windows\\System32\\ieframe.dll",
+			"versionMajor": 1,
+			"versionMinor": 1
+		}
+	],
+	"project.settingsVersion": 1,
+	"project.startupObject": "MainForm",
+	"project.warnings": {
+		"errors": [],
+		"ignored": []
+	},
+	"runtime.useUnicodeStandardLibrary": true
+}

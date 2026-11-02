@@ -1,0 +1,1172 @@
+Option Explicit
+
+' TbRepoModel - typed SilentNotes repository model + writer (route B phase 3A).
+' Built ON TOP of the verified TbRepoXml raw-value tree (phase 2): the typed
+' layer is harvested from it, and the writer either replays the raw tree
+' verbatim (byte-identical, phase-2 fidelity conclusion) or rebuilds only the
+' touched parts in the Core XmlSerializer dialect.
+'
+' Fidelity principle: the model knows id/revision/order_modified_at + per note
+' (id, note_type, background_color, in_recycling_bin, shopping_mode,
+' note_pinned, created_at, modified_at, meta_modified_at nullable, safe_id
+' nullable, tags[], html) + tombstones (id, deleted_at) + safes (typed dates
+' for the fingerprint, raw replay). EVERYTHING ELSE (unknown attributes,
+' unknown child elements, xmlns declarations, quote characters, indentation)
+' is preserved RAW and replayed verbatim on output.
+'
+' Writer modes per item: SER_RAW (replay original subtree bytes) /
+' SER_REBUILD (re-emit from typed fields, Core dialect). A container is
+' rebuilt only when its item list changed or an item is rebuilt; the root is
+' rebuilt only when order_modified_at/revision was refreshed. Untouched
+' documents serialize as a whole-tree verbatim replay (SerializeDocument).
+'
+' Refresh semantics (ComGateway.cs / NoteRepositoryViewModel, pinned clock):
+'   AddNote        -> CreatedAt=ModifiedAt=T + OrderModifiedAt=T
+'   UpdateHtml     -> ModifiedAt=T (content only)
+'   SetPinned      -> on change: MetaModifiedAt=T + OrderModifiedAt=T
+'   SetRecyclingBin-> on change: MetaModifiedAt=T + OrderModifiedAt=T
+'   SetTags        -> on change: MetaModifiedAt=T only (no order refresh)
+'   HardDelete     -> tombstone AddIdOrRefreshDeletedAt=T + Notes.Remove + OrderModifiedAt=T
+' NoteModel.MetaModifiedAt getter normalization (<= ModifiedAt -> null) is
+' applied at emit time and at fingerprint time, exactly like the C# getter.
+'
+' UtcNow: GetSystemTimeAsFileTime -> ticks since 1601 -> +504911232000000000
+' = .NET DateTime ticks; rendered as ISO-8601 "yyyy-MM-ddTHH:mm:ss[.f{1-7}]Z"
+' with trailing zeros of the fraction trimmed and the decimal point omitted
+' for fraction 0 - byte-identical to XmlConvert/XmlSerializer output.
+
+Module TbRepoModel
+
+Public Const MAX_NOTES As Long = 1024
+Public Const MAX_TAGS As Long = 16
+Public Const MAX_DELS As Long = 4096
+Public Const MAX_SAFES As Long = 256
+Public Const MAX_EXTRA As Long = 8
+Public Const SER_RAW As Long = 0
+Public Const SER_REBUILD As Long = 1
+
+Public Const FT_OFFSET As LongLong = 504911232000000000  ' 1601-01-01 -> 0001-01-01 ticks
+Public Const EPOCH_KEY As String = "00010101000000.0000000"
+
+' ---- root ----
+Public RootIdText As String        ' canonical lowercase guid
+Public RootRevision As Long
+Public RootOrderKey As String      ' DateKey form
+Public RootSerMode As Long
+Public RootRawOpen As String       ' original open tag incl. attrs (verbatim)
+Public RootRawDecl As String       ' everything before the root open tag
+Public RootExtraRaw As String      ' unknown attrs verbatim (" nm=""v""" chains)
+
+' ---- containers (raw subtree text, "" = element absent in file) ----
+Public ContNotesRaw As String
+Public ContDelsRaw As String
+Public ContSafesRaw As String
+
+' ---- notes: parallel arrays, document order, index domain [0, n_Count) ----
+Public n_Id() As String
+Public n_Type() As Long            ' 0=Text 1=Checklist
+Public n_Bg() As String
+Public n_HasBg() As Boolean
+Public n_InBin() As Boolean
+Public n_Shop() As Boolean
+Public n_Pin() As Boolean
+Public n_CreatedKey() As String
+Public n_ModKey() As String
+Public n_HasMeta() As Boolean
+Public n_MetaKey() As String
+Public n_HasSafe() As Boolean
+Public n_SafeId() As String
+Public n_Tags() As String          ' (MAX_TAGS, MAX_NOTES)
+Public n_TagCount() As Long
+Public n_Html() As String
+Public n_HasAtt() As Boolean
+Public n_Att() As String
+Public n_SerMode() As Long
+Public n_Raw() As String
+Public n_ExtraAttrName() As String ' (MAX_EXTRA, MAX_NOTES)
+Public n_ExtraAttrRaw() As String
+Public n_ExtraAttrCount() As Long
+Public n_ExtraChild() As String    ' (MAX_EXTRA, MAX_NOTES) raw blobs
+Public n_ExtraChildCount() As Long
+Public n_Count As Long
+Public n_OriginalCount As Long
+
+' ---- deleted notes ----
+Public d_Id() As String
+Public d_Key() As String           ' DateKey of deleted_at
+Public d_SerMode() As Long
+Public d_Raw() As String           ' original subtree text (SER_RAW)
+Public d_Count As Long
+Public d_OriginalCount As Long
+
+' ---- safes (never mutated by CRUD ops; raw replay + typed for fingerprint) ----
+Public s_Id() As String
+Public s_CreatedKey() As String
+Public s_ModKey() As String
+Public s_HasMaint() As Boolean     ' maintained_at ATTRIBUTE present (fingerprint uses presence)
+Public s_MaintKey() As String
+Public s_Raw() As String
+Public s_Count As Long
+Public SafesTouched As Boolean    ' CreateSafe/RemoveSafe touched the safes container
+
+' ---- source bookkeeping ----
+Public m_SrcLen As Long
+
+' Win32
+Private Declare PtrSafe Sub GetSystemTimeAsFileTime Lib "kernel32" (ByRef ft As LongLong)
+Private Declare PtrSafe Function CoCreateGuid Lib "ole32" (ByRef g As TbGuidStruct) As Long
+
+Private Type TbGuidStruct
+    Data1 As Long
+    Data2 As Integer
+    Data3 As Integer
+    Data4(0 To 7) As Byte
+End Type
+
+' ============================================================
+' lifecycle
+' ============================================================
+
+Public Sub ResetModel()
+    ReDim n_Id(0 To MAX_NOTES - 1)
+    ReDim n_Type(0 To MAX_NOTES - 1)
+    ReDim n_Bg(0 To MAX_NOTES - 1)
+    ReDim n_HasBg(0 To MAX_NOTES - 1)
+    ReDim n_InBin(0 To MAX_NOTES - 1)
+    ReDim n_Shop(0 To MAX_NOTES - 1)
+    ReDim n_Pin(0 To MAX_NOTES - 1)
+    ReDim n_CreatedKey(0 To MAX_NOTES - 1)
+    ReDim n_ModKey(0 To MAX_NOTES - 1)
+    ReDim n_HasMeta(0 To MAX_NOTES - 1)
+    ReDim n_MetaKey(0 To MAX_NOTES - 1)
+    ReDim n_HasSafe(0 To MAX_NOTES - 1)
+    ReDim n_SafeId(0 To MAX_NOTES - 1)
+    ReDim n_Tags(0 To MAX_TAGS - 1, 0 To MAX_NOTES - 1)
+    ReDim n_TagCount(0 To MAX_NOTES - 1)
+    ReDim n_Html(0 To MAX_NOTES - 1)
+    ReDim n_HasAtt(0 To MAX_NOTES - 1)
+    ReDim n_Att(0 To MAX_NOTES - 1)
+    ReDim n_SerMode(0 To MAX_NOTES - 1)
+    ReDim n_Raw(0 To MAX_NOTES - 1)
+    ReDim n_ExtraAttrName(0 To MAX_EXTRA - 1, 0 To MAX_NOTES - 1)
+    ReDim n_ExtraAttrRaw(0 To MAX_EXTRA - 1, 0 To MAX_NOTES - 1)
+    ReDim n_ExtraAttrCount(0 To MAX_NOTES - 1)
+    ReDim n_ExtraChild(0 To MAX_EXTRA - 1, 0 To MAX_NOTES - 1)
+    ReDim n_ExtraChildCount(0 To MAX_NOTES - 1)
+    ReDim d_Id(0 To MAX_DELS - 1)
+    ReDim d_Key(0 To MAX_DELS - 1)
+    ReDim d_SerMode(0 To MAX_DELS - 1)
+    ReDim d_Raw(0 To MAX_DELS - 1)
+    ReDim s_Id(0 To MAX_SAFES - 1)
+    ReDim s_CreatedKey(0 To MAX_SAFES - 1)
+    ReDim s_ModKey(0 To MAX_SAFES - 1)
+    ReDim s_HasMaint(0 To MAX_SAFES - 1)
+    ReDim s_MaintKey(0 To MAX_SAFES - 1)
+    ReDim s_Raw(0 To MAX_SAFES - 1)
+    n_Count = 0
+    n_OriginalCount = 0
+    d_Count = 0
+    d_OriginalCount = 0
+    s_Count = 0
+    RootIdText = ""
+    RootRevision = 0
+    RootOrderKey = EPOCH_KEY
+    RootSerMode = SER_RAW
+    RootRawOpen = ""
+    RootRawDecl = ""
+    RootExtraRaw = ""
+    ContNotesRaw = ""
+    ContDelsRaw = ""
+    ContSafesRaw = ""
+    m_SrcLen = 0
+End Sub
+
+' Parse + harvest in one step (TbRepoXml tree is left parsed for raw replay)
+Public Sub ModelLoadFromString(ByRef s As String)
+    Dim errMsg As String
+    TbRepoModel.ResetModel
+    If Not TbXmlLite.ParseString(s, errMsg) Then
+        Err.Raise 1750, "TbRepoModel", "parse failed: " & errMsg
+    End If
+    m_SrcLen = Len(s)
+    Harvest
+End Sub
+
+' ============================================================
+' harvest (typed view over the raw tree)
+' ============================================================
+
+Private Function FirstElemChild(ByVal el As Long) As Long
+    Dim c As Long
+    c = TbRepoXml.m_Nodes(el).NChild1
+    Do While c <> 0
+        If TbRepoXml.m_Nodes(c).NKind = TbRepoXml.NKELEMENT Then
+            FirstElemChild = c
+            Exit Function
+        End If
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+    FirstElemChild = 0
+End Function
+
+Private Function NextElemSibling(ByVal c As Long) As Long
+    Dim n As Long
+    n = TbRepoXml.m_Nodes(c).NNext
+    Do While n <> 0
+        If TbRepoXml.m_Nodes(n).NKind = TbRepoXml.NKELEMENT Then
+            NextElemSibling = n
+            Exit Function
+        End If
+        n = TbRepoXml.m_Nodes(n).NNext
+    Loop
+    NextElemSibling = 0
+End Function
+
+Private Function GetAttr(ByVal el As Long, ByRef nm As String, ByRef val As String) As Boolean
+    Dim i As Long
+    GetAttr = False
+    For i = TbRepoXml.m_Nodes(el).NAttr1 To TbRepoXml.m_Nodes(el).NAttrN
+        If TbRepoXml.m_Attrs(i).AName = nm Then
+            val = TbXmlLite.Unescape(TbRepoXml.m_Attrs(i).AValue)
+            GetAttr = True
+            Exit Function
+        End If
+    Next
+End Function
+
+' concatenated raw (escaped) text child nodes
+Private Function ElemTextRaw(ByVal el As Long) As String
+    Dim c As Long
+    Dim res As String
+    c = TbRepoXml.m_Nodes(el).NChild1
+    Do While c <> 0
+        If TbRepoXml.m_Nodes(c).NKind = TbRepoXml.NKTEXT Then res = res & TbRepoXml.m_Nodes(c).NText
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+    ElemTextRaw = res
+End Function
+
+Private Function BoolAttr(ByRef v As String) As Boolean
+    If v = "true" Then BoolAttr = True
+End Function
+
+' the verbatim open tag "<name a=""b"" ...>" of an element
+Private Function OpenTagText(ByVal el As Long) As String
+    Dim i As Long
+    Dim res As String
+    res = "<" & TbRepoXml.m_Nodes(el).NName
+    For i = TbRepoXml.m_Nodes(el).NAttr1 To TbRepoXml.m_Nodes(el).NAttrN
+        res = res & " " & TbRepoXml.m_Attrs(i).AName & "=" & TbRepoXml.m_Attrs(i).AQuote & _
+              TbRepoXml.m_Attrs(i).AValue & TbRepoXml.m_Attrs(i).AQuote
+    Next
+    OpenTagText = res & ">"
+End Function
+
+Private Sub Harvest()
+    Dim root As Long
+    Dim c As Long
+    Dim cc As Long
+    Dim nm As String
+    Dim v As String
+    root = FirstElemChild(0)
+    If root = 0 Then Err.Raise 1751, "TbRepoModel", "no root element"
+    If TbRepoXml.m_Nodes(root).NName <> "silentnotes" Then
+        Err.Raise 1752, "TbRepoModel", "unexpected root <" & AsciiMask(TbRepoXml.m_Nodes(root).NName) & ">"
+    End If
+
+    ' decl = all node-0 content before the root element
+    RootRawDecl = ""
+    c = TbRepoXml.m_Nodes(0).NChild1
+    Do While c <> 0
+        If c = root Then Exit Do
+        RootRawDecl = RootRawDecl & TbXmlLite.NodeToText(c)
+        c = TbRepoXml.m_Nodes(c).NNext
+    Loop
+    RootRawOpen = OpenTagText(root)
+
+    ' root attributes: typed knowns + raw extras
+    Dim i As Long
+    For i = TbRepoXml.m_Nodes(root).NAttr1 To TbRepoXml.m_Nodes(root).NAttrN
+        nm = TbRepoXml.m_Attrs(i).AName
+        Select Case nm
+        Case "id"
+            RootIdText = LCase$(Trim$(TbXmlLite.Unescape(TbRepoXml.m_Attrs(i).AValue)))
+        Case "revision"
+            RootRevision = CLng(TbXmlLite.Unescape(TbRepoXml.m_Attrs(i).AValue))
+        Case "order_modified_at"
+            RootOrderKey = TbMergeModel.DateKey(TbXmlLite.Unescape(TbRepoXml.m_Attrs(i).AValue))
+        Case Else
+            RootExtraRaw = RootExtraRaw & " " & nm & "=" & TbRepoXml.m_Attrs(i).AQuote & _
+                           TbRepoXml.m_Attrs(i).AValue & TbRepoXml.m_Attrs(i).AQuote
+        End Select
+    Next
+
+    ' containers + children
+    c = FirstElemChild(root)
+    Do While c <> 0
+        nm = TbRepoXml.m_Nodes(c).NName
+        Select Case nm
+        Case "notes"
+            ContNotesRaw = TbXmlLite.NodeToText(c)
+            HarvestNotes c
+        Case "deleted_notes"
+            ContDelsRaw = TbXmlLite.NodeToText(c)
+            HarvestDels c
+        Case "safes"
+            ContSafesRaw = TbXmlLite.NodeToText(c)
+            HarvestSafes c
+        Case Else
+            ' ignore (XmlSerializer never emits anything else here)
+        End Select
+        c = NextElemSibling(c)
+    Loop
+    n_OriginalCount = n_Count
+    d_OriginalCount = d_Count
+End Sub
+
+Private Sub HarvestNotes(ByVal parent As Long)
+    Dim c As Long
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        HarvestNote c
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestNote(ByVal el As Long)
+    Dim v As String
+    Dim cc As Long
+    Dim nm As String
+    Dim i As Long
+    If n_Count > MAX_NOTES - 1 Then Err.Raise 1753, "TbRepoModel", "note capacity exceeded"
+    i = n_Count
+    n_SerMode(i) = SER_RAW
+    n_Raw(i) = TbXmlLite.NodeToText(el)
+    If Not GetAttr(el, "id", v) Then Err.Raise 1754, "TbRepoModel", "note id missing"
+    n_Id(i) = LCase$(Trim$(v))
+    n_Type(i) = 0
+    If GetAttr(el, "note_type", v) Then
+        If v = "Checklist" Then
+            n_Type(i) = 1
+        ElseIf v <> "Text" Then
+            Err.Raise 1755, "TbRepoModel", "unknown note_type: " & AsciiMask(v)
+        End If
+    End If
+    n_HasBg(i) = GetAttr(el, "background_color", v)
+    If n_HasBg(i) Then n_Bg(i) = v
+    If GetAttr(el, "in_recycling_bin", v) Then n_InBin(i) = BoolAttr(v) Else n_InBin(i) = False
+    If GetAttr(el, "shopping_mode", v) Then n_Shop(i) = BoolAttr(v) Else n_Shop(i) = False
+    If GetAttr(el, "note_pinned", v) Then n_Pin(i) = BoolAttr(v) Else n_Pin(i) = False
+    If GetAttr(el, "created_at", v) Then
+        n_CreatedKey(i) = TbMergeModel.DateKey(v)
+    Else
+        n_CreatedKey(i) = EPOCH_KEY
+    End If
+    If GetAttr(el, "modified_at", v) Then
+        n_ModKey(i) = TbMergeModel.DateKey(v)
+    Else
+        n_ModKey(i) = EPOCH_KEY
+    End If
+    ' NoteModel.MetaModifiedAt getter normalization: <= ModifiedAt -> null
+    n_HasMeta(i) = False
+    n_MetaKey(i) = ""
+    If GetAttr(el, "meta_modified_at", v) Then
+        n_HasMeta(i) = True
+        n_MetaKey(i) = TbMergeModel.DateKey(v)
+        If n_MetaKey(i) <= n_ModKey(i) Then
+            n_HasMeta(i) = False
+            n_MetaKey(i) = ""
+        End If
+    End If
+    n_HasSafe(i) = False
+    n_SafeId(i) = ""
+    n_TagCount(i) = 0
+    n_HasAtt(i) = False
+    n_Att(i) = ""
+    n_Html(i) = ""
+    n_ExtraAttrCount(i) = 0
+    n_ExtraChildCount(i) = 0
+
+    ' unknown attributes preserved raw
+    Dim a As Long
+    For a = TbRepoXml.m_Nodes(el).NAttr1 To TbRepoXml.m_Nodes(el).NAttrN
+        nm = TbRepoXml.m_Attrs(a).AName
+        If nm <> "id" And nm <> "note_type" And nm <> "background_color" And nm <> "in_recycling_bin" _
+           And nm <> "shopping_mode" And nm <> "note_pinned" And nm <> "created_at" _
+           And nm <> "modified_at" And nm <> "meta_modified_at" Then
+            If n_ExtraAttrCount(i) > MAX_EXTRA - 1 Then Err.Raise 1756, "TbRepoModel", "extra attr capacity exceeded"
+            n_ExtraAttrName(n_ExtraAttrCount(i), i) = nm
+            n_ExtraAttrRaw(n_ExtraAttrCount(i), i) = TbRepoXml.m_Attrs(a).AQuote & TbRepoXml.m_Attrs(a).AValue & TbRepoXml.m_Attrs(a).AQuote
+            n_ExtraAttrCount(i) = n_ExtraAttrCount(i) + 1
+        End If
+    Next
+
+    ' known children
+    cc = FirstElemChild(el)
+    Do While cc <> 0
+        nm = TbRepoXml.m_Nodes(cc).NName
+        Select Case nm
+        Case "html_content"
+            n_Html(i) = TbXmlLite.Unescape(ElemTextRaw(cc))
+        Case "tags"
+            Dim tc As Long
+            tc = FirstElemChild(cc)
+            Do While tc <> 0
+                If TbRepoXml.m_Nodes(tc).NName = "tag" Then
+                    If n_TagCount(i) > MAX_TAGS - 1 Then Err.Raise 1757, "TbRepoModel", "tag capacity exceeded"
+                    n_Tags(n_TagCount(i), i) = TbXmlLite.Unescape(ElemTextRaw(tc))
+                    n_TagCount(i) = n_TagCount(i) + 1
+                End If
+                tc = NextElemSibling(tc)
+            Loop
+        Case "safe"
+            n_HasSafe(i) = True
+            n_SafeId(i) = LCase$(Trim$(TbXmlLite.Unescape(ElemTextRaw(cc))))
+        Case "attachement_key"
+            If Len(ElemTextRaw(cc)) > 0 Then
+                n_HasAtt(i) = True
+                n_Att(i) = TbXmlLite.Unescape(ElemTextRaw(cc))
+            End If
+        Case Else
+            If n_ExtraChildCount(i) > MAX_EXTRA - 1 Then Err.Raise 1758, "TbRepoModel", "extra child capacity exceeded"
+            n_ExtraChild(n_ExtraChildCount(i), i) = TbXmlLite.NodeToText(cc)
+            n_ExtraChildCount(i) = n_ExtraChildCount(i) + 1
+        End Select
+        cc = NextElemSibling(cc)
+    Loop
+    n_Count = n_Count + 1
+End Sub
+
+Private Sub HarvestDels(ByVal parent As Long)
+    Dim c As Long
+    Dim v As String
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        If d_Count > MAX_DELS - 1 Then Err.Raise 1759, "TbRepoModel", "deleted capacity exceeded"
+        d_SerMode(d_Count) = SER_RAW
+        d_Raw(d_Count) = TbXmlLite.NodeToText(c)
+        d_Id(d_Count) = LCase$(Trim$(TbXmlLite.Unescape(ElemTextRaw(c))))
+        If GetAttr(c, "deleted_at", v) Then
+            d_Key(d_Count) = TbMergeModel.DateKey(v)
+        Else
+            d_Key(d_Count) = EPOCH_KEY
+        End If
+        d_Count = d_Count + 1
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Private Sub HarvestSafes(ByVal parent As Long)
+    Dim c As Long
+    Dim v As String
+    c = FirstElemChild(parent)
+    Do While c <> 0
+        If s_Count > MAX_SAFES - 1 Then Err.Raise 1760, "TbRepoModel", "safe capacity exceeded"
+        s_Raw(s_Count) = TbXmlLite.NodeToText(c)
+        If Not GetAttr(c, "id", v) Then Err.Raise 1761, "TbRepoModel", "safe id missing"
+        s_Id(s_Count) = LCase$(Trim$(v))
+        If GetAttr(c, "created_at", v) Then
+            s_CreatedKey(s_Count) = TbMergeModel.DateKey(v)
+        Else
+            s_CreatedKey(s_Count) = EPOCH_KEY
+        End If
+        If GetAttr(c, "modified_at", v) Then
+            s_ModKey(s_Count) = TbMergeModel.DateKey(v)
+        Else
+            s_ModKey(s_Count) = EPOCH_KEY
+        End If
+        s_HasMaint(s_Count) = False
+        s_MaintKey(s_Count) = ""
+        If GetAttr(c, "maintained_at", v) Then
+            s_HasMaint(s_Count) = True
+            s_MaintKey(s_Count) = TbMergeModel.DateKey(v)
+        End If
+        s_Count = s_Count + 1
+        c = NextElemSibling(c)
+    Loop
+End Sub
+
+Public Function AsciiMask(ByRef s As String) As String
+    AsciiMask = TbMergeModel.AsciiMask(s)
+End Function
+
+' ============================================================
+' CRUD operations (ComGateway semantics, pinned clock T)
+' T = .NET ticks (LongLong). All ops mark touched items SER_REBUILD.
+' ============================================================
+
+Public Function FindNoteById(ByRef idText As String) As Long
+    Dim i As Long
+    For i = 0 To n_Count - 1
+        If n_Id(i) = idText Then
+            FindNoteById = i
+            Exit Function
+        End If
+    Next
+    FindNoteById = -1
+End Function
+
+' ComGateway.AddNote: new NoteModel defaults (bg #fbf4c1 = SettingsModel
+' .StartDefaultNoteColorHex, CreatedAt=ModifiedAt=T, no meta, empty tags) +
+' Notes.Add (bottom) + RefreshOrderModifiedAt.
+Public Sub OpAddNote(ByRef idText As String, ByRef html As String, ByVal tTicks As LongLong)
+    Dim i As Long
+    If n_Count > MAX_NOTES - 1 Then Err.Raise 1762, "TbRepoModel", "note capacity exceeded"
+    i = n_Count
+    n_Id(i) = LCase$(idText)
+    n_Type(i) = 0
+    n_Bg(i) = "#fbf4c1"
+    n_HasBg(i) = True
+    n_InBin(i) = False
+    n_Shop(i) = False
+    n_Pin(i) = False
+    n_CreatedKey(i) = TicksToDateKey(tTicks)
+    n_ModKey(i) = n_CreatedKey(i)
+    n_HasMeta(i) = False
+    n_MetaKey(i) = ""
+    n_HasSafe(i) = False
+    n_SafeId(i) = ""
+    n_TagCount(i) = 0
+    n_Html(i) = html
+    n_HasAtt(i) = False
+    n_Att(i) = ""
+    n_SerMode(i) = SER_REBUILD
+    n_Raw(i) = ""
+    n_ExtraAttrCount(i) = 0
+    n_ExtraChildCount(i) = 0
+    n_Count = n_Count + 1
+    RootOrderKey = TicksToDateKey(tTicks)
+    RootSerMode = SER_REBUILD
+End Sub
+
+' ComGateway.UpdateNoteHtml (plain note): HtmlContent = html + RefreshModifiedAt
+Public Sub OpUpdateHtml(ByVal idx As Long, ByRef html As String, ByVal tTicks As LongLong)
+    If idx < 0 Or idx >= n_Count Then Err.Raise 1763, "TbRepoModel", "note index out of range"
+    n_Html(idx) = html
+    n_ModKey(idx) = TicksToDateKey(tTicks)
+    n_SerMode(idx) = SER_REBUILD
+End Sub
+
+' ComGateway.SetNotePinned: on change IsPinned + RefreshMetaModifiedAt + RefreshOrderModifiedAt
+Public Sub OpSetPinned(ByVal idx As Long, ByVal pinned As Boolean, ByVal tTicks As LongLong)
+    If idx < 0 Or idx >= n_Count Then Err.Raise 1763, "TbRepoModel", "note index out of range"
+    If n_Pin(idx) <> pinned Then
+        n_Pin(idx) = pinned
+        n_HasMeta(idx) = True
+        n_MetaKey(idx) = TicksToDateKey(tTicks)
+        n_SerMode(idx) = SER_REBUILD
+        RootOrderKey = TicksToDateKey(tTicks)
+        RootSerMode = SER_REBUILD
+    End If
+End Sub
+
+' ComGateway.SetNoteRecyclingBin: on change InRecyclingBin + RefreshMetaModifiedAt + RefreshOrderModifiedAt
+Public Sub OpSetRecyclingBin(ByVal idx As Long, ByVal inBin As Boolean, ByVal tTicks As LongLong)
+    If idx < 0 Or idx >= n_Count Then Err.Raise 1763, "TbRepoModel", "note index out of range"
+    If n_InBin(idx) <> inBin Then
+        n_InBin(idx) = inBin
+        n_HasMeta(idx) = True
+        n_MetaKey(idx) = TicksToDateKey(tTicks)
+        n_SerMode(idx) = SER_REBUILD
+        RootOrderKey = TicksToDateKey(tTicks)
+        RootSerMode = SER_REBUILD
+    End If
+End Sub
+
+' ComGateway.SetNoteTags: parse US list (trim, drop empties); on change
+' Tags + RefreshMetaModifiedAt (NO order refresh)
+Public Sub OpSetTags(ByVal idx As Long, ByRef usJoined As String, ByVal tTicks As LongLong)
+    If idx < 0 Or idx >= n_Count Then Err.Raise 1763, "TbRepoModel", "note index out of range"
+    Dim newTags(0 To MAX_TAGS - 1) As String
+    Dim newCount As Long
+    Dim sep As String
+    Dim rest As String
+    Dim p As Long
+    Dim part As String
+    sep = "<x1f>"
+    rest = usJoined
+    If Len(usJoined) > 0 Then
+        Do
+            p = InStr(rest, sep)
+            If p > 0 Then
+                part = Left$(rest, p - 1)
+                rest = Mid$(rest, p + Len(sep))
+            Else
+                part = rest
+                rest = ""
+            End If
+            part = Trim$(part)
+            If Len(part) > 0 Then
+                If newCount > MAX_TAGS - 1 Then Err.Raise 1764, "TbRepoModel", "tag capacity exceeded"
+                newTags(newCount) = part
+                newCount = newCount + 1
+            End If
+        Loop While p > 0
+    End If
+    Dim changed As Boolean
+    Dim i As Long
+    changed = False
+    If newCount <> n_TagCount(idx) Then
+        changed = True
+    Else
+        For i = 0 To newCount - 1
+            If newTags(i) <> n_Tags(i, idx) Then
+                changed = True
+                Exit For
+            End If
+        Next
+    End If
+    If changed Then
+        For i = 0 To newCount - 1
+            n_Tags(i, idx) = newTags(i)
+        Next
+        n_TagCount(idx) = newCount
+        n_HasMeta(idx) = True
+        n_MetaKey(idx) = TicksToDateKey(tTicks)
+        n_SerMode(idx) = SER_REBUILD
+    End If
+End Sub
+
+' ComGateway.DeleteNote (permanent): AddIdOrRefreshDeletedAt + Notes.RemoveAt
+' + RefreshOrderModifiedAt. Tombstones added/refreshed here rebuild.
+Public Sub OpHardDelete(ByVal idx As Long, ByVal tTicks As LongLong)
+    If idx < 0 Or idx >= n_Count Then Err.Raise 1763, "TbRepoModel", "note index out of range"
+    Dim idText As String
+    Dim di As Long
+    idText = n_Id(idx)
+    di = FindDelById(idText)
+    If di >= 0 Then
+        d_Key(di) = TicksToDateKey(tTicks)
+        d_SerMode(di) = SER_REBUILD
+    Else
+        If d_Count > MAX_DELS - 1 Then Err.Raise 1765, "TbRepoModel", "deleted capacity exceeded"
+        d_Id(d_Count) = idText
+        d_Key(d_Count) = TicksToDateKey(tTicks)
+        d_SerMode(d_Count) = SER_REBUILD
+        d_Raw(d_Count) = ""
+        d_Count = d_Count + 1
+    End If
+    RemoveNoteAt idx
+    RootOrderKey = TicksToDateKey(tTicks)
+    RootSerMode = SER_REBUILD
+End Sub
+
+Public Function FindDelById(ByRef idText As String) As Long
+    Dim i As Long
+    For i = 0 To d_Count - 1
+        If d_Id(i) = idText Then
+            FindDelById = i
+            Exit Function
+        End If
+    Next
+    FindDelById = -1
+End Function
+
+Private Sub RemoveNoteAt(ByVal idx As Long)
+    Dim i As Long
+    Dim j As Long
+    For i = idx To n_Count - 2
+        n_Id(i) = n_Id(i + 1)
+        n_Type(i) = n_Type(i + 1)
+        n_Bg(i) = n_Bg(i + 1)
+        n_HasBg(i) = n_HasBg(i + 1)
+        n_InBin(i) = n_InBin(i + 1)
+        n_Shop(i) = n_Shop(i + 1)
+        n_Pin(i) = n_Pin(i + 1)
+        n_CreatedKey(i) = n_CreatedKey(i + 1)
+        n_ModKey(i) = n_ModKey(i + 1)
+        n_HasMeta(i) = n_HasMeta(i + 1)
+        n_MetaKey(i) = n_MetaKey(i + 1)
+        n_HasSafe(i) = n_HasSafe(i + 1)
+        n_SafeId(i) = n_SafeId(i + 1)
+        For j = 0 To MAX_TAGS - 1
+            n_Tags(j, i) = n_Tags(j, i + 1)
+        Next
+        n_TagCount(i) = n_TagCount(i + 1)
+        n_Html(i) = n_Html(i + 1)
+        n_HasAtt(i) = n_HasAtt(i + 1)
+        n_Att(i) = n_Att(i + 1)
+        n_SerMode(i) = n_SerMode(i + 1)
+        n_Raw(i) = n_Raw(i + 1)
+        For j = 0 To MAX_EXTRA - 1
+            n_ExtraAttrName(j, i) = n_ExtraAttrName(j, i + 1)
+            n_ExtraAttrRaw(j, i) = n_ExtraAttrRaw(j, i + 1)
+            n_ExtraChild(j, i) = n_ExtraChild(j, i + 1)
+        Next
+        n_ExtraAttrCount(i) = n_ExtraAttrCount(i + 1)
+        n_ExtraChildCount(i) = n_ExtraChildCount(i + 1)
+    Next
+    n_Count = n_Count - 1
+End Sub
+
+' effective meta (getter normalization at use time): HasMeta And > ModifiedKey
+Public Function NoteHasEffectiveMeta(ByVal idx As Long) As Boolean
+    NoteHasEffectiveMeta = n_HasMeta(idx) And (n_MetaKey(idx) > n_ModKey(idx))
+End Function
+
+' ============================================================
+' time (UtcNow + conversions)
+' ============================================================
+
+' .NET DateTime.UtcNow equivalent: full 100ns precision via FILETIME
+Public Function UtcNowTicks() As LongLong
+    Dim ft As LongLong
+    GetSystemTimeAsFileTime ft
+    UtcNowTicks = ft + FT_OFFSET
+End Function
+
+' ISO-8601 UTC string exactly like XmlSerializer emits DateTime:
+' "yyyy-MM-ddTHH:mm:ss" + optional ".f{1-7}" (trailing zeros trimmed) + "Z"
+Public Function FormatTicksIso(ByVal t As LongLong) As String
+    Dim days As LongLong
+    Dim rem2 As LongLong
+    Dim sec As LongLong
+    Dim frac As LongLong
+    Dim h As LongLong
+    Dim mi As LongLong
+    Dim ss As LongLong
+    Dim fracS As String
+    Dim yy As LongLong, mo As LongLong, dd As LongLong
+    If t < 0 Then Err.Raise 1766, "TbRepoModel", "negative ticks"
+    days = t \ 864000000000^
+    rem2 = t - days * 864000000000^
+    sec = rem2 \ 10000000^
+    frac = rem2 - sec * 10000000^
+    h = sec \ 3600^
+    mi = (sec - h * 3600^) \ 60^
+    ss = sec - h * 3600^ - mi * 60^
+    fracS = ""
+    If frac > 0 Then
+        fracS = Trim7(frac)
+    End If
+    DaysToYmd days, yy, mo, dd
+    FormatTicksIso = Pad4(CLng(yy)) & "-" & Pad2(CLng(mo)) & "-" & Pad2(CLng(dd)) & _
+        "T" & Pad2(CLng(h)) & ":" & Pad2(CLng(mi)) & ":" & Pad2(CLng(ss)) & _
+        IIf(Len(fracS) > 0, "." & fracS, "") & "Z"
+End Function
+
+' 7-digit fraction with trailing zeros trimmed
+Private Function Trim7(ByVal frac As LongLong) As String
+    Dim s As String
+    Dim e As Long
+    s = Pad7(frac)
+    e = 7
+    Do While e > 1
+        If Mid$(s, e, 1) = "0" Then
+            e = e - 1
+        Else
+            Exit Do
+        End If
+    Loop
+    Trim7 = Left$(s, e)
+End Function
+
+Private Function Pad7(ByVal v As LongLong) As String
+    Dim s As String
+    s = CStr(v)
+    Do While Len(s) < 7
+        s = "0" & s
+    Loop
+    Pad7 = s
+End Function
+
+Private Function Pad2(ByVal v As Long) As String
+    If v < 10 Then
+        Pad2 = "0" & CStr(v)
+    Else
+        Pad2 = CStr(v)
+    End If
+End Function
+
+Private Function Pad4(ByVal v As Long) As String
+    Dim s As String
+    s = CStr(v)
+    Do While Len(s) < 4
+        s = "0" & s
+    Loop
+    Pad4 = s
+End Function
+
+' DateKey ("yyyyMMddHHmmss.fffffff", 22 chars) -> .NET ticks
+Public Function DateKeyToTicks(ByRef key As String) As LongLong
+    If Len(key) = 0 Then
+        DateKeyToTicks = 0
+        Exit Function
+    End If
+    If Len(key) <> 22 Then Err.Raise 1767, "TbRepoModel", "bad DateKey: " & AsciiMask(key)
+    Dim y As LongLong, mo As LongLong, dd As LongLong
+    Dim h As LongLong, mi As LongLong, ss As LongLong, frac As LongLong
+    ' key layout: 1-4 y, 5-6 mo, 7-8 dd, 9-10 h, 11-12 mi, 13-14 ss, 15 ".",
+    ' 16-22 fraction (7 digits)
+    y = CLngLng(Mid$(key, 1, 4))
+    mo = CLngLng(Mid$(key, 5, 2))
+    dd = CLngLng(Mid$(key, 7, 2))
+    h = CLngLng(Mid$(key, 9, 2))
+    mi = CLngLng(Mid$(key, 11, 2))
+    ss = CLngLng(Mid$(key, 13, 2))
+    frac = CLngLng(Mid$(key, 16, 7))
+    ' CivilDays returns days since 1970-01-01; +719162 = days since 0001-01-01
+    DateKeyToTicks = ((CivilDays(y, mo, dd) + 719162) * 864000000000^) + _
+        (h * 3600^ + mi * 60^ + ss) * 10000000^ + frac
+End Function
+
+Public Function TicksToDateKey(ByVal t As LongLong) As String
+    Dim days As LongLong
+    Dim rem2 As LongLong
+    Dim sec As LongLong
+    Dim frac As LongLong
+    Dim h As LongLong
+    Dim mi As LongLong
+    Dim ss As LongLong
+    Dim yy As LongLong, mo As LongLong, dd As LongLong
+    If t < 0 Then Err.Raise 1766, "TbRepoModel", "negative ticks"
+    days = t \ 864000000000^
+    rem2 = t - days * 864000000000^
+    sec = rem2 \ 10000000^
+    frac = rem2 - sec * 10000000^
+    h = sec \ 3600^
+    mi = (sec - h * 3600^) \ 60^
+    ss = sec - h * 3600^ - mi * 60^
+    DaysToYmd days, yy, mo, dd
+    TicksToDateKey = Pad4(CLng(yy)) & Pad2(CLng(mo)) & Pad2(CLng(dd)) & _
+        Pad2(CLng(h)) & Pad2(CLng(mi)) & Pad2(CLng(ss)) & "." & Pad7(frac)
+End Function
+
+' proleptic Gregorian, days since 0001-01-01 -> y/m/d (Hinnant civil_from_days;
+' the +306 fuses the 0001->1970 offset (-719162) with Hinnant's +719468)
+Private Sub DaysToYmd(ByVal z As LongLong, ByRef oy As LongLong, ByRef om As LongLong, ByRef od As LongLong)
+    Dim era As LongLong
+    Dim doe As LongLong
+    Dim yoe As LongLong
+    Dim y As LongLong
+    Dim doy As LongLong
+    Dim mp As LongLong
+    z = z + 306^
+    era = z \ 146097
+    doe = z - era * 146097
+    yoe = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+    mp = (5 * doy + 2) \ 153
+    If mp >= 10 Then
+        y = y + 1
+    End If
+    If mp < 10 Then
+        om = mp + 3
+    Else
+        om = mp - 9
+    End If
+    od = doy - (153 * mp + 2) \ 5 + 1
+    oy = y
+End Sub
+
+' proleptic Gregorian day number from y/m/d (days since 1970-01-01, Hinnant;
+' caller adds 719162 for the .NET tick epoch 0001-01-01)
+Public Function CivilDays(ByVal y As LongLong, ByVal m As LongLong, ByVal d As LongLong) As LongLong
+    Dim era As LongLong
+    Dim yoe As LongLong
+    Dim doy As LongLong
+    Dim doe As LongLong
+    Dim mp As LongLong
+    If m <= 2 Then
+        y = y - 1
+        mp = m + 9
+    Else
+        mp = m - 3
+    End If
+    era = (y - IIf(y >= 0, 0, 399)) \ 400
+    yoe = y - era * 400
+    doy = (153 * mp + 2) \ 5 + d - 1
+    doe = yoe * 365 + yoe \ 4 - yoe \ 100 + doy
+    CivilDays = era * 146097 + doe - 719468
+End Function
+
+' NewGuid in "d" format (lowercase) via CoCreateGuid
+Public Function NewGuidText() As String
+    Dim g As TbGuidStruct
+    Dim res As String
+    Dim i As Long
+    CoCreateGuid g
+    res = LCase$(HexGuidPart(g.Data1, 8) & "-" & HexGuidPart(CLngLng(g.Data2 And &HFFFF&), 4) & "-" & _
+        HexGuidPart(CLngLng(g.Data3 And &HFFFF&), 4) & "-")
+    For i = 0 To 1
+        res = res & HexGuidPart(CLngLng(g.Data4(i)), 2)
+    Next
+    res = res & "-"
+    For i = 2 To 7
+        res = res & HexGuidPart(CLngLng(g.Data4(i)), 2)
+    Next
+    NewGuidText = res
+End Function
+
+Private Function HexGuidPart(ByVal v As LongLong, ByVal digits As Long) As String
+    Dim s As String
+    s = Hex$(v)
+    If Len(s) > digits Then s = Right$(s, digits)   ' sign-extended LongLong: keep the low nibbles
+    Do While Len(s) < digits
+        s = "0" & s
+    Loop
+    HexGuidPart = LCase$(s)    ' canonical lowercase guid (matches .NET + the harvest)
+End Function
+
+' ============================================================
+' writer
+' ============================================================
+
+Private m_OutBuf As String
+Private m_OutPos As Long
+
+Private Sub Out(ByRef s As String)
+    Dim l As Long
+    l = Len(s)
+    If l = 0 Then Exit Sub
+    If m_OutPos + l - 1 > Len(m_OutBuf) Then Err.Raise 1770, "TbRepoModel", "writer buffer overflow"
+    Mid$(m_OutBuf, m_OutPos, l) = s
+    m_OutPos = m_OutPos + l
+End Sub
+
+' Whole document unchanged -> verbatim replay of the parsed tree.
+Private Function WholeUnmodified() As Boolean
+    Dim i As Long
+    If RootSerMode <> SER_RAW Then Exit Function
+    If n_Count <> n_OriginalCount Then Exit Function
+    If d_Count <> d_OriginalCount Then Exit Function
+    For i = 0 To n_Count - 1
+        If n_SerMode(i) <> SER_RAW Then Exit Function
+    Next
+    For i = 0 To d_Count - 1
+        If d_SerMode(i) <> SER_RAW Then Exit Function
+    Next
+    WholeUnmodified = True
+End Function
+
+Public Function Serialize() As String
+    Dim buf As String
+    If WholeUnmodified() Then
+        Serialize = TbXmlLite.SerializeDocument(m_SrcLen)
+        Exit Function
+    End If
+    Dim est As Long
+    est = m_SrcLen + 65536
+    Dim i As Long
+    Dim k As Long
+    For i = 0 To n_Count - 1
+        If n_SerMode(i) = SER_REBUILD Then
+            est = est + 4096 + 8 * Len(n_Html(i))
+            For k = 0 To n_TagCount(i) - 1
+                est = est + 64 + 8 * Len(n_Tags(k, i))
+            Next
+        End If
+    Next
+    m_OutBuf = Space$(est)
+    m_OutPos = 1
+
+    Out RootRawDecl
+    If RootSerMode = SER_RAW Then
+        Out RootRawOpen
+    Else
+        Out "<silentnotes"
+        Out RootExtraRaw
+        Out " id="""
+        Out RootIdText
+        Out """ revision="""
+        Out CStr(RootRevision)
+        Out """ order_modified_at="""
+        Out TbXmlLite.EscapeAttr(FormatKeyIso(RootOrderKey))
+        Out """>"
+    End If
+
+    ' notes container
+    If NotesUntouched() And Len(ContNotesRaw) > 0 Then
+        Out vbCrLf
+        Out "  "
+        Out ContNotesRaw
+    Else
+        Out vbCrLf
+        Out "  "
+        If n_Count = 0 Then
+            Out "<notes />"
+        Else
+            Out "<notes>"
+            For i = 0 To n_Count - 1
+                Out vbCrLf
+                Out "    "
+                OutNote i
+            Next
+            Out vbCrLf
+            Out "  </notes>"
+        End If
+    End If
+
+    ' deleted_notes container
+    If DelsUntouched() And Len(ContDelsRaw) > 0 Then
+        Out vbCrLf
+        Out "  "
+        Out ContDelsRaw
+    Else
+        Out vbCrLf
+        Out "  "
+        If d_Count = 0 Then
+            Out "<deleted_notes />"
+        Else
+            Out "<deleted_notes>"
+            For i = 0 To d_Count - 1
+                Out vbCrLf
+                Out "    "
+                Out DelText(i)
+            Next
+            Out vbCrLf
+            Out "  </deleted_notes>"
+        End If
+    End If
+
+    ' safes container: raw replay until touched (TbPureGw CreateSafe/
+    ' RemoveSafe set SafesTouched), then per-item raw re-emission - existing
+    ' subtrees replay verbatim, the layout matches the Core dialect
+    Out vbCrLf
+    Out "  "
+    If (Not SafesTouched) And Len(ContSafesRaw) > 0 Then
+        Out ContSafesRaw
+    Else
+        If s_Count = 0 Then
+            Out "<safes />"
+        Else
+            Out "<safes>"
+            For i = 0 To s_Count - 1
+                Out vbCrLf
+                Out "    "
+                Out s_Raw(i)
+            Next
+            Out vbCrLf
+            Out "  </safes>"
+        End If
+    End If
+
+    Out vbCrLf
+    Out "</silentnotes>"
+    Serialize = Left$(m_OutBuf, m_OutPos - 1)
+    m_OutBuf = ""
+End Function
+
+Private Function FormatKeyIso(ByRef key As String) As String
+    FormatKeyIso = FormatTicksIso(DateKeyToTicks(key))
+End Function
+
+Private Function NotesUntouched() As Boolean
+    Dim i As Long
+    If n_Count <> n_OriginalCount Then Exit Function
+    For i = 0 To n_Count - 1
+        If n_SerMode(i) <> SER_RAW Then Exit Function
+    Next
+    NotesUntouched = True
+End Function
+
+Private Function DelsUntouched() As Boolean
+    Dim i As Long
+    If d_Count <> d_OriginalCount Then Exit Function
+    For i = 0 To d_Count - 1
+        If d_SerMode(i) <> SER_RAW Then Exit Function
+    Next
+    DelsUntouched = True
+End Function
+
+' one <note> element: raw replay or Core-dialect rebuild (buffered segments,
+' no string concatenation of the big html)
+Private Sub OutNote(ByVal i As Long)
+    Dim k As Long
+    If n_SerMode(i) = SER_RAW Then
+        Out n_Raw(i)
+        Exit Sub
+    End If
+    Dim esc As String
+    Out "<note"
+    For k = 0 To n_ExtraAttrCount(i) - 1
+        Out " "
+        Out n_ExtraAttrName(k, i)
+        Out "="
+        Out n_ExtraAttrRaw(k, i)
+    Next
+    Out " id="""
+    Out n_Id(i)
+    Out """ note_type="""
+    If n_Type(i) = 1 Then Out "Checklist" Else Out "Text"
+    Out """"
+    If n_HasBg(i) Then
+        Out " background_color="""
+        Out TbXmlLite.EscapeAttr(n_Bg(i))
+        Out """"
+    End If
+    Out " in_recycling_bin="""
+    If n_InBin(i) Then Out "true" Else Out "false"
+    Out """ shopping_mode="""
+    If n_Shop(i) Then Out "true" Else Out "false"
+    Out """ note_pinned="""
+    If n_Pin(i) Then Out "true" Else Out "false"
+    Out """ created_at="""
+    Out FormatKeyIso(n_CreatedKey(i))
+    Out """ modified_at="""
+    Out FormatKeyIso(n_ModKey(i))
+    Out """"
+    If NoteHasEffectiveMeta(i) Then
+        Out " meta_modified_at="""
+        Out FormatKeyIso(n_MetaKey(i))
+        Out """"
+    End If
+    Out ">"
+    Out vbCrLf
+    Out "      "
+    If Len(n_Html(i)) = 0 Then
+        Out "<html_content />"
+    Else
+        Out "<html_content>"
+        esc = TbXmlLite.EscapeText(n_Html(i))
+        Out esc
+        Out "</html_content>"
+    End If
+    Out vbCrLf
+    Out "      "
+    If n_TagCount(i) = 0 Then
+        Out "<tags />"
+    Else
+        Out "<tags>"
+        For k = 0 To n_TagCount(i) - 1
+            Out vbCrLf
+            Out "        <tag>"
+            esc = TbXmlLite.EscapeText(n_Tags(k, i))
+            Out esc
+            Out "</tag>"
+        Next
+        Out vbCrLf
+        Out "      </tags>"
+    End If
+    If n_HasSafe(i) Then
+        Out vbCrLf
+        Out "      <safe>"
+        Out n_SafeId(i)
+        Out "</safe>"
+    End If
+    If n_HasAtt(i) Then
+        Out vbCrLf
+        Out "      <attachement_key>"
+        Out TbXmlLite.EscapeText(n_Att(i))
+        Out "</attachement_key>"
+    End If
+    For k = 0 To n_ExtraChildCount(i) - 1
+        Out vbCrLf
+        Out "      "
+        Out n_ExtraChild(k, i)
+    Next
+    Out vbCrLf
+    Out "    </note>"
+End Sub
+
+' one <deleted_note> element: raw replay or rebuild
+Private Function DelText(ByVal i As Long) As String
+    If d_SerMode(i) = SER_RAW Then
+        DelText = d_Raw(i)
+        Exit Function
+    End If
+    DelText = "<deleted_note deleted_at=""" & FormatKeyIso(d_Key(i)) & """>" & d_Id(i) & "</deleted_note>"
+End Function
+
+End Module

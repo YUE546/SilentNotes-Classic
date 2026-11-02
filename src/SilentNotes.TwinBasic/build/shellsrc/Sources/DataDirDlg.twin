@@ -1,0 +1,267 @@
+Option Explicit
+
+[Description("Settings dialog: data directory + import backup + sync settings entry, modal, owner-centered")]
+[FormDesignerId("7E4C1A02-93B5-4F6D-8A21-C0D51B9F3A32")]
+[PredeclaredId]
+Class DataDirDlg
+
+    ' set by MainForm before Show 1; read back after the modal returns
+    Public CurrentDir As String        ' effective data directory (display)
+    Public ImportDir As String         ' initial dir of the import file dialog
+    ' Action: "" (closed) | "savedir:<path>" (write the registry value -
+    ' the MAIN form confirms + writes, this dialog never touches the
+    ' registry itself) | "import:<path>" | "sync"
+    Public Action As String
+    ' gate automation: non-empty = auto-consume on activate (close only -
+    ' the gate must NEVER exercise the registry write)
+    Public GateAnswer As String
+
+    Private m_ownerHwnd As Long
+    Private m_focusDone As Boolean
+
+    ' PHYSICAL-pixel sizing + owner centering (LinkDlg/ConfirmDlg recipe)
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 460      ' client, physical px
+    Private Const DlgH As Long = 300
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    ' GetOpenFileNameW (comdlg32): the classic file dialog. The W variant
+    ' keeps every parameter a StrPtr-able string (the A variant would need
+    ' ANSI buffers). Buffer pre-filled with the initial directory when set.
+    Private Type OPENFILENAMEW
+        lStructSize As Long
+        hwndOwner As Long
+        hInstance As Long
+        lpstrFilter As Long
+        lpstrCustomFilter As Long
+        nMaxCustFilter As Long
+        nFilterIndex As Long
+        lpstrFile As Long
+        nMaxFile As Long
+        lpstrFileTitle As Long
+        nMaxFileTitle As Long
+        lpstrInitialDir As Long
+        lpstrTitle As Long
+        flags As Long
+        nFileOffset As Integer
+        nFileExtension As Integer
+        lpstrDefExt As Long
+        lCustData As Long
+        lpfnHook As Long
+        lpTemplateName As Long
+        pvReserved As Long
+        dwReserved As Long
+        FlagsEx As Long
+    End Type
+    Private Declare Function GetOpenFileNameW Lib "comdlg32" (ByRef ofn As OPENFILENAMEW) As Long
+
+    Private Const OFN_HIDEREADONLY As Long = &H4
+    Private Const OFN_PATHMUSTEXIST As Long = &H800
+    Private Const OFN_FILEMUSTEXIST As Long = &H1000
+
+    ' m_ownerHwnd stored BEFORE the first control access (fires Form_Load)
+    ' NOTE: the parameters deliberately differ in NAME from the public
+    ' fields (VB name-matching is case-insensitive - same-name parameters
+    ' would shadow the fields and the assignments would self-assign)
+    Public Sub Preload(ByVal effDir As String, ByVal backupDir As String, ByVal ownerHwnd As Long)
+        Action = ""
+        GateAnswer = ""
+        CurrentDir = effDir
+        ImportDir = backupDir
+        m_ownerHwnd = ownerHwnd
+        m_focusDone = False
+    End Sub
+
+    Private Sub Form_Load()
+        Me.Caption = STitle()
+        lblDirTitle.Caption = SDirTitle()
+        lblVersion.Caption = "V0.1"
+        lblCur.Caption = CurrentDir
+        lblNew.Caption = SNewLbl()
+        cmdSaveDir.Caption = SSaveDirBtn()
+        lblImport.Caption = SImportTitle()
+        cmdImport.Caption = SImportBtn()
+        cmdSync.Caption = SSyncBtn()
+        cmdClose.Caption = SCloseBtn()
+        lblStatus.Caption = ""
+        SnapCenter
+        ' physical-pixel layout (tbform geometry is DPI-scaled by the runtime)
+        lblDirTitle.Move 12, 14, 200, 20
+        lblVersion.Move 348, 14, 100, 20
+        lblCur.Move 12, 38, 436, 34
+        lblNew.Move 12, 82, 92, 20
+        txtDir.Move 108, 78, 340, 28
+        cmdSaveDir.Move 108, 114, 110, 30
+        lblImport.Move 12, 162, 200, 20
+        cmdImport.Move 12, 186, 160, 30
+        cmdSync.Move 184, 186, 140, 30
+        lblStatus.Move 12, 232, 436, 20
+        cmdClose.Move 348, 260, 100, 30
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    ' idempotent Activate (no m_once - opens repeatedly); the gate answer
+    ' only ever closes (the registry write is never gate-automated)
+    Private Sub Form_Activate()
+        If Len(GateAnswer) > 0 Then
+            GateAnswer = ""
+            cmdClose_Click
+        ElseIf Not m_focusDone Then
+            m_focusDone = True
+            On Error Resume Next
+            cmdImport.SetFocus
+        End If
+    End Sub
+
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 27 Then
+            KeyCode = 0
+            cmdClose_Click
+        End If
+    End Sub
+
+    Private Sub cmdSaveDir_Click()
+        On Error Resume Next
+        Dim p As String
+        p = Trim$(txtDir.Text)
+        If Len(p) = 0 Then
+            lblStatus.Caption = SEnterDir()
+            Exit Sub
+        End If
+        If Len(Dir$(p, vbDirectory)) = 0 Then
+            lblStatus.Caption = SDirMissing()
+            Exit Sub
+        End If
+        Action = "savedir:" & p
+        Me.Hide
+    End Sub
+
+    ' classic GetOpenFileNameW; initial directory = the data directory's
+    ' sync_backups subfolder (passed by MainForm), filter = .silentnotes
+    Private Sub cmdImport_Click()
+        On Error Resume Next
+        Dim p As String
+        p = PickBackupFile()
+        If Len(p) = 0 Then Exit Sub          ' cancelled
+        Action = "import:" & p
+        Me.Hide
+    End Sub
+
+    Private Function PickBackupFile() As String
+        On Error GoTo fail
+        Dim ofn As OPENFILENAMEW
+        Dim buf As String
+        Dim flt As String
+        buf = String$(2048, vbNullChar)
+        flt = "SilentNotes (*." & RepoExt() & ")" & vbNullChar & "*." & RepoExt() & vbNullChar & vbNullChar
+        ofn.lStructSize = LenB(ofn)
+        ofn.hwndOwner = m_ownerHwnd
+        ofn.lpstrFilter = StrPtr(flt)
+        ofn.lpstrFile = StrPtr(buf)
+        ofn.nMaxFile = 2048
+        If Len(ImportDir) > 0 Then ofn.lpstrInitialDir = StrPtr(ImportDir)
+        ofn.lpstrTitle = StrPtr(SImportTitle())
+        ofn.flags = OFN_HIDEREADONLY Or OFN_PATHMUSTEXIST Or OFN_FILEMUSTEXIST
+        If GetOpenFileNameW(ofn) = 0 Then Exit Function   ' cancelled
+        PickBackupFile = Left$(buf, InStr(buf, vbNullChar) - 1)
+        Exit Function
+fail:
+        PickBackupFile = ""
+    End Function
+
+    Private Function RepoExt() As String
+        RepoExt = "silentnotes"
+    End Function
+
+    Private Sub cmdSync_Click()
+        On Error Resume Next
+        Action = "sync"
+        Me.Hide
+    End Sub
+
+    Private Sub cmdClose_Click()
+        On Error Resume Next
+        Action = ""
+        Me.Hide
+    End Sub
+
+    ' ---------------------------------------------------- captions (ChrW$)
+
+    Private Function STitle() As String        ' she-zhi (settings)
+        STitle = ChrW$(&H8BBE&) & ChrW$(&H7F6E&)
+    End Function
+
+    Private Function SDirTitle() As String     ' shu-ju-mu-lu (data directory)
+        SDirTitle = ChrW$(&H6570&) & ChrW$(&H636E&) & ChrW$(&H76EE&) & ChrW$(&H5F55&)
+    End Function
+
+    Private Function SNewLbl() As String       ' xin-mu-lu: (new directory:)
+        SNewLbl = ChrW$(&H65B0&) & ChrW$(&H76EE&) & ChrW$(&H5F55&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SSaveDirBtn() As String   ' bao-cun-mu-lu (save directory)
+        SSaveDirBtn = ChrW$(&H4FDD&) & ChrW$(&H5B58&) & ChrW$(&H76EE&) & ChrW$(&H5F55&)
+    End Function
+
+    Private Function SImportTitle() As String  ' dao-ru-bei-fen (import backup)
+        SImportTitle = ChrW$(&H5BFC&) & ChrW$(&H5165&) & ChrW$(&H5907&) & ChrW$(&H4EFD&)
+    End Function
+
+    Private Function SImportBtn() As String    ' dao-ru-bei-fen-wen-jian... (import backup file...)
+        SImportBtn = SImportTitle() & ChrW$(&H6587&) & ChrW$(&H4EF6&) & "..."
+    End Function
+
+    Private Function SSyncBtn() As String      ' tong-bu-she-zhi... (sync settings...)
+        SSyncBtn = ChrW$(&H540C&) & ChrW$(&H6B65&) & ChrW$(&H8BBE&) & ChrW$(&H7F6E&) & "..."
+    End Function
+
+    Private Function SCloseBtn() As String     ' guan-bi (close)
+        SCloseBtn = ChrW$(&H5173&) & ChrW$(&H95ED&)
+    End Function
+
+    Private Function SEnterDir() As String     ' qing-shu-ru-xin-mu-lu (enter the new directory)
+        SEnterDir = ChrW$(&H8BF7&) & ChrW$(&H8F93&) & ChrW$(&H5165&) & ChrW$(&H65B0&) & _
+            ChrW$(&H76EE&) & ChrW$(&H5F55&)
+    End Function
+
+    Private Function SDirMissing() As String   ' mu-lu-bu-cun-zai (directory does not exist)
+        SDirMissing = ChrW$(&H76EE&) & ChrW$(&H5F55&) & ChrW$(&H4E0D&) & ChrW$(&H5B58&) & _
+            ChrW$(&H5728&)
+    End Function
+End Class

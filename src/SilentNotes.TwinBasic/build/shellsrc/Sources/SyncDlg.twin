@@ -1,0 +1,189 @@
+Option Explicit
+
+[Description("WebDAV + transfer-code settings dialog: native controls, modal, owner-centered")]
+[FormDesignerId("3A7C1D54-8E9B-4F2A-9C6D-1B5E8A7F4C21")]
+[PredeclaredId]
+Class SyncDlg
+
+    ' set by MainForm before Show 1; read back after the modal returns.
+    ' PasswordChar is set at runtime (tbform enum property risk).
+    Public Confirmed As Boolean
+    Public ServerUrl As String
+    Public Username As String
+    Public Password As String
+    Public TransferCode As String
+    ' free-form hint line under the fields (e.g. import note from MainForm)
+    Public Hint As String
+    ' gate automation: True = auto-OK on first activate (exercises cmdOK path)
+    Public GateApply As Boolean
+
+    Private m_pending As Boolean          ' Preload armed: Activate pushes the public fields into the controls
+    Private m_ownerHwnd As Long
+
+    Private Const SWP_NOZORDER As Long = 4
+    Private Const GWL_STYLE As Long = -16
+    Private Const GWL_EXSTYLE As Long = -20
+    Private Const DlgW As Long = 420      ' client, physical px
+    Private Const DlgH As Long = 236
+
+    Private Type RECTW
+        L As Long
+        T As Long
+        R As Long
+        B As Long
+    End Type
+
+    Private Declare Function GetWindowLongW Lib "user32" (ByVal hWnd As Long, ByVal nIndex As Long) As Long
+    Private Declare Function GetWindowRectW Lib "user32" Alias "GetWindowRect" (ByVal hWnd As Long, ByRef rc As RECTW) As Long
+    Private Declare Function AdjustWindowRectEx Lib "user32" (ByRef rc As RECTW, ByVal style As Long, ByVal menu As Long, ByVal exStyle As Long) As Long
+    Private Declare Function SetWindowPos Lib "user32" (ByVal hWnd As Long, ByVal hWndAfter As Long, ByVal x As Long, ByVal y As Long, ByVal cx As Long, ByVal cy As Long, ByVal flags As Long) As Long
+
+    Public Sub Preload(ByVal ownerHwnd As Long)
+        Confirmed = False
+        m_ownerHwnd = ownerHwnd
+        m_pending = True
+        ' touching the controls triggers form loading - Preload stores the
+        ' values, Activate pushes them into the boxes (also on re-Show,
+        ' since Form_Load runs once per session)
+    End Sub
+
+    Private Sub Form_Load()
+        Me.Caption = SSyncTitle()
+        lblUrl.Caption = SServerLbl()
+        lblUser.Caption = SUserLbl()
+        lblPass.Caption = SPassLbl()
+        lblCode.Caption = SCodeLbl()
+        cmdOK.Caption = SOkBtn()
+        cmdCancel.Caption = SCancelBtn()
+        lblHint.Caption = Hint
+        SnapCenter
+        ' physical-pixel layout (tbform geometry is DPI-scaled by the runtime)
+        lblUrl.Move 12, 17, 92, 20
+        txtUrl.Move 108, 13, 300, 28
+        lblUser.Move 12, 57, 92, 20
+        txtUser.Move 108, 53, 180, 28
+        lblPass.Move 12, 97, 92, 20
+        txtPass.Move 108, 93, 180, 28
+        lblCode.Move 12, 137, 92, 20
+        txtCode.Move 108, 133, 180, 28
+        lblHint.Move 108, 168, 300, 20
+        cmdOK.Move 224, 196, 88, 28
+        cmdCancel.Move 320, 196, 88, 28
+        On Error Resume Next
+        txtPass.PasswordChar = "*"          ' tB: string property - Asc("*")
+                                            ' became "42" -> echoed "4"
+        txtCode.PasswordChar = ""           ' transfer code stays readable
+    End Sub
+
+    Private Sub PushFields()
+        On Error Resume Next
+        txtUrl.Text = ServerUrl
+        txtUser.Text = Username
+        txtPass.Text = Password
+        txtCode.Text = TransferCode
+        lblHint.Caption = Hint
+    End Sub
+
+    Private Sub SnapCenter()
+        On Error Resume Next
+        Dim rc As RECTW
+        rc.R = DlgW
+        rc.B = DlgH
+        AdjustWindowRectEx rc, GetWindowLongW(Me.hWnd, GWL_STYLE), 0, GetWindowLongW(Me.hWnd, GWL_EXSTYLE)
+        Dim w As Long, h As Long
+        w = rc.R - rc.L
+        h = rc.B - rc.T
+        Dim ow As RECTW
+        If m_ownerHwnd <> 0 Then
+            GetWindowRectW m_ownerHwnd, ow
+        Else
+            ow.L = 0
+            ow.T = 0
+            ow.R = DlgW * 4
+            ow.B = DlgH * 4
+        End If
+        Dim x As Long, y As Long
+        x = ow.L + ((ow.R - ow.L) - w) \ 2
+        y = ow.T + ((ow.B - ow.T) - h) \ 2
+        SetWindowPos Me.hWnd, 0, x, y, w, h, SWP_NOZORDER
+    End Sub
+
+    Private Sub Form_Activate()
+        If m_pending Then
+            m_pending = False
+            PushFields
+        End If
+        If GateApply Then
+            GateApply = False
+            PushFields
+            cmdOK_Click
+        Else
+            txtUrl.SetFocus
+        End If
+    End Sub
+
+    ' gate path: run a pending GateApply through cmdOK_Click without Show -
+    ' the Activate-driven answer loses to foreground focus fights
+    Public Sub ApplyNow()
+        If GateApply Then
+            GateApply = False
+            PushFields
+            cmdOK_Click
+        End If
+    End Sub
+
+    Private Sub Form_KeyDown(KeyCode As Integer, Shift As Integer)
+        If KeyCode = 13 Then
+            KeyCode = 0
+            cmdOK_Click
+        ElseIf KeyCode = 27 Then
+            KeyCode = 0
+            cmdCancel_Click
+        End If
+    End Sub
+
+    Private Sub cmdOK_Click()
+        ServerUrl = Trim$(txtUrl.Text)
+        Username = txtUser.Text
+        Password = txtPass.Text
+        TransferCode = Trim$(txtCode.Text)
+        Confirmed = True
+        Me.Hide
+    End Sub
+
+    Private Sub cmdCancel_Click()
+        Confirmed = False
+        Me.Hide
+    End Sub
+
+    ' ---------------------------------------------------- captions (ChrW$)
+    ' ASCII-only source: all Chinese captions assembled from code points
+
+    Private Function SSyncTitle() As String   ' 同步设置
+        SSyncTitle = ChrW$(&H540C&) & ChrW$(&H6B65&) & ChrW$(&H8BBE&) & ChrW$(&H7F6E&)
+    End Function
+
+    Private Function SServerLbl() As String   ' 服务器地址：
+        SServerLbl = ChrW$(&H670D&) & ChrW$(&H52A1&) & ChrW$(&H5668&) & ChrW$(&H5730&) & ChrW$(&H5740&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SUserLbl() As String     ' 用户名：
+        SUserLbl = ChrW$(&H7528&) & ChrW$(&H6237&) & ChrW$(&H540D&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SPassLbl() As String     ' 密码：
+        SPassLbl = ChrW$(&H5BC6&) & ChrW$(&H7801&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SCodeLbl() As String     ' 传输码：
+        SCodeLbl = ChrW$(&H4F20&) & ChrW$(&H8F93&) & ChrW$(&H7801&) & ChrW$(&HFF1A&)
+    End Function
+
+    Private Function SOkBtn() As String       ' 确定
+        SOkBtn = ChrW$(&H786E&) & ChrW$(&H5B9A&)
+    End Function
+
+    Private Function SCancelBtn() As String   ' 取消
+        SCancelBtn = ChrW$(&H53D6&) & ChrW$(&H6D88&)
+    End Function
+End Class
